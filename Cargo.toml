@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/deploy-core", "crates/deploy-cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "fs",
+  "io-util",
+  "sync",
+  "time",
+  "net",
+] }
+directories = "6"
+clap = { version = "4", features = ["derive"] }
+deploy-core = { path = "crates/deploy-core" }

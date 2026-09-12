@@ -1,0 +1,16 @@
+[package]
+name = "deploy-cli"
+version.workspace = true
+edition.workspace = true
+description = "DeployCode 命令行工具"
+
+[[bin]]
+name = "deploy-code-cli"
+path = "src/main.rs"
+
+[dependencies]
+deploy-core.workspace = true
+clap.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,11 @@
+node_modules/
+dist/
+target/
+src-tauri/gen/
+config.json
+history.json
+.env*
+*.pem
+*.key
+*.local
+.DS_Store

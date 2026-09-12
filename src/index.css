@@ -1,0 +1,593 @@
+@import "tailwindcss";
+
+/* ==========================================================================
+   设计令牌（Design Tokens）
+   调整配色 / 圆角 / 字体等全局样式只需修改本文件。
+   主题切换：html[data-theme="light"] 覆盖下方变量。
+   ========================================================================== */
+
+@theme inline {
+  --font-sans:
+    "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "PingFang SC",
+    "Microsoft YaHei UI", "Microsoft YaHei", sans-serif;
+  --font-mono:
+    "JetBrains Mono", "Cascadia Mono", Consolas, "Menlo", monospace;
+
+  /* 表面 */
+  --color-app: var(--app); /* 窗口底色 */
+  --color-panel: var(--panel); /* 侧栏 / 卡片 / 弹层 */
+  --color-field: var(--field); /* 输入框 / 次级色块 */
+  --color-chip: var(--chip); /* 选中项 / 激活标签 */
+  --color-sunken: var(--sunken); /* 编辑器 / 日志区 */
+  --color-hover: var(--hover); /* 悬停高亮 */
+
+  /* 描边 */
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+
+  /* 文字 */
+  --color-ink: var(--ink);
+  --color-ink-dim: var(--ink-dim);
+  --color-ink-faint: var(--ink-faint);
+
+  /* 品牌色 */
+  --color-primary: var(--primary); /* 主按钮实底 */
+  --color-primary-hover: var(--primary-hover);
+  --color-on-primary: var(--on-primary);
+  --color-brand: var(--brand); /* 强调文字 / 图标 */
+  --color-brand-soft: var(--brand-soft); /* 强调弱底 */
+  --color-brand-line: var(--brand-line); /* 强调描边 / 焦点环 */
+
+  /* 状态色 */
+  --color-pos: var(--pos);
+  --color-pos-soft: var(--pos-soft);
+  --color-neg: var(--neg);
+  --color-neg-soft: var(--neg-soft);
+  --color-warn: var(--warn);
+  --color-warn-soft: var(--warn-soft);
+
+  /* 投影 */
+  --shadow-btn: var(--shadow-btn-v);
+  --shadow-card: var(--shadow-card-v);
+  --shadow-pop: var(--shadow-pop-v);
+}
+
+/* --------------------------------------------------------------------------
+   深色主题（默认）
+   -------------------------------------------------------------------------- */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --app: #0d0e12;
+  --panel: #16171c;
+  --field: #1c1e24;
+  --chip: rgba(255, 255, 255, 0.07);
+  --sunken: #0a0b0e;
+  --hover: rgba(255, 255, 255, 0.06);
+
+  --line: rgba(255, 255, 255, 0.075);
+  --line-strong: rgba(255, 255, 255, 0.17);
+
+  --ink: #eef0f4;
+  --ink-dim: #a4aab6;
+  --ink-faint: #6e7480;
+
+  --primary: #e9e9e9;
+  --primary-hover: #f7f7f7;
+  --on-primary: #17181c;
+  --brand: #8aa6f7;
+  --brand-soft: rgba(104, 134, 244, 0.16);
+  --brand-line: rgba(104, 134, 244, 0.45);
+
+  --pos: #4dbe77;
+  --pos-soft: rgba(77, 190, 119, 0.13);
+  --neg: #e4605e;
+  --neg-soft: rgba(228, 96, 94, 0.13);
+  --warn: #d9a445;
+  --warn-soft: rgba(217, 164, 69, 0.14);
+
+  --scroll-thumb: rgba(255, 255, 255, 0.14);
+  --scroll-thumb-hover: rgba(255, 255, 255, 0.26);
+
+  /* 质感：渐变 / 高光 / 投影 */
+  --app-glow: none;
+  --hero-glow: rgba(79, 111, 232, 0.28);
+  --logo-from: #5b7df2;
+  --logo-to: #38bdf8;
+  --sidebar-top: #191a20;
+  --sidebar-bottom: #14151a;
+  --titlebar-top: #1a1b21;
+  --titlebar-bottom: #15161b;
+  --btn-primary-top: #efefef;
+  --btn-primary-bottom: #dedede;
+  --btn-primary-border: rgba(255, 255, 255, 0.1);
+  --btn-secondary-top: rgba(255, 255, 255, 0.075);
+  --btn-secondary-bottom: rgba(255, 255, 255, 0.025);
+  --btn-secondary-top-h: rgba(255, 255, 255, 0.115);
+  --btn-secondary-bottom-h: rgba(255, 255, 255, 0.045);
+  --btn-inset: rgba(255, 255, 255, 0.12);
+  --btn-danger-top: #e05a5c;
+  --btn-danger-bottom: #cb4a4e;
+  --btn-danger-border: rgba(255, 255, 255, 0.14);
+  --btn-success-top: #3fae66;
+  --btn-success-bottom: #339a57;
+  --btn-success-border: rgba(255, 255, 255, 0.14);
+  --shadow-btn-v: 0 1px 2px rgba(0, 0, 0, 0.4);
+  --shadow-card-v: 0 1px 2px rgba(0, 0, 0, 0.3), 0 8px 24px -12px rgba(0, 0, 0, 0.5);
+  --shadow-pop-v: 0 16px 48px -12px rgba(0, 0, 0, 0.7), 0 2px 8px rgba(0, 0, 0, 0.5);
+  --card-inset: rgba(255, 255, 255, 0.04);
+  --input-inset: rgba(0, 0, 0, 0.25);
+
+  /* 代码高亮 */
+  --tok-comment: #7d848e;
+  --tok-keyword: #e88a8a;
+  --tok-string: #9ecbff;
+  --tok-number: #7fb4e8;
+  --tok-title: #c9a0e8;
+  --tok-attr: #7fb4e8;
+  --tok-builtin: #e0a268;
+  --tok-tag: #8ec99a;
+  --tok-meta: #7d848e;
+}
+
+/* --------------------------------------------------------------------------
+   浅色主题
+   -------------------------------------------------------------------------- */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --app: #ffffff;
+  --panel: #ffffff;
+  --field: #ffffff;
+  --chip: #ececec;
+  --sunken: #ffffff;
+  --hover: rgba(0, 0, 0, 0.045);
+
+  --line: #e7e7e7;
+  --line-strong: #d5d5d5;
+
+  --ink: #1c1c1c;
+  --ink-dim: #5f5f5f;
+  --ink-faint: #9b9b9b;
+
+  --primary: #242424;
+  --primary-hover: #3a3a3a;
+  --on-primary: #ffffff;
+  --brand: #2f63cf;
+  --brand-soft: rgba(47, 99, 207, 0.08);
+  --brand-line: rgba(47, 99, 207, 0.32);
+
+  --pos: #12894a;
+  --pos-soft: rgba(18, 137, 74, 0.09);
+  --neg: #cf3f45;
+  --neg-soft: rgba(207, 63, 69, 0.08);
+  --warn: #96690f;
+  --warn-soft: rgba(150, 105, 15, 0.1);
+
+  --scroll-thumb: rgba(0, 0, 0, 0.18);
+  --scroll-thumb-hover: rgba(0, 0, 0, 0.3);
+
+  /* 质感：白色极简，扁平无渐变 */
+  --app-glow: none;
+  --hero-glow: rgba(47, 99, 207, 0.06);
+  --logo-from: #2f63cf;
+  --logo-to: #2f63cf;
+  --sidebar-top: #ffffff;
+  --sidebar-bottom: #ffffff;
+  --titlebar-top: #ffffff;
+  --titlebar-bottom: #ffffff;
+  --btn-primary-top: #242424;
+  --btn-primary-bottom: #242424;
+  --btn-primary-border: transparent;
+  --btn-secondary-top: #ffffff;
+  --btn-secondary-bottom: #ffffff;
+  --btn-secondary-top-h: #f7f7f7;
+  --btn-secondary-bottom-h: #f7f7f7;
+  --btn-inset: transparent;
+  --btn-danger-top: #cf3f45;
+  --btn-danger-bottom: #cf3f45;
+  --btn-danger-border: transparent;
+  --btn-success-top: #12894a;
+  --btn-success-bottom: #12894a;
+  --btn-success-border: transparent;
+  --shadow-btn-v: 0 1px 1px rgba(0, 0, 0, 0.02);
+  --shadow-card-v: 0 1px 2px rgba(0, 0, 0, 0.03);
+  --shadow-pop-v: 0 12px 32px -8px rgba(0, 0, 0, 0.16), 0 1px 3px rgba(0, 0, 0, 0.06);
+  --card-inset: transparent;
+  --input-inset: rgba(0, 0, 0, 0);
+
+  /* 代码高亮 */
+  --tok-comment: #6e7781;
+  --tok-keyword: #b03453;
+  --tok-string: #0a3c78;
+  --tok-number: #0550ae;
+  --tok-title: #7a3cc9;
+  --tok-attr: #0550ae;
+  --tok-builtin: #953800;
+  --tok-tag: #116731;
+  --tok-meta: #6e7781;
+}
+
+/* 提交图车道色（两种主题通用，取中间明度） */
+:root {
+  --lane-1: #4e9de0;
+  --lane-2: #a97fd8;
+  --lane-3: #3fae83;
+  --lane-4: #d9a13c;
+  --lane-5: #e0686f;
+  --lane-6: #31b3ad;
+  --lane-7: #d67fb4;
+  --lane-8: #8a93a0;
+}
+
+/* ==========================================================================
+   基础样式
+   ========================================================================== */
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--app);
+  background-image: var(--app-glow);
+  background-attachment: fixed;
+  color: var(--ink);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scroll-thumb) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border-radius: 999px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--brand) 30%, transparent);
+}
+
+select option {
+  background-color: var(--panel);
+  color: var(--ink);
+}
+
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* ==========================================================================
+   组件质感层
+   按钮 / 卡片 / 输入 / 徽标 / 面板等共用样式集中在这里，统一调整。
+   ========================================================================== */
+
+@layer components {
+  /* —— 按钮 —— */
+  .ui-btn {
+    position: relative;
+    border: 1px solid transparent;
+    transition:
+      filter 0.14s ease,
+      background-color 0.14s ease,
+      border-color 0.14s ease,
+      color 0.14s ease,
+      box-shadow 0.14s ease;
+  }
+
+  .ui-btn:focus-visible {
+    outline: 2px solid var(--brand-line);
+    outline-offset: 1px;
+  }
+
+  .ui-btn-primary {
+    color: var(--on-primary);
+    border-color: var(--btn-primary-border);
+    background-image: linear-gradient(180deg, var(--btn-primary-top), var(--btn-primary-bottom));
+    box-shadow: inset 0 1px 0 0 var(--btn-inset), var(--shadow-btn-v);
+  }
+
+  .ui-btn-primary:hover {
+    filter: brightness(1.07);
+  }
+
+  .ui-btn-primary:active {
+    filter: brightness(0.95);
+  }
+
+  .ui-btn-secondary {
+    color: var(--ink);
+    border-color: var(--line-strong);
+    background-image: linear-gradient(
+      180deg,
+      var(--btn-secondary-top),
+      var(--btn-secondary-bottom)
+    );
+    box-shadow: inset 0 1px 0 0 var(--btn-inset), var(--shadow-btn-v);
+  }
+
+  .ui-btn-secondary:hover {
+    background-image: linear-gradient(
+      180deg,
+      var(--btn-secondary-top-h),
+      var(--btn-secondary-bottom-h)
+    );
+  }
+
+  .ui-btn-ghost {
+    color: var(--ink-dim);
+  }
+
+  .ui-btn-ghost:hover {
+    background-color: var(--hover);
+    color: var(--ink);
+  }
+
+  .ui-btn-danger {
+    color: var(--on-primary);
+    border-color: var(--btn-danger-border);
+    background-image: linear-gradient(180deg, var(--btn-danger-top), var(--btn-danger-bottom));
+    box-shadow: inset 0 1px 0 0 var(--btn-inset), var(--shadow-btn-v);
+  }
+
+  .ui-btn-danger:hover {
+    filter: brightness(1.07);
+  }
+
+  .ui-btn-success {
+    color: var(--on-primary);
+    border-color: var(--btn-success-border);
+    background-image: linear-gradient(180deg, var(--btn-success-top), var(--btn-success-bottom));
+    box-shadow: inset 0 1px 0 0 var(--btn-inset), var(--shadow-btn-v);
+  }
+
+  .ui-btn-success:hover {
+    filter: brightness(1.07);
+  }
+
+  /* —— 卡片 / 弹层 —— */
+  .ui-card {
+    background-color: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: inset 0 1px 0 0 var(--card-inset), var(--shadow-card-v);
+  }
+
+  .ui-pop {
+    background-color: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    box-shadow: inset 0 1px 0 0 var(--card-inset), var(--shadow-pop-v);
+  }
+
+  /* —— 输入 —— */
+  .ui-input {
+    background-color: var(--field);
+    border: 1px solid var(--line);
+    box-shadow: inset 0 1px 2px var(--input-inset);
+  }
+
+  .ui-input:focus {
+    outline: none;
+    border-color: var(--brand-line);
+    box-shadow: 0 0 0 3px var(--brand-soft);
+  }
+
+  /* —— 徽标 —— */
+  .ui-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 1px 6px;
+    border: 1px solid;
+    border-radius: 5px;
+    font-size: 11px;
+    font-weight: 500;
+    line-height: 1.45;
+  }
+
+  .ui-badge-gray {
+    color: var(--ink-dim);
+    background-color: var(--field);
+    border-color: var(--line);
+  }
+
+  .ui-badge-pos {
+    color: var(--pos);
+    background-color: var(--pos-soft);
+    border-color: color-mix(in srgb, var(--pos) 30%, transparent);
+  }
+
+  .ui-badge-neg {
+    color: var(--neg);
+    background-color: var(--neg-soft);
+    border-color: color-mix(in srgb, var(--neg) 30%, transparent);
+  }
+
+  .ui-badge-warn {
+    color: var(--warn);
+    background-color: var(--warn-soft);
+    border-color: color-mix(in srgb, var(--warn) 32%, transparent);
+  }
+
+  .ui-badge-brand {
+    color: var(--brand);
+    background-color: var(--brand-soft);
+    border-color: var(--brand-line);
+  }
+
+  /* —— 面板渐变 —— */
+  .ui-sidebar {
+    background-image: linear-gradient(180deg, var(--sidebar-top), var(--sidebar-bottom));
+  }
+
+  .ui-titlebar {
+    background-image: linear-gradient(180deg, var(--titlebar-top), var(--titlebar-bottom));
+  }
+
+  /* —— 品牌 Logo —— */
+  .ui-logo {
+    background-image: linear-gradient(135deg, var(--logo-from), var(--logo-to));
+    box-shadow:
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.25),
+      0 2px 8px -2px rgba(74, 106, 226, 0.55);
+  }
+
+  /* —— 欢迎区（Hero）—— */
+  .ui-hero {
+    position: relative;
+    overflow: hidden;
+    background-color: var(--panel);
+    border: 1px solid var(--line);
+    border-radius: 14px;
+    box-shadow: inset 0 1px 0 0 var(--card-inset), var(--shadow-card-v);
+  }
+
+  .ui-hero::before {
+    content: "";
+    position: absolute;
+    inset: -45% -15% auto;
+    height: 85%;
+    background: radial-gradient(48% 62% at 50% 0%, var(--hero-glow), transparent 72%);
+    pointer-events: none;
+  }
+
+  /* —— 导航项 —— */
+  .ui-nav-item {
+    color: var(--ink-dim);
+    border-radius: 6px;
+    transition:
+      background-color 0.14s ease,
+      color 0.14s ease;
+  }
+
+  .ui-nav-item:hover {
+    background-color: var(--hover);
+    color: var(--ink);
+  }
+
+  .ui-nav-item-active {
+    color: var(--brand);
+    background-color: var(--brand-soft);
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.05);
+  }
+
+  /* —— 标题栏按钮 —— */
+  .ui-caption-btn {
+    color: var(--ink-dim);
+    transition:
+      background-color 0.12s ease,
+      color 0.12s ease;
+  }
+
+  .ui-caption-btn:hover {
+    background-color: var(--hover);
+    color: var(--ink);
+  }
+
+  .ui-caption-btn-close:hover {
+    background-color: #e5484d;
+    color: #ffffff;
+  }
+}
+
+/* ==========================================================================
+   highlight.js 配色（跟随主题令牌）
+   ========================================================================== */
+
+.hljs {
+  color: var(--ink);
+  background: transparent;
+}
+
+.hljs-comment,
+.hljs-quote,
+.hljs-doctag {
+  color: var(--tok-comment);
+  font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-operator,
+.hljs-subst {
+  color: var(--tok-keyword);
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition {
+  color: var(--tok-string);
+}
+
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-variable,
+.hljs-template-variable {
+  color: var(--tok-number);
+}
+
+.hljs-title,
+.hljs-title.function_,
+.hljs-selector-class,
+.hljs-selector-id {
+  color: var(--tok-title);
+}
+
+.hljs-attr,
+.hljs-property,
+.hljs-built_in,
+.hljs-type,
+.hljs-class {
+  color: var(--tok-attr);
+}
+
+.hljs-tag,
+.hljs-name,
+.hljs-selector-attr,
+.hljs-selector-pseudo {
+  color: var(--tok-tag);
+}
+
+.hljs-meta,
+.hljs-meta .hljs-keyword {
+  color: var(--tok-meta);
+}
+
+.hljs-deletion {
+  color: var(--neg);
+}
+
+.hljs-strong {
+  font-weight: 600;
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
