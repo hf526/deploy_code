@@ -584,7 +584,7 @@ fn remote_pidfile(target: &str, record_id: &str) -> String {
 }
 
 /// 终止 pidfile 中记录的脚本进程组，并删除 pidfile。
-fn kill_script(pidfile: &str) -> String {
+pub(crate) fn kill_script(pidfile: &str) -> String {
     let file = shell_quote(pidfile);
     // 先发信号再删 pidfile：中途被中断时，脚本仍可被下次清理定位到。
     // 进程组优先从 /proc 读取（Linux 通用），失败再退回 ps，兼容精简系统的 ps。

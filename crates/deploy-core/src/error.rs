@@ -21,6 +21,12 @@ pub enum CoreError {
     #[error("部署失败: {0}")]
     Deploy(String),
 
+    #[error("备份失败: {0}")]
+    Backup(String),
+
+    #[error("Pages 部署失败: {0}")]
+    Pages(String),
+
     #[error("IO 错误: {0}")]
     Io(#[from] std::io::Error),
 
@@ -47,6 +53,14 @@ impl CoreError {
 
     pub fn deploy(msg: impl Into<String>) -> Self {
         Self::Deploy(msg.into())
+    }
+
+    pub fn backup(msg: impl Into<String>) -> Self {
+        Self::Backup(msg.into())
+    }
+
+    pub fn pages(msg: impl Into<String>) -> Self {
+        Self::Pages(msg.into())
     }
 
     pub fn io_path(path: impl Into<PathBuf>, err: std::io::Error) -> Self {

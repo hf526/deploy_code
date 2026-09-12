@@ -8,9 +8,11 @@ import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/ui";
 import { useApp } from "./lib/store";
-import type { DeployEvent } from "./lib/types";
+import type { BackupEvent, DeployEvent, PagesEvent } from "./lib/types";
+import BackupsPage from "./pages/BackupsPage";
 import DeployPage from "./pages/DeployPage";
 import HistoryPage from "./pages/HistoryPage";
+import PagesPage from "./pages/PagesPage";
 import RepoDetailPage from "./pages/RepoDetailPage";
 import ReposPage from "./pages/ReposPage";
 import ServersPage from "./pages/ServersPage";
@@ -30,6 +32,8 @@ function TabsAndRoutes() {
           <Route path="/repos/:repoId" element={<RepoDetailPage />} />
           <Route path="/deploy" element={<DeployPage />} />
           <Route path="/servers" element={<ServersPage />} />
+          <Route path="/backups" element={<BackupsPage />} />
+          <Route path="/pages" element={<PagesPage />} />
           <Route path="/history" element={<HistoryPage />} />
           <Route path="/settings" element={<SettingsPage />} />
           <Route path="*" element={<Navigate to="/repos" replace />} />
@@ -42,6 +46,8 @@ function TabsAndRoutes() {
 export default function App() {
   const loadAll = useApp((state) => state.loadAll);
   const handleDeployEvent = useApp((state) => state.handleDeployEvent);
+  const handleBackupEvent = useApp((state) => state.handleBackupEvent);
+  const handlePagesEvent = useApp((state) => state.handlePagesEvent);
 
   useEffect(() => {
     void loadAll();
@@ -66,6 +72,46 @@ export default function App() {
       unlisten?.();
     };
   }, [handleDeployEvent]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<BackupEvent>("backup://event", (event) => {
+      handleBackupEvent(event.payload);
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [handleBackupEvent]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<PagesEvent>("pages://event", (event) => {
+      handlePagesEvent(event.payload);
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [handlePagesEvent]);
 
   return (
     <HashRouter>

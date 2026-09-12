@@ -4,6 +4,8 @@ target/
 src-tauri/gen/
 config.json
 history.json
+backups.json
+pages.json
 .env*
 *.pem
 *.key

@@ -23,7 +23,8 @@ fn under_git(path: &Path) -> bool {
 }
 
 /// 监听仓库工作区文件变化（忽略 .git，避免 git 命令自触发回环）。
-#[tauri::command(async)]
+/// 使用同步命令：保证与 unwatch 的调用顺序一致，避免快速切换仓库时 watcher 泄漏。
+#[tauri::command]
 pub fn watch_repo(
     state: State<AppState>,
     app: AppHandle,

@@ -42,6 +42,14 @@ pub enum Command {
     #[command(subcommand)]
     History(HistoryCommand),
 
+    /// 数据库备份（服务器 PostgreSQL -> 远端 PostgreSQL）
+    #[command(subcommand)]
+    Backup(BackupCommand),
+
+    /// Cloudflare Pages 部署（wrangler）
+    #[command(subcommand)]
+    Pages(PagesCommand),
+
     /// 打印数据目录位置
     Where,
 }
@@ -176,6 +184,30 @@ pub struct ServerAddArgs {
     /// 默认部署目录
     #[arg(short, long)]
     pub dir: Option<String>,
+    /// 数据库采集方式：docker / system
+    #[arg(long)]
+    pub db_mode: Option<String>,
+    /// 数据库所在容器名（docker 模式）
+    #[arg(long)]
+    pub db_container: Option<String>,
+    /// 数据库名
+    #[arg(long)]
+    pub db_name: Option<String>,
+    /// 数据库用户名
+    #[arg(long)]
+    pub db_user: Option<String>,
+    /// 数据库密码
+    #[arg(long)]
+    pub db_password: Option<String>,
+    /// 备份的 schema（默认 public）
+    #[arg(long)]
+    pub db_schema: Option<String>,
+    /// 该服务器默认使用的备份目标（id / 名称）
+    #[arg(long)]
+    pub backup_target: Option<String>,
+    /// 该服务器专用的数据库连接串（旧字段，优先使用 --backup-target）
+    #[arg(long)]
+    pub supabase_url: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -200,6 +232,124 @@ pub struct DeployArgs {
     /// 跳过脚本执行
     #[arg(long)]
     pub no_scripts: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupCommand {
+    /// 执行一次备份（pg_dump -> 全量覆盖到目标数据库）
+    Run {
+        /// 服务器 id / 名称 / host
+        server: String,
+        /// 备份目标 id / 名称（默认使用服务器或全局默认目标）
+        #[arg(short, long)]
+        target: Option<String>,
+        /// 直接指定目标连接串（优先级最高）
+        #[arg(long)]
+        supabase_url: Option<String>,
+        /// 覆盖数据库名
+        #[arg(long)]
+        database: Option<String>,
+        /// 覆盖 schema
+        #[arg(long)]
+        schema: Option<String>,
+    },
+    /// 管理备份目标（Supabase / Aiven / Neon 等）
+    #[command(subcommand)]
+    Target(TargetCommand),
+    /// 列出备份记录
+    List {
+        /// 只查看某台服务器
+        #[arg(short, long)]
+        server: Option<String>,
+        /// 条数
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 查看某条备份记录详情（含日志）
+    Show { record: String },
+    /// 清空全部备份记录
+    Clear {
+        /// 确认执行
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 检查备份环境（pg_dump 与目标连通性）
+    Test { server: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum TargetCommand {
+    /// 添加备份目标
+    Add {
+        /// 目标名称（如 Supabase / Aiven / Neon）
+        name: String,
+        /// postgres:// 或 postgresql:// 连接串
+        url: String,
+    },
+    /// 列出备份目标
+    List,
+    /// 删除备份目标
+    Remove { target: String },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PagesCommand {
+    /// 配置某个仓库的 Pages 部署参数
+    Config {
+        /// 仓库 id / 名称 / 路径
+        repo: String,
+        /// Cloudflare Pages 项目名
+        #[arg(short, long)]
+        project: Option<String>,
+        /// 构建命令（如 npm run build）
+        #[arg(short, long)]
+        build: Option<String>,
+        /// 输出目录（默认 dist）
+        #[arg(short, long)]
+        output: Option<String>,
+        /// 生产分支（默认 main）
+        #[arg(long)]
+        branch: Option<String>,
+    },
+    /// 构建并部署到 Cloudflare Pages
+    Run {
+        /// 仓库 id / 名称 / 路径
+        repo: String,
+        /// 覆盖项目名
+        #[arg(short, long)]
+        project: Option<String>,
+        /// 覆盖构建命令
+        #[arg(short, long)]
+        build: Option<String>,
+        /// 覆盖输出目录
+        #[arg(short, long)]
+        output: Option<String>,
+        /// 覆盖分支
+        #[arg(long)]
+        branch: Option<String>,
+        /// 跳过构建，直接上传现有产物
+        #[arg(long)]
+        skip_build: bool,
+    },
+    /// 列出 Pages 部署记录
+    List {
+        /// 只查看某个仓库
+        #[arg(short, long)]
+        repo: Option<String>,
+        /// 条数
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 查看某条部署记录详情（含日志）
+    Show { record: String },
+    /// 清空全部 Pages 部署记录
+    Clear {
+        /// 确认执行
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 检查 wrangler / Token / Account 是否可用
+    Test { repo: String },
 }
 
 #[derive(Subcommand, Debug)]

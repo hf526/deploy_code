@@ -16,10 +16,12 @@ export function LogConsole({
   lines,
   className,
   emptyText = "等待部署开始 ...",
+  title = "部署日志",
 }: {
   lines: LogLine[];
   className?: string;
   emptyText?: string;
+  title?: string;
 }) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [autoScroll, setAutoScroll] = useState(true);
@@ -47,7 +49,7 @@ export function LogConsole({
     >
       <div className="flex shrink-0 items-center gap-2 border-b border-line bg-panel px-3 py-1.5">
         <TerminalSquare className="size-3.5 text-ink-dim" />
-        <span className="text-xs font-medium text-ink-dim">部署日志</span>
+        <span className="text-xs font-medium text-ink-dim">{title}</span>
         {!autoScroll && (
           <button
             onClick={() => setAutoScroll(true)}

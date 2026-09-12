@@ -1,6 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  BackupRecord,
+  BackupRequest,
+  BackupTarget,
   Branch,
   Commit,
   DeployRecord,
@@ -8,6 +11,9 @@ import type {
   FileContent,
   FileEntry,
   GraphCommit,
+  PagesConfig,
+  PagesDeployRecord,
+  PagesRequest,
   RepoDetail,
   RepoInfo,
   RepoStatus,
@@ -111,4 +117,29 @@ export const api = {
   getRecord: (recordId: string) => invoke<DeployRecord>("get_record", { recordId }),
   deleteRecord: (recordId: string) => invoke<boolean>("delete_record", { recordId }),
   clearHistory: () => invoke<void>("clear_history"),
+
+  // 数据库备份
+  startBackup: (request: BackupRequest) => invoke<string>("start_backup", { request }),
+  listBackups: (serverId?: string | null) =>
+    invoke<BackupRecord[]>("list_backups", { serverId: serverId ?? null }),
+  getBackup: (backupId: string) => invoke<BackupRecord>("get_backup", { backupId }),
+  deleteBackup: (backupId: string) => invoke<boolean>("delete_backup", { backupId }),
+  clearBackups: () => invoke<void>("clear_backups"),
+  testBackup: (request: BackupRequest) => invoke<string>("test_backup", { request }),
+  listBackupTargets: () => invoke<BackupTarget[]>("list_backup_targets"),
+  saveBackupTargets: (targets: BackupTarget[]) =>
+    invoke<BackupTarget[]>("save_backup_targets", { targets }),
+
+  // Cloudflare Pages
+  startPagesDeploy: (request: PagesRequest) => invoke<string>("start_pages_deploy", { request }),
+  listPagesRecords: (repoId?: string | null) =>
+    invoke<PagesDeployRecord[]>("list_pages_records", { repoId: repoId ?? null }),
+  getPagesRecord: (recordId: string) => invoke<PagesDeployRecord>("get_pages_record", { recordId }),
+  deletePagesRecord: (recordId: string) => invoke<boolean>("delete_pages_record", { recordId }),
+  clearPagesRecords: () => invoke<void>("clear_pages_records"),
+  getPagesConfig: (repoId: string) => invoke<PagesConfig>("get_pages_config", { repoId }),
+  savePagesConfig: (repoId: string, config: PagesConfig) =>
+    invoke<PagesConfig>("save_pages_config", { repoId, config }),
+  testPages: (repoId: string, config?: PagesConfig) =>
+    invoke<string>("test_pages", { repoId, config }),
 };

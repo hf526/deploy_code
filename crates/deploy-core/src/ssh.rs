@@ -56,33 +56,40 @@ impl SshClient {
         .map_err(|_| CoreError::ssh(format!("连接 {label} 超时")))?
         .map_err(|e| CoreError::ssh(format!("连接 {label} 失败: {e}")))?;
 
-        let authenticated = match &server.auth {
-            SshAuth::Password { password } => session
-                .authenticate_password(server.username.clone(), password.clone())
-                .await
-                .map_err(|e| CoreError::ssh(format!("认证失败: {e}")))?
-                .success(),
-            SshAuth::PrivateKey {
-                key_path,
-                passphrase,
-            } => {
-                let key = load_secret_key(key_path, passphrase.as_deref()).map_err(|e| {
-                    CoreError::ssh(format!("读取私钥失败 {}: {e}", key_path))
-                })?;
-                let hash_alg = session
-                    .best_supported_rsa_hash()
+        // 认证阶段同样受限：服务器接受 TCP 连接但迟迟不完成认证时不能永久挂起。
+        let authenticated = match tokio::time::timeout(timeout, async {
+            match &server.auth {
+                SshAuth::Password { password } => session
+                    .authenticate_password(server.username.clone(), password.clone())
                     .await
-                    .map_err(|e| CoreError::ssh(format!("协商密钥算法失败: {e}")))?
-                    .flatten();
-                session
-                    .authenticate_publickey(
-                        server.username.clone(),
-                        PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
-                    )
-                    .await
-                    .map_err(|e| CoreError::ssh(format!("认证失败: {e}")))?
-                    .success()
+                    .map_err(|e| CoreError::ssh(format!("认证失败: {e}")))
+                    .map(|result| result.success()),
+                SshAuth::PrivateKey {
+                    key_path,
+                    passphrase,
+                } => {
+                    let key = load_secret_key(key_path, passphrase.as_deref())
+                        .map_err(|e| CoreError::ssh(format!("读取私钥失败 {key_path}: {e}")))?;
+                    let hash_alg = session
+                        .best_supported_rsa_hash()
+                        .await
+                        .map_err(|e| CoreError::ssh(format!("协商密钥算法失败: {e}")))?
+                        .flatten();
+                    session
+                        .authenticate_publickey(
+                            server.username.clone(),
+                            PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg),
+                        )
+                        .await
+                        .map_err(|e| CoreError::ssh(format!("认证失败: {e}")))
+                        .map(|result| result.success())
+                }
             }
+        })
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => return Err(CoreError::ssh(format!("认证 {label} 超时"))),
         };
 
         if !authenticated {
@@ -154,19 +161,21 @@ impl SshClient {
             .map_err(|e| CoreError::ssh(format!("执行命令失败: {e}")))?;
 
         let mut exit_code: i32 = -1;
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
+        // 按字节缓存：SSH 数据块可能从 UTF-8 多字节字符中间切断，
+        // 逐块 from_utf8_lossy 会把字符边界处的字符破坏成 U+FFFD。
+        let mut stdout_buf: Vec<u8> = Vec::new();
+        let mut stderr_buf: Vec<u8> = Vec::new();
 
         while let Some(msg) = channel.wait().await {
             match msg {
                 ChannelMsg::Data { data } => {
-                    stdout_buf.push_str(&String::from_utf8_lossy(&data));
-                    drain_lines(&mut stdout_buf, OutputKind::Stdout, on_output);
+                    stdout_buf.extend_from_slice(&data);
+                    drain_lines_bytes(&mut stdout_buf, OutputKind::Stdout, on_output);
                 }
                 ChannelMsg::ExtendedData { data, ext } => {
                     let _ = ext;
-                    stderr_buf.push_str(&String::from_utf8_lossy(&data));
-                    drain_lines(&mut stderr_buf, OutputKind::Stderr, on_output);
+                    stderr_buf.extend_from_slice(&data);
+                    drain_lines_bytes(&mut stderr_buf, OutputKind::Stderr, on_output);
                 }
                 ChannelMsg::ExitStatus { exit_status } => {
                     exit_code = exit_status as i32;
@@ -176,8 +185,8 @@ impl SshClient {
             }
         }
 
-        flush_rest(&mut stdout_buf, OutputKind::Stdout, on_output);
-        flush_rest(&mut stderr_buf, OutputKind::Stderr, on_output);
+        flush_rest_bytes(&mut stdout_buf, OutputKind::Stdout, on_output);
+        flush_rest_bytes(&mut stderr_buf, OutputKind::Stderr, on_output);
         Ok(exit_code)
     }
 
@@ -263,24 +272,39 @@ impl SshClient {
     }
 }
 
-fn drain_lines(
-    buffer: &mut String,
+fn drain_lines_bytes(
+    buffer: &mut Vec<u8>,
     kind: OutputKind,
     on_output: &mut (dyn FnMut(OutputKind, String) + Send),
 ) {
-    while let Some(pos) = buffer.find('\n') {
-        let line: String = buffer.drain(..=pos).collect();
-        on_output(kind, line.trim_end_matches(['\r', '\n']).to_string());
+    let mut start = 0usize;
+    while let Some(pos) = buffer[start..].iter().position(|byte| *byte == b'\n') {
+        let end = start + pos;
+        // 整行已完整，此时解码不会破坏多字节字符。
+        let line = String::from_utf8_lossy(&buffer[..end]);
+        on_output(kind, line.trim_end_matches('\r').to_string());
+        start = end + 1;
+    }
+    if start > 0 {
+        buffer.drain(..start);
+    }
+    // 远端持续输出而无换行时，缓存不能无限增长：超过 1 MiB 先按块吐出。
+    const MAX_PENDING: usize = 1024 * 1024;
+    if buffer.len() > MAX_PENDING {
+        let line = String::from_utf8_lossy(buffer);
+        on_output(kind, line.trim_end().to_string());
+        buffer.clear();
     }
 }
 
-fn flush_rest(
-    buffer: &mut String,
+fn flush_rest_bytes(
+    buffer: &mut Vec<u8>,
     kind: OutputKind,
     on_output: &mut (dyn FnMut(OutputKind, String) + Send),
 ) {
     if !buffer.is_empty() {
-        on_output(kind, buffer.trim_end_matches(['\r', '\n']).to_string());
+        let line = String::from_utf8_lossy(buffer);
+        on_output(kind, line.trim_end_matches(['\r', '\n']).to_string());
         buffer.clear();
     }
 }

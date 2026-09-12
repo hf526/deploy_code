@@ -33,9 +33,29 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 - 支持只执行指定脚本，或跳过脚本执行
 - 部署记录持久化（版本、服务器、完整日志），可一键重新部署
 
+### 数据库备份（PostgreSQL -> Supabase / Aiven / Neon）
+
+把服务器上的 PostgreSQL schema 全量同步到远端 PostgreSQL，全程在服务器上完成，不经过本机：
+
+- 来源支持 Docker 容器（`docker exec pg_dump`）或服务器本机 `pg_dump`，可配置库名 / 用户 / 密码 / schema
+- 备份目标（Supabase / Aiven / Neon 等）可配置多个，每次备份选择其中一个；支持全局默认目标，服务器可绑定自己的默认目标
+- 全量覆盖：恢复前清空目标 schema 并恢复默认角色授权（Supabase 的 anon / authenticated / service_role 会自动恢复）
+- 实时日志与进度；支持环境检查（pg_dump 版本 + 目标连通性）
+- 备份记录持久化，可查看 / 删除 / 清空
+
+### Cloudflare Pages 部署
+
+仓库本地构建（可选）后通过 `wrangler` 一键部署到 Cloudflare Pages：
+
+- 按仓库配置项目名 / 构建命令 / 输出目录（dist 等）/ 生产分支
+- 一键「构建并部署」，实时日志；可跳过构建直接上传已有产物
+- 自动创建 Pages 项目（已存在则跳过），从 wrangler 输出解析部署地址
+- 支持环境检查（wrangler + Token / Account 校验）；部署记录持久化
+- 依赖本机 Node.js（wrangler 通过 `npx` 调用）；API Token 通过环境变量传递，不进入命令行
+
 ### CLI
 
-命令行覆盖仓库 / 分支 / 服务器 / 部署 / 历史等操作，适合脚本化与服务器环境使用。
+命令行覆盖仓库 / 分支 / 服务器 / 部署 / 备份 / Pages / 历史等操作，适合脚本化与服务器环境使用。
 
 ## 技术栈
 
@@ -73,9 +93,23 @@ deploy_code/
 配置与部署历史保存在系统数据目录，**不会写入代码仓库**：
 
 - Windows：`%APPDATA%\deploycode\DeployCode\data`
-- 文件：`config.json`（服务器 / 仓库 / 设置）、`history.json`（部署记录）、`temp/`（临时归档）
+- 文件：`config.json`（服务器 / 仓库 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
 
-> ⚠️ SSH 密码与私钥口令以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
+> ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
+
+### 备份目标连接串
+
+在 **设置 → 数据库备份目标** 中添加，支持任意 PostgreSQL（Supabase / Aiven / Neon / 自建）：
+
+```text
+postgresql://<user>:<password>@<host>:5432/<database>
+```
+
+- Supabase：从控制台 **Connect** 面板获取，推荐 Session Pooler（兼容 IPv4）：
+  `postgresql://postgres.<project-ref>:<password>@aws-0-<region>.pooler.supabase.com:5432/postgres`
+- Aiven / Neon：使用控制台提供的 PostgreSQL 连接串（Neon 需带 `?sslmode=require`）
+- 备份脚本会在服务器上调用 `psql`；若服务器未安装 `postgresql-client`，docker 模式下会自动改用数据库容器内的 `psql`
+- 凭据写入服务器临时脚本（权限 0700）并在结束后删除，请确保服务器仅受信任用户可登录
 
 ## 开发与构建
 
@@ -119,6 +153,22 @@ deploy-code-cli repo add /path/to/myapp --name myapp --server prod --dir /opt/my
 deploy-code-cli branch list myapp --all
 deploy-code-cli deploy myapp --rev main
 deploy-code-cli history list -n 10
+
+# 数据库备份（服务器 PG -> Supabase / Aiven / Neon 等）
+deploy-code-cli backup target add Aiven "postgresql://user:password@host:5432/db"
+deploy-code-cli backup target add Neon "postgresql://user:password@host:5432/db"
+deploy-code-cli backup target list
+deploy-code-cli backup test prod
+deploy-code-cli backup run prod --target Aiven
+deploy-code-cli backup list -n 10
+deploy-code-cli backup show <记录ID>
+
+# Cloudflare Pages 部署
+deploy-code-cli pages config myapp --project my-site --build "npm run build" --output dist
+deploy-code-cli pages test myapp
+deploy-code-cli pages run myapp
+deploy-code-cli pages list -n 10
+deploy-code-cli pages show <记录ID>
 
 # 查看数据目录
 deploy-code-cli where

@@ -1,9 +1,13 @@
 use std::sync::Arc;
 
 use deploy_core::models::{
-    DeployEvent, DeployRecord, DeployRequest, DeployStatus, RepoConfig, SshAuth,
+    BackupEvent, BackupRequest, BackupTarget, DeployEvent, DeployRecord, DeployRequest,
+    DeployStatus, PagesEvent, PagesRequest, RepoConfig, ServerConfig, SshAuth,
 };
-use deploy_core::{repo_info, CoreError, DeployEngine, Git, Result, Store};
+use deploy_core::{
+    backup::mask_database_url, repo_info, BackupEngine, CoreError, DeployEngine, Git, PagesEngine,
+    Result, Store,
+};
 use tokio::sync::mpsc;
 
 use crate::cli::*;
@@ -16,6 +20,8 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Server(command) => server_command(cli, command).await,
         Command::Deploy(args) => deploy_command(cli, args).await,
         Command::History(command) => history_command(cli, command).await,
+        Command::Backup(command) => backup_command(cli, command).await,
+        Command::Pages(command) => pages_command(cli, command).await,
         Command::Where => {
             let store = open_store(cli)?;
             output::info(store.base_dir().display().to_string());
@@ -24,7 +30,7 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
     }
 }
 
-fn open_store(cli: &Cli) -> Result<Store> {
+pub fn open_store(cli: &Cli) -> Result<Store> {
     match &cli.data_dir {
         Some(dir) => Ok(Store::new(dir)),
         None => Store::default_store(),
@@ -36,6 +42,46 @@ fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
     Ok(())
 }
 
+/// JSON 输出中用于替换密码的占位符。
+const MASKED_SECRET: &str = "***";
+
+/// 复制一份服务器配置用于 JSON 输出，隐藏 SSH 密码 / 私钥口令 / 数据库密码与连接串密码。
+fn redact_server(server: &ServerConfig) -> ServerConfig {
+    let mut copy = server.clone();
+    copy.auth = match &server.auth {
+        SshAuth::Password { .. } => SshAuth::Password {
+            password: MASKED_SECRET.to_string(),
+        },
+        SshAuth::PrivateKey { key_path, passphrase } => SshAuth::PrivateKey {
+            key_path: key_path.clone(),
+            passphrase: passphrase.as_ref().map(|_| MASKED_SECRET.to_string()),
+        },
+    };
+    if let Some(source) = copy.db_backup.as_mut() {
+        source.password = MASKED_SECRET.to_string();
+    }
+    if let Some(url) = copy.supabase_url.as_deref() {
+        copy.supabase_url = Some(mask_database_url(url));
+    }
+    copy
+}
+
+/// 复制一份备份目标用于 JSON 输出，隐藏连接串中的密码。
+fn redact_target(target: &BackupTarget) -> BackupTarget {
+    BackupTarget {
+        id: target.id.clone(),
+        name: target.name.clone(),
+        url: mask_database_url(&target.url),
+    }
+}
+
+/// 抢占跨进程任务锁；已被 GUI / 其他命令行进程持有时返回统一错误。
+fn claim_task_lock(store: &Store, name: &str) -> Result<deploy_core::store::TaskLock> {
+    store.try_task_lock(name)?.ok_or_else(|| {
+        CoreError::config("已有任务正在进行（GUI 或其他命令行进程），请稍后再试")
+    })
+}
+
 // ---------------------------------------------------------------------------
 // repo
 // ---------------------------------------------------------------------------
@@ -44,7 +90,6 @@ fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
     let store = open_store(cli)?;
     match command {
         RepoCommand::Add(args) => {
-            let mut config = store.load_config()?;
             Git::open(&args.path)?;
 
             let path = deploy_core::process::canonicalize_path(&args.path);
@@ -56,27 +101,30 @@ fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
                         .map(|value| value.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "repo".to_string());
-
-            if config.repos.iter().any(|repo| repo.name == name) {
-                return Err(CoreError::config(format!("仓库名称已存在: {name}")));
-            }
             let normalized = path.to_string_lossy().replace('\\', "/");
-            if config.repos.iter().any(|repo| {
-                repo.path.replace('\\', "/").trim_end_matches('/') == normalized.trim_end_matches('/')
-            }) {
-                return Err(CoreError::config(format!("仓库已添加: {}", path.display())));
-            }
 
-            let default_server_id = match &args.server {
-                Some(key) => Some(Store::find_server(&config, key)?.id.clone()),
-                None => None,
-            };
+            let repo = store.mutate_config(|config| {
+                if config.repos.iter().any(|repo| repo.name == name) {
+                    return Err(CoreError::config(format!("仓库名称已存在: {name}")));
+                }
+                if config.repos.iter().any(|repo| {
+                    repo.path.replace('\\', "/").trim_end_matches('/')
+                        == normalized.trim_end_matches('/')
+                }) {
+                    return Err(CoreError::config(format!("仓库已添加: {}", path.display())));
+                }
 
-            let mut repo = RepoConfig::new(name, path.to_string_lossy().into_owned());
-            repo.default_server_id = default_server_id;
-            repo.default_target_dir = args.dir.clone().unwrap_or_default();
-            config.repos.push(repo.clone());
-            store.save_config(&config)?;
+                let default_server_id = match &args.server {
+                    Some(key) => Some(Store::find_server(config, key)?.id.clone()),
+                    None => None,
+                };
+
+                let mut repo = RepoConfig::new(name.clone(), path.to_string_lossy().into_owned());
+                repo.default_server_id = default_server_id;
+                repo.default_target_dir = args.dir.clone().unwrap_or_default();
+                config.repos.push(repo.clone());
+                Ok(repo)
+            })?;
 
             if cli.json {
                 return print_json(&repo_info(&repo));
@@ -105,10 +153,11 @@ fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
             Ok(())
         }
         RepoCommand::Remove { repo } => {
-            let mut config = store.load_config()?;
-            let target = Store::find_repo(&config, repo)?.id.clone();
-            config.repos.retain(|item| item.id != target);
-            store.save_config(&config)?;
+            store.mutate_config(|config| {
+                let target = Store::find_repo(config, repo)?.id.clone();
+                config.repos.retain(|item| item.id != target);
+                Ok(())
+            })?;
             output::success(format!("已移除仓库 {repo}"));
             Ok(())
         }
@@ -299,7 +348,6 @@ async fn server_command(cli: &Cli, command: &ServerCommand) -> Result<()> {
     let store = open_store(cli)?;
     match command {
         ServerCommand::Add(args) => {
-            let mut config = store.load_config()?;
             let auth = match (&args.password, &args.key) {
                 (Some(_), Some(_)) => {
                     return Err(CoreError::config("--password 与 --key 只能提供一个"))
@@ -316,29 +364,71 @@ async fn server_command(cli: &Cli, command: &ServerCommand) -> Result<()> {
                 }
             };
 
-            let mut server = match config.servers.iter().find(|item| item.name == args.name) {
-                Some(existing) => existing.clone(),
-                None => deploy_core::models::ServerConfig::new(
-                    args.name.clone(),
-                    args.host.clone(),
-                    args.user.clone(),
-                    auth.clone(),
-                ),
-            };
-            server.host = args.host.clone();
-            server.port = args.port;
-            server.username = args.user.clone();
-            server.auth = auth;
-            if let Some(dir) = &args.dir {
-                server.default_target_dir = dir.clone();
-            }
+            let (server, is_new) = store.mutate_config(|config| {
+                let mut server = match config.servers.iter().find(|item| item.name == args.name) {
+                    Some(existing) => existing.clone(),
+                    None => deploy_core::models::ServerConfig::new(
+                        args.name.clone(),
+                        args.host.clone(),
+                        args.user.clone(),
+                        auth.clone(),
+                    ),
+                };
+                server.host = args.host.clone();
+                server.port = args.port;
+                server.username = args.user.clone();
+                server.auth = auth.clone();
+                if let Some(dir) = &args.dir {
+                    server.default_target_dir = dir.clone();
+                }
 
-            let is_new = !config.servers.iter().any(|item| item.id == server.id);
-            Store::upsert_server(&mut config, server.clone())?;
-            store.save_config(&config)?;
+                let has_db_args = args.db_mode.is_some()
+                    || args.db_container.is_some()
+                    || args.db_name.is_some()
+                    || args.db_user.is_some()
+                    || args.db_password.is_some()
+                    || args.db_schema.is_some();
+                if has_db_args {
+                    let mut source = server.db_backup.clone().unwrap_or_default();
+                    if let Some(mode) = &args.db_mode {
+                        source.mode = mode.clone();
+                    }
+                    if let Some(container) = &args.db_container {
+                        source.container = container.clone();
+                    }
+                    if let Some(name) = &args.db_name {
+                        source.database = name.clone();
+                    }
+                    if let Some(user) = &args.db_user {
+                        source.username = user.clone();
+                    }
+                    if let Some(password) = &args.db_password {
+                        source.password = password.clone();
+                    }
+                    if let Some(schema) = &args.db_schema {
+                        source.schema = schema.clone();
+                    }
+                    server.db_backup = Some(source);
+                }
+                if let Some(url) = &args.supabase_url {
+                    server.supabase_url = Some(url.clone());
+                }
+                if let Some(key) = &args.backup_target {
+                    let target = config
+                        .backup_targets
+                        .iter()
+                        .find(|target| target.id == *key || target.name == *key)
+                        .ok_or_else(|| CoreError::not_found(format!("备份目标不存在: {key}")))?;
+                    server.backup_target_id = Some(target.id.clone());
+                }
+
+                let is_new = !config.servers.iter().any(|item| item.id == server.id);
+                Store::upsert_server(config, server.clone())?;
+                Ok((server, is_new))
+            })?;
 
             if cli.json {
-                return print_json(&server);
+                return print_json(&redact_server(&server));
             }
             output::success(format!(
                 "{}服务器 {} ({}@{})",
@@ -352,7 +442,8 @@ async fn server_command(cli: &Cli, command: &ServerCommand) -> Result<()> {
         ServerCommand::List => {
             let config = store.load_config()?;
             if cli.json {
-                return print_json(&config.servers);
+                let servers: Vec<_> = config.servers.iter().map(redact_server).collect();
+                return print_json(&servers);
             }
             if config.servers.is_empty() {
                 output::dim("暂无服务器，使用 `server add` 添加");
@@ -376,10 +467,11 @@ async fn server_command(cli: &Cli, command: &ServerCommand) -> Result<()> {
             Ok(())
         }
         ServerCommand::Remove { server } => {
-            let mut config = store.load_config()?;
-            let id = Store::find_server(&config, server)?.id.clone();
-            config.servers.retain(|item| item.id != id);
-            store.save_config(&config)?;
+            store.mutate_config(|config| {
+                let id = Store::find_server(config, server)?.id.clone();
+                config.servers.retain(|item| item.id != id);
+                Ok(())
+            })?;
             output::success(format!("已删除服务器 {server}"));
             Ok(())
         }
@@ -482,7 +574,7 @@ async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
                 let rev = format!("{} {}", record.branch, record.commit_short);
                 println!(
                     "{:<9} {:<19} {:<16} {:<20} {:<12} {:<6} {}",
-                    &record.id[..8.min(record.id.len())],
+                    short_id(&record.id),
                     record.started_at,
                     truncate(&record.repo_name, 14),
                     truncate(&rev, 18),
@@ -556,8 +648,458 @@ async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// backup
+// ---------------------------------------------------------------------------
+
+async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result<()> {
+    let store = Arc::new(open_store(cli)?);
+    match command {
+        BackupCommand::Run {
+            server,
+            target,
+            supabase_url,
+            database,
+            schema,
+        } => {
+            // 与 GUI / 其他命令行进程互斥，避免并发执行破坏性操作。
+            let _lock = claim_task_lock(&store, "backup")?;
+            let config = store.load_config()?;
+            let server = Store::find_server(&config, server)?.clone();
+            let engine = BackupEngine::new(store.clone());
+            let request = BackupRequest {
+                server_id: server.id.clone(),
+                target_id: target.clone(),
+                supabase_url: supabase_url.clone(),
+                database: database.clone(),
+                schema: schema.clone(),
+            };
+            let prepared = engine.prepare(&request)?;
+            output::info(format!("备份记录: {}", prepared.record.id));
+            output::info(format!(
+                "来源: {} / {}",
+                prepared.record.server_name, prepared.record.database
+            ));
+            output::info(format!(
+                "目标: {} ({})",
+                prepared.record.target_name, prepared.record.target
+            ));
+
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let printer = tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    match event {
+                        BackupEvent::Log { level, message } => output::deploy_log(level, &message),
+                        BackupEvent::Progress { message, .. } => output::progress(&message),
+                        _ => {}
+                    }
+                }
+            });
+
+            let record = engine
+                .run(prepared.record, prepared.source, prepared.target, Some(sender))
+                .await;
+            let _ = printer.await;
+            output::progress_done();
+
+            if record.status == DeployStatus::Failed {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        BackupCommand::Target(command) => match command {
+            TargetCommand::Add { name, url } => {
+                let target = store.mutate_config(|config| {
+                    if config.backup_targets.iter().any(|target| target.name == *name) {
+                        return Err(CoreError::config(format!("备份目标名称已存在: {name}")));
+                    }
+                    if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                        return Err(CoreError::config(
+                            "连接串必须以 postgres:// 或 postgresql:// 开头",
+                        ));
+                    }
+                    let target = BackupTarget::new(name.clone(), url.clone());
+                    config.backup_targets.push(target.clone());
+                    Ok(target)
+                })?;
+                if cli.json {
+                    return print_json(&redact_target(&target));
+                }
+                output::success(format!(
+                    "已添加备份目标 {} ({})",
+                    target.name,
+                    mask_database_url(&target.url)
+                ));
+                Ok(())
+            }
+            TargetCommand::List => {
+                let config = store.load_config()?;
+                if cli.json {
+                    let targets: Vec<_> = config.backup_targets.iter().map(redact_target).collect();
+                    return print_json(&targets);
+                }
+                if config.backup_targets.is_empty() {
+                    output::dim("暂无备份目标，使用 `backup target add <名称> <连接串>` 添加");
+                    return Ok(());
+                }
+                let default_id = config.settings.default_backup_target_id.as_deref();
+                for target in &config.backup_targets {
+                    let marker = if default_id == Some(target.id.as_str()) {
+                        "*"
+                    } else {
+                        " "
+                    };
+                    println!(
+                        "{marker} {:<16} {}",
+                        target.name,
+                        mask_database_url(&target.url)
+                    );
+                }
+                Ok(())
+            }
+            TargetCommand::Remove { target } => {
+                store.mutate_config(|config| {
+                    let id = config
+                        .backup_targets
+                        .iter()
+                        .find(|item| item.id == *target || item.name == *target)
+                        .map(|item| item.id.clone())
+                        .ok_or_else(|| {
+                            CoreError::not_found(format!("备份目标不存在: {target}"))
+                        })?;
+                    config.backup_targets.retain(|item| item.id != id);
+                    if config.settings.default_backup_target_id.as_deref() == Some(id.as_str()) {
+                        config.settings.default_backup_target_id = None;
+                    }
+                    for server in config.servers.iter_mut() {
+                        if server.backup_target_id.as_deref() == Some(id.as_str()) {
+                            server.backup_target_id = None;
+                        }
+                    }
+                    Ok(())
+                })?;
+                output::success(format!("已删除备份目标 {target}"));
+                Ok(())
+            }
+        },
+        BackupCommand::List { server, limit } => {
+            let mut records = store.load_backups()?;
+            records.reverse();
+            if let Some(key) = server {
+                let server_id = Store::find_server(&store.load_config()?, key)?.id.clone();
+                records.retain(|record| record.server_id == server_id);
+            }
+            records.truncate(*limit);
+
+            if cli.json {
+                return print_json(&records);
+            }
+            if records.is_empty() {
+                output::dim("暂无备份记录");
+                return Ok(());
+            }
+            println!(
+                "{:<9} {:<19} {:<14} {:<12} {:<12} {:<10} {:<6} {}",
+                "ID", "时间", "服务器", "数据库", "目标", "大小", "状态", "耗时"
+            );
+            for record in records {
+                let status = match record.status {
+                    DeployStatus::Success => "成功",
+                    DeployStatus::Failed => "失败",
+                    DeployStatus::Running => "进行中",
+                };
+                println!(
+                    "{:<9} {:<19} {:<14} {:<12} {:<12} {:<10} {:<6} {}",
+                    short_id(&record.id),
+                    record.started_at,
+                    truncate(&record.server_name, 12),
+                    truncate(&record.database, 10),
+                    truncate(&record.target_name, 10),
+                    human_size(record.dump_size),
+                    status,
+                    format_duration(record.duration_ms),
+                );
+            }
+            Ok(())
+        }
+        BackupCommand::Show { record } => {
+            let record = store.find_backup(record)?;
+            if cli.json {
+                return print_json(&record);
+            }
+            println!("记录 ID   : {}", record.id);
+            println!("服务器    : {} ({})", record.server_name, record.server_id);
+            println!("数据库    : {} · schema {}", record.database, record.schema);
+            println!("目标      : {} ({})", record.target_name, record.target);
+            println!(
+                "状态      : {}",
+                match record.status {
+                    DeployStatus::Success => "成功",
+                    DeployStatus::Failed => "失败",
+                    DeployStatus::Running => "进行中",
+                }
+            );
+            println!("压缩包    : {}", human_size(record.dump_size));
+            println!("开始时间  : {}", record.started_at);
+            if let Some(finished) = &record.finished_at {
+                println!("结束时间  : {finished}");
+            }
+            if let Some(err) = &record.error {
+                println!("错误      : {err}");
+            }
+            println!("--- 日志 ---");
+            output::info(&record.log);
+            Ok(())
+        }
+        BackupCommand::Clear { yes } => {
+            if !yes {
+                return Err(CoreError::config("清空记录不可恢复，确认请加 --yes"));
+            }
+            store.clear_backups()?;
+            output::success("已清空备份记录");
+            Ok(())
+        }
+        BackupCommand::Test { server } => {
+            let config = store.load_config()?;
+            let server = Store::find_server(&config, server)?.clone();
+            let request = BackupRequest {
+                server_id: server.id.clone(),
+                target_id: None,
+                supabase_url: None,
+                database: None,
+                schema: None,
+            };
+            output::info(format!("正在检查 {} 的备份环境 ...", server.name));
+            let message = BackupEngine::new(store).test(&request).await?;
+            output::success("环境检查通过");
+            output::info(message);
+            Ok(())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// pages
+// ---------------------------------------------------------------------------
+
+async fn pages_command(cli: &Cli, command: &PagesCommand) -> Result<()> {
+    let store = Arc::new(open_store(cli)?);
+    match command {
+        PagesCommand::Config {
+            repo,
+            project,
+            build,
+            output,
+            branch,
+        } => {
+            let (repo_name, pages) = store.mutate_config(|config| {
+                let repo_id = Store::find_repo(config, repo)?.id.clone();
+                let repo_name = config
+                    .repos
+                    .iter()
+                    .find(|item| item.id == repo_id)
+                    .map(|item| item.name.clone())
+                    .unwrap_or_default();
+                let repo_mut = config
+                    .repos
+                    .iter_mut()
+                    .find(|item| item.id == repo_id)
+                    .expect("repo exists");
+
+                let mut pages = repo_mut.pages.clone().unwrap_or_default();
+                if let Some(value) = project {
+                    pages.project_name = value.trim().to_string();
+                }
+                if let Some(value) = build {
+                    pages.build_command = value.trim().to_string();
+                }
+                if let Some(value) = output {
+                    pages.output_dir = value.trim().to_string();
+                }
+                if let Some(value) = branch {
+                    pages.branch = value.trim().to_string();
+                }
+                if pages.output_dir.is_empty() {
+                    pages.output_dir = "dist".to_string();
+                }
+                if pages.branch.is_empty() {
+                    pages.branch = "main".to_string();
+                }
+                repo_mut.pages = if pages.project_name.is_empty() {
+                    None
+                } else {
+                    Some(pages.clone())
+                };
+                Ok((repo_name, pages))
+            })?;
+
+            if cli.json {
+                return print_json(&pages);
+            }
+            output::success(format!("已更新 {repo_name} 的 Pages 配置"));
+            Ok(())
+        }
+        PagesCommand::Run {
+            repo,
+            project,
+            build,
+            output,
+            branch,
+            skip_build,
+        } => {
+            // 与 GUI / 其他命令行进程互斥，避免并发执行破坏性操作。
+            let _lock = claim_task_lock(&store, "pages")?;
+            let config = store.load_config()?;
+            let repo = Store::find_repo(&config, repo)?.clone();
+            let engine = PagesEngine::new(store.clone());
+            let request = PagesRequest {
+                repo_id: repo.id.clone(),
+                project_name: project.clone(),
+                build_command: build.clone(),
+                output_dir: output.clone(),
+                branch: branch.clone(),
+                skip_build: *skip_build,
+            };
+            let prepared = engine.prepare(&request)?;
+            output::info(format!("Pages 部署记录: {}", prepared.record.id));
+            output::info(format!(
+                "仓库: {} -> 项目 {}（{}）",
+                prepared.record.repo_name, prepared.record.project_name, prepared.record.branch
+            ));
+            if !skip_build && !prepared.config.build_command.trim().is_empty() {
+                output::info(format!("构建命令: {}", prepared.config.build_command));
+            }
+
+            let skip_build = *skip_build;
+            let (sender, mut receiver) = mpsc::unbounded_channel();
+            let printer = tokio::spawn(async move {
+                while let Some(event) = receiver.recv().await {
+                    if let PagesEvent::Log { level, message } = event {
+                        output::deploy_log(level, &message);
+                    }
+                }
+            });
+
+            let record = tokio::task::spawn_blocking(move || {
+                engine.run(
+                    prepared.record,
+                    prepared.config,
+                    prepared.repo_path,
+                    prepared.token,
+                    prepared.account_id,
+                    skip_build,
+                    Some(sender),
+                )
+            })
+            .await
+            .map_err(|e| CoreError::Process(format!("Pages 部署任务异常: {e}")))?;
+            let _ = printer.await;
+
+            if record.status == DeployStatus::Failed {
+                std::process::exit(2);
+            }
+            Ok(())
+        }
+        PagesCommand::List { repo, limit } => {
+            let mut records = store.load_pages_records()?;
+            records.reverse();
+            if let Some(key) = repo {
+                let repo_id = Store::find_repo(&store.load_config()?, key)?.id.clone();
+                records.retain(|record| record.repo_id == repo_id);
+            }
+            records.truncate(*limit);
+
+            if cli.json {
+                return print_json(&records);
+            }
+            if records.is_empty() {
+                output::dim("暂无 Pages 部署记录");
+                return Ok(());
+            }
+            println!(
+                "{:<9} {:<19} {:<12} {:<18} {:<10} {:<6} {}",
+                "ID", "时间", "仓库", "项目", "分支", "状态", "地址"
+            );
+            for record in records {
+                let status = match record.status {
+                    DeployStatus::Success => "成功",
+                    DeployStatus::Failed => "失败",
+                    DeployStatus::Running => "进行中",
+                };
+                println!(
+                    "{:<9} {:<19} {:<12} {:<18} {:<10} {:<6} {}",
+                    short_id(&record.id),
+                    record.started_at,
+                    truncate(&record.repo_name, 10),
+                    truncate(&record.project_name, 16),
+                    truncate(&record.branch, 8),
+                    status,
+                    record.url.as_deref().unwrap_or("-"),
+                );
+            }
+            Ok(())
+        }
+        PagesCommand::Show { record } => {
+            let record = store.find_pages_record(record)?;
+            if cli.json {
+                return print_json(&record);
+            }
+            println!("记录 ID   : {}", record.id);
+            println!("仓库      : {} ({})", record.repo_name, record.repo_id);
+            println!("项目      : {}（分支 {}）", record.project_name, record.branch);
+            if !record.commit_short.is_empty() {
+                println!("提交      : {}", record.commit_short);
+            }
+            println!(
+                "状态      : {}",
+                match record.status {
+                    DeployStatus::Success => "成功",
+                    DeployStatus::Failed => "失败",
+                    DeployStatus::Running => "进行中",
+                }
+            );
+            if let Some(url) = &record.url {
+                println!("地址      : {url}");
+            }
+            println!("开始时间  : {}", record.started_at);
+            if let Some(finished) = &record.finished_at {
+                println!("结束时间  : {finished}");
+            }
+            if let Some(err) = &record.error {
+                println!("错误      : {err}");
+            }
+            println!("--- 日志 ---");
+            output::info(&record.log);
+            Ok(())
+        }
+        PagesCommand::Clear { yes } => {
+            if !yes {
+                return Err(CoreError::config("清空记录不可恢复，确认请加 --yes"));
+            }
+            store.clear_pages_records()?;
+            output::success("已清空 Pages 部署记录");
+            Ok(())
+        }
+        PagesCommand::Test { repo } => {
+            let config = store.load_config()?;
+            let repo = Store::find_repo(&config, repo)?.clone();
+            output::info(format!("正在检查 {} 的 Pages 环境 ...", repo.name));
+            let repo_id = repo.id.clone();
+            let engine = PagesEngine::new(store);
+            let message = tokio::task::spawn_blocking(move || engine.test(&repo_id, None))
+                .await
+                .map_err(|e| CoreError::Process(format!("检查任务异常: {e}")))??;
+            output::success("环境检查通过");
+            output::info(message);
+            Ok(())
+        }
+    }
+}
+
 /// 执行部署并把事件实时打印到终端。
 async fn run_deploy(store: &Arc<Store>, request: DeployRequest) -> Result<bool> {
+    // 与 GUI / 其他命令行进程互斥，避免并发执行破坏性操作。
+    let _lock = claim_task_lock(store, "deploy")?;
     let engine = DeployEngine::new(store.clone());
     let record = engine.prepare(&request)?;
     output::info(format!("部署记录: {}", record.id));
@@ -614,5 +1156,26 @@ fn format_duration(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
+    }
+}
+
+/// 取记录 ID 前 8 个字符用于列表展示（按字符而非字节，避免多字节 panic）。
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let value = bytes as f64;
+    if value >= GB {
+        format!("{:.2} GB", value / GB)
+    } else if value >= MB {
+        format!("{:.2} MB", value / MB)
+    } else if value >= KB {
+        format!("{:.1} KB", value / KB)
+    } else {
+        format!("{bytes} B")
     }
 }

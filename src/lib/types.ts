@@ -5,6 +5,21 @@ export type SshAuth =
   | { type: "password"; password: string }
   | { type: "privateKey"; keyPath: string; passphrase: string | null };
 
+export interface DbBackupSource {
+  mode: "docker" | "system";
+  container: string;
+  database: string;
+  username: string;
+  password: string;
+  schema: string;
+}
+
+export interface BackupTarget {
+  id: string;
+  name: string;
+  url: string;
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -13,6 +28,9 @@ export interface ServerConfig {
   username: string;
   auth: SshAuth;
   defaultTargetDir: string;
+  dbBackup?: DbBackupSource | null;
+  backupTargetId?: string | null;
+  supabaseUrl?: string | null;
   createdAt: string;
 }
 
@@ -154,6 +172,13 @@ export interface Settings {
   scriptTimeoutSecs: number;
   keepRemoteArchive: boolean;
   historyLimit: number;
+  supabaseUrl: string;
+  defaultBackupTargetId: string | null;
+  backupHistoryLimit: number;
+  backupTimeoutSecs: number;
+  cloudflareApiToken: string;
+  cloudflareAccountId: string;
+  pagesHistoryLimit: number;
 }
 
 export type DeployEvent =
@@ -173,6 +198,90 @@ export interface LiveDeploy {
   progress: number;
   status: DeployStatus;
   record: DeployRecord | null;
+}
+
+export interface BackupRecord {
+  id: string;
+  serverId: string;
+  serverName: string;
+  database: string;
+  schema: string;
+  targetName: string;
+  target: string;
+  status: DeployStatus;
+  error: string | null;
+  log: string;
+  dumpSize: number;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number;
+}
+
+export interface BackupRequest {
+  serverId: string;
+  targetId?: string | null;
+  supabaseUrl?: string | null;
+  database?: string | null;
+  schema?: string | null;
+}
+
+export type BackupEvent =
+  | { type: "started"; recordId: string }
+  | { type: "log"; level: LogLevel; message: string }
+  | { type: "progress"; percent: number; message: string }
+  | { type: "finished"; record: BackupRecord };
+
+export interface LiveBackup {
+  recordId: string;
+  lines: LogLine[];
+  progress: number;
+  status: DeployStatus;
+  record: BackupRecord | null;
+}
+
+export interface PagesConfig {
+  projectName: string;
+  buildCommand: string;
+  outputDir: string;
+  branch: string;
+}
+
+export interface PagesDeployRecord {
+  id: string;
+  repoId: string;
+  repoName: string;
+  projectName: string;
+  branch: string;
+  commit: string;
+  commitShort: string;
+  status: DeployStatus;
+  error: string | null;
+  log: string;
+  url: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number;
+}
+
+export interface PagesRequest {
+  repoId: string;
+  projectName?: string | null;
+  buildCommand?: string | null;
+  outputDir?: string | null;
+  branch?: string | null;
+  skipBuild: boolean;
+}
+
+export type PagesEvent =
+  | { type: "started"; recordId: string }
+  | { type: "log"; level: LogLevel; message: string }
+  | { type: "finished"; record: PagesDeployRecord };
+
+export interface LivePages {
+  recordId: string;
+  lines: LogLine[];
+  status: DeployStatus;
+  record: PagesDeployRecord | null;
 }
 
 export interface FailedLogin {

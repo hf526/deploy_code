@@ -1,9 +1,63 @@
-use std::io::Read;
+use std::collections::HashSet;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{CoreError, Result};
+use crate::ssh::OutputKind;
+
+/// 当前存活的本地子进程（用于应用退出时统一终止，避免残留构建/上传进程）。
+fn running_children() -> &'static Mutex<HashSet<u32>> {
+    static CHILDREN: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    CHILDREN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn track_child(pid: u32) {
+    if let Ok(mut children) = running_children().lock() {
+        children.insert(pid);
+    }
+}
+
+fn untrack_child(pid: u32) {
+    if let Ok(mut children) = running_children().lock() {
+        children.remove(&pid);
+    }
+}
+
+/// 终止所有仍在运行的本地子进程（应用退出时调用；Unix 按进程组，Windows 用 taskkill /T）。
+pub fn kill_all_children() {
+    let pids: Vec<u32> = match running_children().lock() {
+        Ok(mut children) => children.drain().collect(),
+        Err(_) => return,
+    };
+    for pid in pids {
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+            libc::kill(pid as i32, libc::SIGKILL);
+        }
+        #[cfg(windows)]
+        {
+            let args = vec![
+                "/F".to_string(),
+                "/T".to_string(),
+                "/PID".to_string(),
+                pid.to_string(),
+            ];
+            let _ = base_command("taskkill", &args, None)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            let _ = pid;
+        }
+    }
+}
 
 /// 本地命令输出。
 #[derive(Debug, Clone)]
@@ -81,19 +135,25 @@ pub fn run_timeout(
     let mut child = cmd.spawn().map_err(|e| {
         CoreError::Process(format!("无法执行 `{program}`: {e}（请确认该命令已安装并在 PATH 中）"))
     })?;
+    let pid = child.id();
+    track_child(pid);
 
+    let (out_tx, out_rx) = mpsc::channel::<Vec<u8>>();
     let out_thread = child.stdout.take().map(|mut stdout| {
+        let tx = out_tx.clone();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = stdout.read_to_end(&mut buf);
-            buf
+            let _ = tx.send(buf);
         })
     });
+    let (err_tx, err_rx) = mpsc::channel::<Vec<u8>>();
     let err_thread = child.stderr.take().map(|mut stderr| {
+        let tx = err_tx.clone();
         std::thread::spawn(move || {
             let mut buf = Vec::new();
             let _ = stderr.read_to_end(&mut buf);
-            buf
+            let _ = tx.send(buf);
         })
     });
 
@@ -104,6 +164,7 @@ pub fn run_timeout(
             Ok(None) => {
                 if Instant::now() >= deadline {
                     kill_process_tree(&mut child);
+                    untrack_child(pid);
                     // 读取线程不 join：孙进程可能仍持有管道，join 会把"超时"变成永久阻塞；
                     // 进程组/进程树被终止后管道会关闭，线程自行退出。
                     drop(out_thread);
@@ -117,13 +178,20 @@ pub fn run_timeout(
             }
             Err(e) => {
                 kill_process_tree(&mut child);
+                untrack_child(pid);
                 return Err(CoreError::Process(format!("`{program}` 执行失败: {e}")));
             }
         }
     };
 
-    let stdout = out_thread.and_then(|thread| thread.join().ok()).unwrap_or_default();
-    let stderr = err_thread.and_then(|thread| thread.join().ok()).unwrap_or_default();
+    // 子进程已退出，但孙进程可能仍持有管道写端，读线程的 join 可能长期阻塞：
+    // 用带超时的通道收结果，超时则放弃剩余输出并继续。
+    const READ_GRACE: Duration = Duration::from_secs(5);
+    let stdout = out_rx.recv_timeout(READ_GRACE).unwrap_or_default();
+    let stderr = err_rx.recv_timeout(READ_GRACE).unwrap_or_default();
+    untrack_child(pid);
+    drop(out_thread);
+    drop(err_thread);
     Ok(CommandOutput {
         code: status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
@@ -165,6 +233,140 @@ fn kill_process_tree(child: &mut std::process::Child) {
     // 兜底：若上面的树终止未生效（如 taskkill 不可用），至少终止直接子进程。
     let _ = child.kill();
     let _ = child.wait();
+}
+
+/// 本地命令流式执行：按行回调输出（stdout/stderr），支持超时终止进程树。返回退出码。
+pub fn run_stream(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+    timeout: Duration,
+    on_line: &mut (dyn FnMut(OutputKind, String) + Send),
+) -> Result<i32> {
+    let mut cmd = base_command(program, args, cwd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| {
+        CoreError::Process(format!("无法执行 `{program}`: {e}（请确认该命令已安装并在 PATH 中）"))
+    })?;
+    let pid = child.id();
+    track_child(pid);
+
+    let (tx, rx) = mpsc::channel::<(OutputKind, String)>();
+    let out_tx = tx.clone();
+    let out_thread = child
+        .stdout
+        .take()
+        .map(|stdout| std::thread::spawn(move || pump_lines(stdout, OutputKind::Stdout, out_tx)));
+    let err_tx = tx.clone();
+    let err_thread = child
+        .stderr
+        .take()
+        .map(|stderr| std::thread::spawn(move || pump_lines(stderr, OutputKind::Stderr, err_tx)));
+    drop(tx);
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        // 每轮最多消费固定条数：高输出量时不能无限排空通道，否则永远检查不到超时。
+        for _ in 0..512 {
+            match rx.try_recv() {
+                Ok((kind, line)) => on_line(kind, line),
+                Err(_) => break,
+            }
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    kill_process_tree(&mut child);
+                    untrack_child(pid);
+                    // 不 join 读取线程：孙进程可能仍持有管道导致永久阻塞。
+                    drop(out_thread);
+                    drop(err_thread);
+                    return Err(CoreError::Process(format!(
+                        "`{program}` 执行超时（{} 秒），已终止",
+                        timeout.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => {
+                kill_process_tree(&mut child);
+                untrack_child(pid);
+                drop(out_thread);
+                drop(err_thread);
+                return Err(CoreError::Process(format!("`{program}` 执行失败: {e}")));
+            }
+        }
+    };
+
+    // 收尾：把剩余日志送完，但最多等 2 秒，避免管道被孙进程持有导致卡死。
+    let drain_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if Instant::now() >= drain_deadline {
+            break;
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok((kind, line)) => on_line(kind, line),
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+        }
+    }
+    untrack_child(pid);
+    drop(out_thread);
+    drop(err_thread);
+    Ok(status.code().unwrap_or(-1))
+}
+
+/// 使用系统 shell 执行命令字符串（构建命令等），流式输出。
+pub fn run_shell_stream(
+    command: &str,
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+    timeout: Duration,
+    on_line: &mut (dyn FnMut(OutputKind, String) + Send),
+) -> Result<i32> {
+    #[cfg(windows)]
+    let (program, args) = (
+        "cmd.exe".to_string(),
+        vec!["/C".to_string(), command.to_string()],
+    );
+    #[cfg(not(windows))]
+    let (program, args) = (
+        "sh".to_string(),
+        vec!["-c".to_string(), command.to_string()],
+    );
+    run_stream(&program, &args, cwd, envs, timeout, on_line)
+}
+
+/// 从管道按行读取并通过通道发送（在主线程回调，避免回调跨线程竞争）。
+fn pump_lines(pipe: impl Read, kind: OutputKind, tx: mpsc::Sender<(OutputKind, String)>) {
+    let mut reader = BufReader::new(pipe);
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break,
+            Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
+                let line = line.trim_end_matches(['\r', '\n']).to_string();
+                if tx.send((kind, line)).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 /// 执行本地命令，非零退出码返回错误。

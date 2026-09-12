@@ -1,4 +1,4 @@
-import { FolderOpen, GitBranch, History, Rocket, Server, Settings } from "lucide-react";
+import { Cloud, Database, FolderOpen, GitBranch, History, Rocket, Server, Settings } from "lucide-react";
 import { NavLink, useNavigate } from "react-router-dom";
 
 import { openRepoFolder } from "../lib/openRepo";
@@ -9,13 +9,17 @@ import { ThemeToggle } from "./ThemeToggle";
 const NAV_ITEMS = [
   { to: "/repos", label: "仓库", icon: GitBranch },
   { to: "/deploy", label: "部署", icon: Rocket },
+  { to: "/pages", label: "Pages", icon: Cloud },
   { to: "/servers", label: "服务器", icon: Server },
+  { to: "/backups", label: "备份", icon: Database },
   { to: "/history", label: "记录", icon: History },
   { to: "/settings", label: "设置", icon: Settings },
 ];
 
 export function Sidebar() {
   const liveRunning = useApp((state) => state.live?.status === "running");
+  const backupRunning = useApp((state) => state.liveBackup?.status === "running");
+  const pagesRunning = useApp((state) => state.livePages?.status === "running");
   const navigate = useNavigate();
 
   return (
@@ -49,6 +53,12 @@ export function Sidebar() {
             <item.icon className="size-4" />
             <span>{item.label}</span>
             {item.to === "/deploy" && liveRunning && (
+              <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
+            )}
+            {item.to === "/backups" && backupRunning && (
+              <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
+            )}
+            {item.to === "/pages" && pagesRunning && (
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}
           </NavLink>

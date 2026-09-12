@@ -174,8 +174,11 @@ impl Git {
             &pretty_arg,
         ])?;
         if !out.success() {
-            // 空仓库（还没有任何提交）时直接返回空列表
-            return Ok(Vec::new());
+            // 只有"空仓库"才静默返回空列表，其他失败如实报错，避免掩盖对象库损坏等问题。
+            if is_empty_repo_error(&out) {
+                return Ok(Vec::new());
+            }
+            return Err(CoreError::git(git_error(&["log"], &out)));
         }
         let mut commits = Vec::new();
         for line in out.stdout.lines() {
@@ -225,8 +228,12 @@ impl Git {
         let limit_arg = format!("-n{limit}");
         let format = format!("%H{SEP}%h{SEP}%P{SEP}%an{SEP}%ad{SEP}%s{SEP}%D");
         let pretty_arg = format!("--pretty=format:{format}");
+        let ref_name = match ref_name.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(name) => Some(validate_ref_arg(name, "分支")?),
+            None => None,
+        };
         let mut args: Vec<&str> = vec!["log"];
-        match ref_name {
+        match &ref_name {
             Some(name) => args.push(name),
             None => args.push("--all"),
         }
@@ -240,7 +247,10 @@ impl Git {
 
         let out = self.try_run(&args)?;
         if !out.success() {
-            return Ok(Vec::new());
+            if is_empty_repo_error(&out) {
+                return Ok(Vec::new());
+            }
+            return Err(CoreError::git(git_error(&args, &out)));
         }
 
         let head_branch = self.current_branch().unwrap_or_default();
@@ -293,27 +303,34 @@ impl Git {
 
     /// 切换分支。
     pub fn checkout(&self, branch: &str) -> Result<String> {
-        let out = self.try_run(&["checkout", branch])?;
+        let branch = validate_ref_arg(branch, "分支")?;
+        let out = self.try_run(&["checkout", &branch])?;
         if !out.success() {
-            return Err(CoreError::git(git_error(&["checkout", branch], &out)));
+            return Err(CoreError::git(git_error(&["checkout", &branch], &out)));
         }
         Ok(format!("已切换到分支 {branch}"))
     }
 
     /// 创建分支，可选基于某个起点并立即切换过去。
     pub fn create_branch(&self, name: &str, from: Option<&str>, checkout: bool) -> Result<String> {
+        let name = validate_ref_arg(name, "分支")?;
+        let from = match from.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(from) => Some(validate_ref_arg(from, "起点版本")?),
+            None => None,
+        };
         let command = if checkout { "checkout" } else { "branch" };
-        let mut args = vec![command];
+        let mut args = vec![command.to_string()];
         if checkout {
-            args.push("-b");
+            args.push("-b".to_string());
         }
-        args.push(name);
-        if let Some(from) = from {
-            args.push(from);
+        args.push(name.clone());
+        if let Some(from) = &from {
+            args.push(from.clone());
         }
-        let out = self.try_run(&args)?;
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let out = self.try_run(&arg_refs)?;
         if !out.success() {
-            return Err(CoreError::git(git_error(&args, &out)));
+            return Err(CoreError::git(git_error(&arg_refs, &out)));
         }
         if checkout {
             Ok(format!("已创建并切换到分支 {name}"))
@@ -324,10 +341,11 @@ impl Git {
 
     /// 删除分支（force = 强制删除未合并分支）。
     pub fn delete_branch(&self, name: &str, force: bool) -> Result<String> {
+        let name = validate_ref_arg(name, "分支")?;
         let force_arg = if force { "-D" } else { "-d" };
-        let out = self.try_run(&["branch", force_arg, name])?;
+        let out = self.try_run(&["branch", force_arg, &name])?;
         if !out.success() {
-            return Err(CoreError::git(git_error(&["branch", force_arg, name], &out)));
+            return Err(CoreError::git(git_error(&["branch", force_arg, &name], &out)));
         }
         Ok(format!("已删除分支 {name}"))
     }
@@ -397,11 +415,8 @@ impl Git {
 
     /// 将分支名 / 标签 / 提交号解析为具体提交。
     pub fn resolve(&self, rev: &str) -> Result<ResolvedRev> {
-        let rev = rev.trim();
-        if rev.is_empty() {
-            return Err(CoreError::git("版本号不能为空"));
-        }
-        let hash = match self.rev_hash(rev)? {
+        let rev = validate_ref_arg(rev, "版本号")?;
+        let hash = match self.rev_hash(&rev)? {
             Some(hash) => hash,
             None => {
                 let remote_rev = format!("origin/{rev}");
@@ -465,11 +480,22 @@ impl Git {
         let dst = File::create(gz_path).map_err(|e| CoreError::io_path(gz_path, e))?;
         let mut encoder = GzEncoder::new(BufWriter::new(dst), Compression::default());
         let mut reader = std::io::BufReader::new(src);
-        let written = std::io::copy(&mut reader, &mut encoder)?;
+        std::io::copy(&mut reader, &mut encoder)?;
         encoder.flush()?;
-        encoder.finish()?;
+        // finish() 只把 gzip 尾部写进 BufWriter，必须显式 flush/sync，否则最终写盘错误会被 drop 静默吞掉。
+        let mut writer = encoder.finish()?;
+        writer.flush().map_err(|e| CoreError::io_path(gz_path, e))?;
+        writer
+            .into_inner()
+            .map_err(|e| CoreError::io_path(gz_path, e.into_error()))?
+            .sync_all()
+            .map_err(|e| CoreError::io_path(gz_path, e))?;
         let _ = std::fs::remove_file(tar_path);
-        Ok(written)
+        // 返回实际压缩包大小（io::copy 返回的是未压缩的 tar 字节数）。
+        let size = std::fs::metadata(gz_path)
+            .map_err(|e| CoreError::io_path(gz_path, e))?
+            .len();
+        Ok(size)
     }
 
     /// 远端仓库地址。
@@ -545,6 +571,15 @@ impl Git {
         if !file.is_file() {
             return Err(CoreError::not_found(format!("文件不存在: {rel}")));
         }
+        // 仓库里可能存在指向仓库外的符号链接，解析真实路径后必须仍在仓库内。
+        let root =
+            std::fs::canonicalize(&self.path).map_err(|e| CoreError::io_path(&self.path, e))?;
+        let canonical = std::fs::canonicalize(&file).map_err(|e| CoreError::io_path(&file, e))?;
+        if !canonical.starts_with(&root) {
+            return Err(CoreError::git(format!(
+                "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
+            )));
+        }
         let bytes = std::fs::read(&file).map_err(|e| CoreError::io_path(&file, e))?;
         if bytes[..bytes.len().min(8000)].contains(&0) {
             return Err(CoreError::git("二进制文件，暂不支持预览"));
@@ -567,6 +602,34 @@ impl Git {
         let file = self.path.join(&rel);
         if file.is_dir() {
             return Err(CoreError::git(format!("目标是目录: {rel}")));
+        }
+        let root =
+            std::fs::canonicalize(&self.path).map_err(|e| CoreError::io_path(&self.path, e))?;
+        // 已存在的文件解析符号链接后必须仍在仓库内；新文件则要求其父目录
+        // （解析符号链接后）位于仓库内，避免经由链接目录写到仓库外。
+        match std::fs::symlink_metadata(&file) {
+            Ok(_) => {
+                let canonical =
+                    std::fs::canonicalize(&file).map_err(|e| CoreError::io_path(&file, e))?;
+                if !canonical.starts_with(&root) {
+                    return Err(CoreError::git(format!(
+                        "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
+                    )));
+                }
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                let parent = file
+                    .parent()
+                    .ok_or_else(|| CoreError::git(format!("非法路径: {rel}")))?;
+                let canonical_parent =
+                    std::fs::canonicalize(parent).map_err(|e| CoreError::io_path(parent, e))?;
+                if !canonical_parent.starts_with(&root) {
+                    return Err(CoreError::git(format!(
+                        "文件路径越界（父目录指向仓库外）: {rel}"
+                    )));
+                }
+            }
+            Err(err) => return Err(CoreError::io_path(&file, err)),
         }
         std::fs::write(&file, content.as_bytes()).map_err(|e| CoreError::io_path(&file, e))?;
         Ok(format!("已保存 {rel}"))
@@ -611,7 +674,8 @@ impl Git {
         if !case_sensitive {
             args.push("-i");
         }
-        args.extend(["--fixed-strings", query]);
+        // 用 -e 显式标记 pattern，避免以 `-` 开头的搜索词被 git 当作选项。
+        args.extend(["--fixed-strings", "-e", query]);
         let out = self.try_run(&args)?;
         if out.code != 0 && out.code != 1 {
             return Err(CoreError::git(git_error(&args, &out)));
@@ -671,7 +735,7 @@ impl Git {
             };
             let (next, count) = replace_all_occurrences(&text, search, replacement, case_sensitive);
             if count > 0 {
-                std::fs::write(&file, next.as_bytes()).map_err(|e| CoreError::io_path(&file, e))?;
+                atomic_write_text(&file, &next)?;
                 files += 1;
                 matches += count;
             }
@@ -735,6 +799,12 @@ fn replace_all_occurrences(
         if matched {
             let start = units[index].byte_start;
             let end = units[index + needle.len() - 1].byte_end;
+            // 匹配起点落在已写入字符内部（如 İ 展开为两个 lowercase 单元）时跳过，
+            // 否则 `text[written..start]` 会因 start < written 而 panic。
+            if start < written {
+                index += 1;
+                continue;
+            }
             result.push_str(&text[written..start]);
             result.push_str(replacement);
             count += 1;
@@ -758,6 +828,61 @@ fn normalize_rel(rel: &str) -> Result<String> {
         return Err(CoreError::git(format!("非法路径: {rel}")));
     }
     Ok(rel.trim_matches('/').to_string())
+}
+
+/// 校验用户提供的分支 / 版本 / 引用参数，避免以 `-` 开头被 git 当作选项
+/// （例如 `git checkout -f` 会丢弃工作区全部未提交改动）。
+fn validate_ref_arg(value: &str, label: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CoreError::git(format!("{label}不能为空")));
+    }
+    if value.starts_with('-') {
+        return Err(CoreError::git(format!("非法的{label}: {value}")));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err(CoreError::git(format!("{label}包含非法字符")));
+    }
+    Ok(value.to_string())
+}
+
+/// 判断 git 失败输出是否表示"仓库还没有任何提交"。
+fn is_empty_repo_error(out: &CommandOutput) -> bool {
+    let text = out.combined().to_ascii_lowercase();
+    text.contains("does not have any commits")
+        || text.contains("bad revision 'head'")
+        || text.contains("unknown revision or path not in the working tree")
+}
+
+/// 原子写回替换后的文本：同目录临时文件 + 刷盘 + rename，避免中途失败截断源文件。
+fn atomic_write_text(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("file");
+    let tmp = parent.join(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()));
+
+    let write = (|| -> Result<()> {
+        let mut file = File::create(&tmp).map_err(|e| CoreError::io_path(&tmp, e))?;
+        file.write_all(contents.as_bytes())
+            .map_err(|e| CoreError::io_path(&tmp, e))?;
+        file.sync_all().map_err(|e| CoreError::io_path(&tmp, e))?;
+        Ok(())
+    })();
+    if let Err(err) = write {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(err);
+    }
+
+    if let Ok(meta) = std::fs::metadata(path) {
+        let _ = std::fs::set_permissions(&tmp, meta.permissions());
+    }
+    if let Err(err) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(CoreError::io_path(path, err));
+    }
+    Ok(())
 }
 
 fn non_empty(value: &str) -> Option<String> {
@@ -932,5 +1057,68 @@ mod tests {
         let (text, count) = replace_all_occurrences("abc", "", "x", false);
         assert_eq!(count, 0);
         assert_eq!(text, "abc");
+    }
+
+    #[test]
+    fn replace_case_insensitive_skips_match_inside_expanded_char() {
+        // İ 展开为 i + U+0307 两个 lower 单元（共享同一字节区间）：
+        // 第二次匹配起点落在第一次匹配已写入的字符内部时，旧实现会
+        // `&text[written..start]` 越界 panic。
+        let input = "\u{0307}x\u{0130}xi";
+        let (text, count) = replace_all_occurrences(input, "\u{0307}xi", "R", false);
+        assert_eq!(count, 1);
+        assert_eq!(text, "Rxi");
+    }
+
+    #[test]
+    fn validate_ref_arg_rejects_option_like_names() {
+        assert!(validate_ref_arg("main", "分支").is_ok());
+        assert!(validate_ref_arg("origin/main", "分支").is_ok());
+        assert!(validate_ref_arg("-f", "分支").is_err());
+        assert!(validate_ref_arg("--force", "分支").is_err());
+        assert!(validate_ref_arg("  ", "分支").is_err());
+        assert!(validate_ref_arg("a\nb", "分支").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_ops_reject_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("deploycode-git-escape-{}", uuid::Uuid::new_v4()));
+        let repo = base.join("repo");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "top secret").unwrap();
+
+        let git = Git { path: repo.clone() };
+
+        // 指向仓库外文件的符号链接：读写都必须被拒绝。
+        symlink(outside.join("secret.txt"), repo.join("link.txt")).unwrap();
+        assert!(git.read_file("link.txt").is_err());
+        assert!(git.write_file("link.txt", "hacked").is_err());
+        assert_eq!(
+            std::fs::read_to_string(outside.join("secret.txt")).unwrap(),
+            "top secret"
+        );
+
+        // 指向仓库外目录的符号链接：经由它读写同样被拒绝。
+        symlink(&outside, repo.join("dirlink")).unwrap();
+        assert!(git.read_file("dirlink/secret.txt").is_err());
+        assert!(git.write_file("dirlink/new.txt", "x").is_err());
+        assert!(!outside.join("new.txt").exists());
+
+        // 仓库内的普通文件读写不受影响。
+        std::fs::write(repo.join("ok.txt"), "hi").unwrap();
+        assert_eq!(git.read_file("ok.txt").unwrap().content, "hi");
+        assert!(git.write_file("ok.txt", "hello").is_ok());
+        assert_eq!(
+            std::fs::read_to_string(repo.join("ok.txt")).unwrap(),
+            "hello"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }
