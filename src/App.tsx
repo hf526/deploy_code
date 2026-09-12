@@ -18,6 +18,18 @@ import ReposPage from "./pages/ReposPage";
 import ServersPage from "./pages/ServersPage";
 import SettingsPage from "./pages/SettingsPage";
 
+function ReposEntry() {
+  const tabs = useApp((state) => state.tabs);
+  const location = useLocation();
+  // 有打开的仓库标签时，「仓库」默认回到最近查看的工作区；
+  // 仅在从工作区左上角返回（?list=1）或没有标签时显示项目列表。
+  const showList = new URLSearchParams(location.search).get("list") === "1";
+  if (!showList && tabs.length > 0) {
+    return <Navigate to={`/repos/${tabs[tabs.length - 1]}`} replace />;
+  }
+  return <ReposPage />;
+}
+
 function TabsAndRoutes() {
   const location = useLocation();
   const repoRouteId = location.pathname.match(/^\/repos\/([^/]+)/)?.[1] ?? null;
@@ -28,7 +40,7 @@ function TabsAndRoutes() {
       <main className="min-h-0 flex-1 overflow-hidden">
         <Routes>
           <Route path="/" element={<Navigate to="/repos" replace />} />
-          <Route path="/repos" element={<ReposPage />} />
+          <Route path="/repos" element={<ReposEntry />} />
           <Route path="/repos/:repoId" element={<RepoDetailPage />} />
           <Route path="/deploy" element={<DeployPage />} />
           <Route path="/servers" element={<ServersPage />} />

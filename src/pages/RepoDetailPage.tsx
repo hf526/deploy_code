@@ -493,7 +493,7 @@ export default function RepoDetailPage() {
           size="sm"
           variant="ghost"
           icon={<ArrowLeft className="size-4" />}
-          onClick={() => navigate("/repos")}
+          onClick={() => navigate("/repos?list=1")}
         />
         <div className="min-w-0">
           <h1 className="truncate text-sm font-semibold tracking-tight text-ink">{repo.name}</h1>

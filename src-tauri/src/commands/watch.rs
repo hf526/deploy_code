@@ -18,8 +18,21 @@ struct FsChanged {
     repo_id: String,
 }
 
-fn under_git(path: &Path) -> bool {
-    path.components().any(|c| c.as_os_str() == ".git")
+/// 判断事件路径是否应忽略，避免构建 / 装依赖时的事件风暴触发无谓刷新。
+/// `.git` 与任意层级的 `node_modules` 一律忽略；`target` / `dist` 只忽略仓库第一层，
+/// 防止误伤源码里同名的子目录。
+fn ignored_path(path: &Path, root: &Path) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    for component in rel.components() {
+        match component.as_os_str().to_str() {
+            Some(".git") | Some("node_modules") => return true,
+            _ => {}
+        }
+    }
+    matches!(
+        rel.components().next().and_then(|c| c.as_os_str().to_str()),
+        Some("target") | Some("dist")
+    )
 }
 
 /// 监听仓库工作区文件变化（忽略 .git，避免 git 命令自触发回环）。
@@ -48,10 +61,15 @@ pub fn watch_repo(
     }
 
     let (tx, rx) = mpsc::channel::<()>();
+    let filter_root = root.clone();
     let mut watcher: RecommendedWatcher =
         notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
             if let Ok(event) = res {
-                if event.paths.iter().any(|p| !under_git(p)) {
+                if event
+                    .paths
+                    .iter()
+                    .any(|p| !ignored_path(p, &filter_root))
+                {
                     let _ = tx.send(());
                 }
             }
@@ -88,4 +106,32 @@ pub fn unwatch_repo(state: State<AppState>, repo_id: String) -> Result<()> {
         watchers.remove(&repo_id);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ignored_path_skips_git_and_build_dirs() {
+        let root = Path::new("/repo");
+        assert!(ignored_path(Path::new("/repo/.git/index"), root));
+        assert!(ignored_path(
+            Path::new("/repo/packages/app/node_modules/x/index.js"),
+            root
+        ));
+        assert!(ignored_path(Path::new("/repo/target/debug/app.exe"), root));
+        assert!(ignored_path(Path::new("/repo/dist/index.html"), root));
+        // 源码与深层同名目录不受影响。
+        assert!(!ignored_path(Path::new("/repo/src/main.rs"), root));
+        assert!(!ignored_path(Path::new("/repo/src/dist/tool.rs"), root));
+        assert!(!ignored_path(Path::new("/repo/crates/app/target/x"), root));
+    }
+
+    #[test]
+    fn ignored_path_falls_back_when_not_under_root() {
+        let root = Path::new("/repo");
+        assert!(ignored_path(Path::new("/other/node_modules/x"), root));
+        assert!(!ignored_path(Path::new("/other/src/x.rs"), root));
+    }
 }

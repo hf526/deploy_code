@@ -162,9 +162,11 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   openTab: (repoId) =>
-    set((state) =>
-      state.tabs.includes(repoId) ? {} : { tabs: [...state.tabs, repoId] },
-    ),
+    set((state) => {
+      // 最近查看的仓库移到末尾，返回工作区时可直接回到它。
+      if (state.tabs[state.tabs.length - 1] === repoId) return {};
+      return { tabs: [...state.tabs.filter((id) => id !== repoId), repoId] };
+    }),
 
   closeTab: (repoId) =>
     set((state) => ({ tabs: state.tabs.filter((id) => id !== repoId) })),
