@@ -25,7 +25,7 @@ pub struct Git {
 }
 
 impl Git {
-    /// 打开一个已存在的 Git 仓库。
+    /// 打开一个本地目录。不要求目录已经是 Git 仓库，未初始化时可在绑定远端时自动执行 `git init`。
     pub fn open(path: impl Into<PathBuf>) -> Result<Self> {
         let git = Self { path: path.into() };
         if !git.path.is_dir() {
@@ -34,18 +34,18 @@ impl Git {
                 git.path.display()
             )));
         }
-        let out = git.try_run(&["rev-parse", "--is-inside-work-tree"])?;
-        if !out.success() || out.stdout.trim() != "true" {
-            return Err(CoreError::git(format!(
-                "{} 不是有效的 Git 仓库",
-                git.path.display()
-            )));
-        }
         Ok(git)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// 目录是否位于 Git 仓库内。
+    pub fn is_repo(&self) -> bool {
+        self.try_run(&["rev-parse", "--is-inside-work-tree"])
+            .map(|out| out.success() && out.stdout.trim() == "true")
+            .unwrap_or(false)
     }
 
     fn base_args(&self, args: &[&str]) -> Vec<String> {
@@ -81,8 +81,17 @@ impl Git {
         )
     }
 
-    /// 获取当前分支名（分离头指针时为 HEAD）。
+    /// 获取当前分支名（分离头指针时为 HEAD；空仓库返回尚未提交的初始分支名）。
     pub fn current_branch(&self) -> Result<String> {
+        // 空仓库没有 HEAD 提交，`rev-parse --abbrev-ref HEAD` 会直接失败；
+        // `symbolic-ref` 对尚未提交的初始分支同样有效。
+        let symbolic = self.try_run(&["symbolic-ref", "--short", "-q", "HEAD"])?;
+        if symbolic.success() {
+            let name = symbolic.stdout.trim();
+            if !name.is_empty() {
+                return Ok(name.to_string());
+            }
+        }
         Ok(self.run(&["rev-parse", "--abbrev-ref", "HEAD"])?.trim().to_string())
     }
 
@@ -199,11 +208,20 @@ impl Git {
 
     /// 工作区文件相对当前提交的差异（unified diff）。未跟踪文件按“新增”构造差异。
     pub fn diff_file(&self, path: &str) -> Result<String> {
-        let rel = path.trim().replace('\\', "/");
+        let rel = normalize_rel(path)?;
         if rel.is_empty() {
             return Err(CoreError::git("文件路径不能为空"));
         }
-        let text = self.run(&["diff", "HEAD", "--", &rel])?.trim_end().to_string();
+        // 空仓库（绑定后还没提交过）没有 HEAD，直接 `git diff HEAD` 会失败：
+        // 已暂存文件用 `--cached` 展示，未暂存文件交给下方的"新增"差异逻辑。
+        let text = if self.rev_hash("HEAD")?.is_some() {
+            self.run(&["diff", "HEAD", "--", &rel])?.trim_end().to_string()
+        } else {
+            self.run(&["diff", "--cached", "--", &rel])
+                .unwrap_or_default()
+                .trim_end()
+                .to_string()
+        };
         if !text.is_empty() {
             return Ok(truncate_diff(text));
         }
@@ -211,7 +229,22 @@ impl Git {
         if !status.lines().any(|line| line.starts_with("??")) {
             return Ok(String::new());
         }
-        let content = std::fs::read_to_string(self.path.join(&rel))
+        // 未跟踪文件可能是指向仓库外的符号链接：与 read_file 一致，解析真实路径并限制在仓库内。
+        let file = self.path.join(&rel);
+        let root =
+            std::fs::canonicalize(&self.path).map_err(|e| CoreError::io_path(&self.path, e))?;
+        let canonical = std::fs::canonicalize(&file)
+            .map_err(|_| CoreError::git("二进制或无法读取的文件，暂不支持差异预览"))?;
+        if !canonical.starts_with(&root) {
+            return Err(CoreError::git(format!(
+                "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
+            )));
+        }
+        // 与文件预览保持一致的大小上限，避免超大文件把差异内容全部读入内存。
+        if std::fs::metadata(&file).map(|meta| meta.len()).unwrap_or(0) > 2_000_000 {
+            return Err(CoreError::git("文件过大，暂不支持差异预览"));
+        }
+        let content = std::fs::read_to_string(&file)
             .map_err(|_| CoreError::git("二进制或无法读取的文件，暂不支持差异预览"))?;
         let added: Vec<String> = content.lines().map(|line| format!("+{line}")).collect();
         let mut diff = format!("diff --git a/{rel} b/{rel}\nnew file\n--- /dev/null\n+++ b/{rel}\n");
@@ -284,6 +317,10 @@ impl Git {
 
     /// 推送当前分支（无上游时自动关联 origin 同名分支）。
     pub fn push(&self) -> Result<String> {
+        // 空仓库还没有任何提交，git push 只会报 "src refspec ... does not match any"。
+        if self.rev_hash("HEAD")?.is_none() {
+            return Err(CoreError::git("还没有可推送的提交，请先提交变更"));
+        }
         let branch = self.current_branch()?;
         let out = if self.has_upstream() {
             self.run_network(&["push"])?
@@ -378,8 +415,8 @@ impl Git {
         })
     }
 
-    /// 提交全部改动。
-    pub fn commit_all(&self, message: &str) -> Result<String> {
+    /// 提交全部改动；`allow_sensitive` 为 false 时拒绝提交疑似敏感文件。
+    pub fn commit_all(&self, message: &str, allow_sensitive: bool) -> Result<String> {
         let message = message.trim();
         if message.is_empty() {
             return Err(CoreError::git("提交信息不能为空"));
@@ -388,6 +425,15 @@ impl Git {
         if status.trim().is_empty() {
             return Err(CoreError::git("没有需要提交的改动"));
         }
+        if !allow_sensitive {
+            let sensitive = self.sensitive_changes()?;
+            if !sensitive.is_empty() {
+                return Err(CoreError::git(format!(
+                    "检测到疑似敏感文件，已阻止提交：\n  {}\n如确认不含密钥 / 密码：界面中可再次确认提交，命令行需加 --allow-sensitive。",
+                    sensitive.join("\n  ")
+                )));
+            }
+        }
         self.run(&["add", "-A"])?;
         let out = self.try_run(&["commit", "-m", message])?;
         if !out.success() {
@@ -395,6 +441,30 @@ impl Git {
         }
         let short = self.run(&["rev-parse", "--short", "HEAD"])?;
         Ok(format!("已提交 {}: {}", short.trim(), message))
+    }
+
+    /// 列出本次改动中疑似包含敏感信息的文件（按文件名判断，含未跟踪文件）。
+    pub fn sensitive_changes(&self) -> Result<Vec<String>> {
+        // -z 输出以 NUL 分隔且不做引号转义：重命名会额外输出旧路径段，统一收集判断即可，
+        // 避免 ` -> ` 出现在文件名里或路径被 git 引号包裹时漏检。
+        let out = self.run(&["status", "--porcelain", "-z", "--untracked-files=all"])?;
+        let mut files: Vec<String> = Vec::new();
+        for entry in out.split('\0') {
+            if entry.is_empty() {
+                continue;
+            }
+            // 常规条目形如 "XY path"（前两列状态 + 一个空格），否则是重命名的旧路径段。
+            let path = if entry.len() > 3 && entry.as_bytes()[2] == b' ' {
+                &entry[3..]
+            } else {
+                entry
+            }
+            .replace('\\', "/");
+            if is_sensitive_path(&path) && !files.contains(&path) {
+                files.push(path);
+            }
+        }
+        Ok(files)
     }
 
     /// 回退到指定版本（丢弃工作区改动）。
@@ -506,6 +576,56 @@ impl Git {
         } else {
             Ok(None)
         }
+    }
+
+    /// 任意可用的远端地址：优先 origin，其次其他 remote（如 upstream）。
+    pub fn any_remote_url(&self) -> Result<Option<String>> {
+        if let Some(url) = self.remote_url()? {
+            return Ok(Some(url));
+        }
+        for name in self.remote_names() {
+            let out = self.try_run(&["remote", "get-url", &name])?;
+            if out.success() {
+                if let Some(url) = non_empty(out.stdout.trim()) {
+                    return Ok(Some(url));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 克隆远端仓库到指定目录（目标目录必须不存在或为空）。
+    pub fn clone(remote: &str, dest: &Path) -> Result<()> {
+        let remote = validate_remote_url(remote)?;
+        let args = vec![
+            "clone".to_string(),
+            "--progress".to_string(),
+            remote,
+            dest.to_string_lossy().into_owned(),
+        ];
+        let out = crate::process::run_timeout("git", &args, None, Duration::from_secs(900))
+            .map_err(|e| CoreError::git(format!("克隆失败: {e}")))?;
+        if !out.success() {
+            return Err(CoreError::git(format!("克隆失败: {}", out.combined().trim())));
+        }
+        Ok(())
+    }
+
+    /// 绑定或更新远端地址（origin）；目录尚未初始化 Git 时自动执行 `git init`。
+    pub fn set_remote_url(&self, url: &str) -> Result<()> {
+        let url = validate_remote_url(url)?;
+        if !self.is_repo() {
+            let out = self.try_run(&["init"])?;
+            if !out.success() {
+                return Err(CoreError::git(git_error(&["init"], &out)));
+            }
+        }
+        if self.remote_names().iter().any(|name| name == "origin") {
+            self.run(&["remote", "set-url", "origin", &url])?;
+        } else {
+            self.run(&["remote", "add", "origin", &url])?;
+        }
+        Ok(())
     }
 
     fn remote_names(&self) -> Vec<String> {
@@ -631,12 +751,36 @@ impl Git {
             }
             Err(err) => return Err(CoreError::io_path(&file, err)),
         }
-        std::fs::write(&file, content.as_bytes()).map_err(|e| CoreError::io_path(&file, e))?;
+        // 普通文件走「临时文件 + rename」原子写，避免写入中途失败截断原文件；
+        // 指向仓库内其他文件的符号链接保持写穿语义，不做替换。
+        let is_symlink = std::fs::symlink_metadata(&file)
+            .map(|meta| meta.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_symlink {
+            std::fs::write(&file, content.as_bytes()).map_err(|e| CoreError::io_path(&file, e))?;
+        } else {
+            atomic_write_text(&file, content)?;
+        }
         Ok(format!("已保存 {rel}"))
     }
 
     /// 按文件名快速搜索（tracked + 未忽略的 untracked），大小写不敏感子串匹配。
+    /// 非 Git 文件夹退化为遍历本地目录。
     pub fn find_files(&self, query: &str, limit: usize) -> Result<Vec<String>> {
+        if !self.is_repo() {
+            let needle = query.trim().to_lowercase();
+            let mut files = Vec::new();
+            walk_files(&self.path, |rel, _| {
+                if needle.is_empty() || rel.to_lowercase().contains(&needle) {
+                    files.push(rel.to_string());
+                    files.len() >= limit
+                } else {
+                    false
+                }
+            });
+            files.sort();
+            return Ok(files);
+        }
         let out = self.try_run(&["ls-files", "--cached", "--others", "--exclude-standard"])?;
         if !out.success() {
             return Ok(Vec::new());
@@ -659,6 +803,7 @@ impl Git {
     }
 
     /// 全仓库内容搜索（git grep 固定字符串，含未跟踪文件，跳过二进制）。
+    /// 非 Git 文件夹退化为遍历本地目录逐行匹配。
     pub fn search_content(
         &self,
         query: &str,
@@ -669,8 +814,13 @@ impl Git {
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        let limit_arg = format!("-{limit}");
-        let mut args: Vec<&str> = vec!["grep", "-n", "-I", "--untracked", &limit_arg];
+        if !self.is_repo() {
+            return self.search_content_fs(query, case_sensitive, limit);
+        }
+        // git grep 的 `-<n>` 是上下文行数（-C <n>）而非条数上限，必须用 --max-count；
+        // 且 --max-count 是「每个文件」上限，解析时再按总量截断。
+        let max_arg = format!("--max-count={limit}");
+        let mut args: Vec<&str> = vec!["grep", "-n", "-I", "--untracked", &max_arg];
         if !case_sensitive {
             args.push("-i");
         }
@@ -695,7 +845,62 @@ impl Git {
                 line: num,
                 text: text.trim_start().to_string(),
             });
+            if hits.len() >= limit {
+                break;
+            }
         }
+        Ok(hits)
+    }
+
+    /// 非 Git 文件夹的全文搜索：遍历目录逐行匹配，跳过二进制与超大文件。
+    fn search_content_fs(
+        &self,
+        query: &str,
+        case_sensitive: bool,
+        limit: usize,
+    ) -> Result<Vec<SearchHit>> {
+        /// 单个文件最多读取的字节数，与文件预览的上限保持一致。
+        const MAX_FILE_SIZE: u64 = 2_000_000;
+        let needle = if case_sensitive {
+            query.to_string()
+        } else {
+            query.to_lowercase()
+        };
+        let mut hits = Vec::new();
+        walk_files(&self.path, |rel, path| {
+            let Ok(meta) = std::fs::metadata(path) else {
+                return false;
+            };
+            if !meta.is_file() || meta.len() > MAX_FILE_SIZE {
+                return false;
+            }
+            let Ok(bytes) = std::fs::read(path) else {
+                return false;
+            };
+            if bytes[..bytes.len().min(8000)].contains(&0) {
+                return false;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (index, line) in text.lines().enumerate() {
+                let matched = if case_sensitive {
+                    line.contains(&needle)
+                } else {
+                    line.to_lowercase().contains(&needle)
+                };
+                if !matched {
+                    continue;
+                }
+                hits.push(SearchHit {
+                    path: rel.to_string(),
+                    line: (index + 1) as u32,
+                    text: line.trim_start().to_string(),
+                });
+                if hits.len() >= limit {
+                    return true;
+                }
+            }
+            false
+        });
         Ok(hits)
     }
 
@@ -712,6 +917,8 @@ impl Git {
         }
         let mut files = 0u32;
         let mut matches = 0u32;
+        let root =
+            std::fs::canonicalize(&self.path).map_err(|e| CoreError::io_path(&self.path, e))?;
         for rel in paths {
             let Ok(rel) = normalize_rel(rel) else {
                 continue;
@@ -721,6 +928,13 @@ impl Git {
             }
             let file = self.path.join(&rel);
             if !file.is_file() {
+                continue;
+            }
+            // 与 write_file 一致：解析符号链接后必须仍在仓库内，避免经链接目录写到仓库外。
+            let Ok(canonical) = std::fs::canonicalize(&file) else {
+                continue;
+            };
+            if !canonical.starts_with(&root) {
                 continue;
             }
             let bytes = match std::fs::read(&file) {
@@ -744,6 +958,41 @@ impl Git {
             files_replaced: files,
             matches_replaced: matches,
         })
+    }
+}
+
+/// 非 Git 文件夹的文件遍历：跳过 `.git`、`node_modules` 与符号链接（避免环路），
+/// 回调收到相对路径与绝对路径；回调返回 true 表示停止遍历。
+fn walk_files(root: &Path, mut visit: impl FnMut(&str, &Path) -> bool) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for item in read.flatten() {
+            let Ok(file_type) = item.file_type() else {
+                continue;
+            };
+            let name = item.file_name().to_string_lossy().into_owned();
+            if name == ".git" || name == "node_modules" || file_type.is_symlink() {
+                continue;
+            }
+            let path = item.path();
+            if file_type.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let rel = path
+                .strip_prefix(root)
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_default();
+            if rel.is_empty() {
+                continue;
+            }
+            if visit(&rel, &path) {
+                return;
+            }
+        }
     }
 }
 
@@ -842,6 +1091,21 @@ fn validate_ref_arg(value: &str, label: &str) -> Result<String> {
     }
     if value.chars().any(|c| c.is_control()) {
         return Err(CoreError::git(format!("{label}包含非法字符")));
+    }
+    Ok(value.to_string())
+}
+
+/// 校验用户填写的远端地址，避免以 `-` 开头被 git 当作选项。
+fn validate_remote_url(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(CoreError::config("Git 地址不能为空"));
+    }
+    if value.starts_with('-') {
+        return Err(CoreError::config(format!("非法的 Git 地址: {value}")));
+    }
+    if value.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(CoreError::config("Git 地址不能包含空白或控制字符"));
     }
     Ok(value.to_string())
 }
@@ -993,11 +1257,47 @@ fn describe_code(code: &str) -> String {
     }
 }
 
+/// 按文件名判断是否疑似敏感文件（模板 / 示例 / 公钥文件除外）。
+fn is_sensitive_path(path: &str) -> bool {
+    let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
+    // 公钥与示例文件不敏感，避免误报阻断提交。
+    if name.ends_with(".pub")
+        || [".example", ".sample", ".template", ".dist"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+    {
+        return false;
+    }
+    name == ".env"
+        || name.starts_with(".env.")
+        || name.ends_with(".env")
+        || name.ends_with(".pem")
+        || name.ends_with(".key")
+        || name.ends_with(".pfx")
+        || name.ends_with(".p12")
+        || name.ends_with(".keystore")
+        || name.ends_with(".jks")
+        || name.starts_with("id_rsa")
+        || name.starts_with("id_ed25519")
+        || name.starts_with("id_ecdsa")
+        || name.starts_with("id_dsa")
+        || name == ".npmrc"
+        || name == ".pypirc"
+        || name == ".netrc"
+        || name == ".git-credentials"
+        || name.contains("credentials")
+        || name.starts_with("secrets")
+        || name.ends_with(".secret")
+}
+
 fn git_error(args: &[&str], out: &CommandOutput) -> String {
     let detail = out.combined();
     let detail = if detail.is_empty() { "无输出" } else { &detail };
     if detail.contains("Please tell me who you are") {
         return "Git 未配置提交身份，请先执行:\n  git config --global user.name \"你的名字\"\n  git config --global user.email \"你的邮箱\"".to_string();
+    }
+    if detail.contains("not a git repository") {
+        return "当前文件夹尚未绑定 Git 仓库，请先绑定远端仓库地址".to_string();
     }
     format!("git {} 失败: {detail}", args.join(" "))
 }
@@ -1071,6 +1371,15 @@ mod tests {
     }
 
     #[test]
+    fn validate_remote_url_rejects_option_like_and_blank() {
+        assert!(validate_remote_url("git@github.com:user/repo.git").is_ok());
+        assert!(validate_remote_url("https://github.com/user/repo.git").is_ok());
+        assert!(validate_remote_url("  ").is_err());
+        assert!(validate_remote_url("--upload-pack=evil").is_err());
+        assert!(validate_remote_url("https://x y/z").is_err());
+    }
+
+    #[test]
     fn validate_ref_arg_rejects_option_like_names() {
         assert!(validate_ref_arg("main", "分支").is_ok());
         assert!(validate_ref_arg("origin/main", "分支").is_ok());
@@ -1120,5 +1429,275 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn git_available() -> bool {
+        std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn open_missing_dir_errors() {
+        let missing =
+            std::env::temp_dir().join(format!("deploycode-git-missing-{}", uuid::Uuid::new_v4()));
+        assert!(Git::open(&missing).is_err());
+    }
+
+    #[test]
+    fn open_non_git_dir_is_allowed() {
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-plain-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = Git::open(&dir).unwrap();
+        assert!(!git.is_repo());
+        if git_available() {
+            assert_eq!(git.remote_url().unwrap(), None);
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn binding_remote_initializes_non_git_dir() {
+        if !git_available() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-init-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let git = Git::open(&dir).unwrap();
+        git.set_remote_url("https://github.com/user/repo.git").unwrap();
+        assert!(git.is_repo());
+        assert_eq!(
+            git.remote_url().unwrap().as_deref(),
+            Some("https://github.com/user/repo.git")
+        );
+
+        // 已初始化后再次绑定只更新地址，不重复 init。
+        git.set_remote_url("git@github.com:user/other.git").unwrap();
+        assert_eq!(
+            git.remote_url().unwrap().as_deref(),
+            Some("git@github.com:user/other.git")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bind_commit_and_push_after_binding_local_remote() {
+        if !git_available() {
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("deploycode-git-e2e-{}", uuid::Uuid::new_v4()));
+        let work = base.join("work");
+        let remote = base.join("remote.git");
+        std::fs::create_dir_all(&work).unwrap();
+        let status = std::process::Command::new("git")
+            .arg("init")
+            .arg("--bare")
+            .arg(&remote)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap();
+        assert!(status.success());
+
+        std::fs::write(work.join("readme.md"), "hello").unwrap();
+
+        let git = Git::open(&work).unwrap();
+        assert!(!git.is_repo());
+        git.set_remote_url(&remote.to_string_lossy()).unwrap();
+        // 提交身份与签名在本地配置，不依赖运行环境的全局 Git 配置。
+        git.run(&["config", "user.name", "DeployCode Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"]).unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+
+        let message = git.commit_all("init", false).unwrap();
+        assert!(message.contains("init"));
+        git.push().unwrap();
+
+        let branch = git.current_branch().unwrap();
+        let out = std::process::Command::new("git")
+            .arg("--git-dir")
+            .arg(&remote)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg(format!("refs/heads/{branch}"))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "远端未收到推送的分支 {branch}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn diff_file_handles_unborn_repo_and_untracked_files() {
+        if !git_available() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-diff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("first.txt"), "first\n").unwrap();
+
+        let git = Git::open(&dir).unwrap();
+        git.set_remote_url("https://github.com/user/repo.git").unwrap();
+
+        // 空仓库也应读到初始分支名（否则绑定后界面会一直显示 "-"）。
+        let branch = git.current_branch().unwrap();
+        assert!(!branch.is_empty() && branch != "HEAD", "branch = {branch}");
+
+        // 空仓库推送应给出明确提示，而不是 git 原始的 refspec 报错。
+        let err = git.push().unwrap_err().to_string();
+        assert!(err.contains("还没有可推送的提交"), "err = {err}");
+
+        // 空仓库的未跟踪文件：应构造新增差异，而不是 `git diff HEAD` 报错。
+        let diff = git.diff_file("first.txt").unwrap();
+        assert!(diff.contains("+first"), "diff = {diff}");
+
+        // 空仓库的已暂存文件：走 `--cached` 差异。
+        git.run(&["add", "-A"]).unwrap();
+        let diff = git.diff_file("first.txt").unwrap();
+        assert!(diff.contains("+first"), "diff = {diff}");
+
+        // 空仓库的文件名搜索与内容搜索仍走 git 路径。
+        std::fs::write(dir.join("third.txt"), "needle\n").unwrap();
+        assert!(git
+            .find_files("third.txt", 10)
+            .unwrap()
+            .contains(&"third.txt".to_string()));
+        assert!(git
+            .search_content("needle", false, 10)
+            .unwrap()
+            .iter()
+            .any(|hit| hit.path == "third.txt"));
+
+        git.run(&["config", "user.name", "DeployCode Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"]).unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        git.commit_all("init", false).unwrap();
+
+        // 有 HEAD 后修改已跟踪文件。
+        std::fs::write(dir.join("first.txt"), "first changed\n").unwrap();
+        let diff = git.diff_file("first.txt").unwrap();
+        assert!(
+            diff.contains("-first") && diff.contains("+first changed"),
+            "diff = {diff}"
+        );
+
+        // 有 HEAD 后新增未跟踪文件。
+        std::fs::write(dir.join("second.txt"), "second\n").unwrap();
+        let diff = git.diff_file("second.txt").unwrap();
+        assert!(diff.contains("+second"), "diff = {diff}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn diff_file_on_non_git_dir_reports_clear_error() {
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-nodiff-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.txt"), "x").unwrap();
+
+        let git = Git { path: dir.clone() };
+        let err = git.diff_file("a.txt").unwrap_err().to_string();
+        if git_available() {
+            assert!(err.contains("尚未绑定 Git 仓库"), "err = {err}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_and_search_fall_back_without_git_repo() {
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-walk-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join("node_modules/pkg")).unwrap();
+        std::fs::write(dir.join("src/a.txt"), "first line\nHello World\n").unwrap();
+        std::fs::write(dir.join("src/b.rs"), "fn main() {}\n").unwrap();
+        std::fs::write(dir.join("node_modules/pkg/a.txt"), "Hello World\n").unwrap();
+        std::fs::write(dir.join(".git-placeholder"), "x").unwrap();
+
+        let git = Git { path: dir.clone() };
+
+        let files = git.find_files("a.txt", 10).unwrap();
+        assert_eq!(files, vec!["src/a.txt".to_string()]);
+
+        let hits = git.search_content("hello", false, 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "src/a.txt");
+        assert_eq!(hits[0].line, 2);
+        assert_eq!(hits[0].text, "Hello World");
+
+        assert!(git.search_content("HELLO", true, 10).unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sensitive_path_detection_matches_common_secrets() {
+        for path in [
+            ".env",
+            ".env.production",
+            "docker/.env",
+            "prod.env",
+            "server.pem",
+            "TLS.KEY",
+            "id_rsa",
+            "credentials.json",
+            "secrets.yaml",
+            ".npmrc",
+            ".git-credentials",
+            "app.p12",
+        ] {
+            assert!(is_sensitive_path(path), "{path} 应判定为敏感文件");
+        }
+        for path in [
+            ".env.example",
+            ".env.sample",
+            ".env.template",
+            ".env.dist",
+            "id_rsa.pub",
+            "src/main.rs",
+            "readme.md",
+            "package.json",
+        ] {
+            assert!(!is_sensitive_path(path), "{path} 不应判定为敏感文件");
+        }
+    }
+
+    #[test]
+    fn commit_all_blocks_sensitive_files_until_allowed() {
+        if !git_available() {
+            return;
+        }
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-git-secret-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = Git::open(&dir).unwrap();
+        git.run(&["init"]).unwrap();
+        std::fs::write(dir.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::write(dir.join("readme.md"), "hi\n").unwrap();
+
+        assert_eq!(git.sensitive_changes().unwrap(), vec![".env".to_string()]);
+        let err = git.commit_all("init", false).unwrap_err().to_string();
+        assert!(err.contains(".env"), "err = {err}");
+
+        git.run(&["config", "user.name", "DeployCode Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"]).unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        git.commit_all("init", true).unwrap();
+        assert!(git.status().unwrap().changes.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

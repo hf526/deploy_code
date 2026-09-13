@@ -1,23 +1,30 @@
 import { useEffect, useRef, useState } from "react";
-import { FolderOpen, Plus, Save, Settings2, Trash2 } from "lucide-react";
+import { FolderOpen, Plus, Save, Server, Settings2, Trash2 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { Button, Card, Field, Input, Page, SectionTitle, Select } from "../components/ui";
+import { BackupTargetFromServerModal } from "../components/BackupTargetFromServerModal";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { api } from "../lib/api";
+import { applyLanguage, normalizeLanguagePreference } from "../lib/i18n";
 import { useApp } from "../lib/store";
 import type { BackupTarget, Settings } from "../lib/types";
 
 export default function SettingsPage() {
+  const { t } = useTranslation();
   const settings = useApp((state) => state.settings);
   const setSettings = useApp((state) => state.setSettings);
   const backupTargets = useApp((state) => state.backupTargets);
+  const servers = useApp((state) => state.servers);
   const refreshBackupTargets = useApp((state) => state.refreshBackupTargets);
+  const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const refreshServers = useApp((state) => state.refreshServers);
   const toast = useApp((state) => state.toast);
 
   const [dataDir, setDataDir] = useState("");
   const [draft, setDraft] = useState<Settings>(settings);
   const [targetDraft, setTargetDraft] = useState<BackupTarget[]>(backupTargets);
+  const [fromServerOpen, setFromServerOpen] = useState(false);
 
   useEffect(() => {
     void api
@@ -46,24 +53,31 @@ export default function SettingsPage() {
     setTargetDraft(backupTargets);
   }, [backupTargets]);
 
+  /** 保存到后端的规范化：数值字段限幅、空值用默认值兜底。 */
+  function normalizedSettings(source: Settings): Settings {
+    return {
+      ...source,
+      scriptDir: source.scriptDir.trim() || "docker",
+      connectTimeoutSecs: Math.max(3, Number(source.connectTimeoutSecs) || 15),
+      scriptTimeoutSecs: Math.max(10, Number(source.scriptTimeoutSecs) || 1800),
+      historyLimit: Math.max(20, Number(source.historyLimit) || 500),
+      supabaseUrl: source.supabaseUrl.trim(),
+      defaultBackupTargetId: source.defaultBackupTargetId || null,
+      backupHistoryLimit: Math.max(10, Number(source.backupHistoryLimit) || 200),
+      backupTimeoutSecs: Math.max(60, Number(source.backupTimeoutSecs) || 3600),
+      cloudflareApiToken: source.cloudflareApiToken.trim(),
+      cloudflareAccountId: source.cloudflareAccountId.trim(),
+      githubToken: source.githubToken.trim(),
+      pagesHistoryLimit: Math.max(10, Number(source.pagesHistoryLimit) || 200),
+      language: normalizeLanguagePreference(source.language),
+    };
+  }
+
   async function handleSaveSettings() {
     try {
-      const saved = await api.saveSettings({
-        ...draft,
-        scriptDir: draft.scriptDir.trim() || "docker",
-        connectTimeoutSecs: Math.max(3, Number(draft.connectTimeoutSecs) || 15),
-        scriptTimeoutSecs: Math.max(10, Number(draft.scriptTimeoutSecs) || 1800),
-        historyLimit: Math.max(20, Number(draft.historyLimit) || 500),
-        supabaseUrl: draft.supabaseUrl.trim(),
-        defaultBackupTargetId: draft.defaultBackupTargetId || null,
-        backupHistoryLimit: Math.max(10, Number(draft.backupHistoryLimit) || 200),
-        backupTimeoutSecs: Math.max(60, Number(draft.backupTimeoutSecs) || 3600),
-        cloudflareApiToken: draft.cloudflareApiToken.trim(),
-        cloudflareAccountId: draft.cloudflareAccountId.trim(),
-        pagesHistoryLimit: Math.max(10, Number(draft.pagesHistoryLimit) || 200),
-      });
+      const saved = await api.saveSettings(normalizedSettings(draft));
       setSettings(saved);
-      toast("success", "设置已保存");
+      toast("success", t("settings.saved"));
     } catch (error) {
       toast("error", String(error));
     }
@@ -73,57 +87,64 @@ export default function SettingsPage() {
     try {
       const saved = await api.saveBackupTargets(targetDraft);
       setTargetDraft(saved);
-      await Promise.all([refreshBackupTargets(), refreshServers()]);
+      await Promise.all([refreshBackupTargets(), refreshServers(), refreshBackupConfigs()]);
       // 后端可能清理指向已删除目标的默认设置，需要同步最新 settings。
       const fresh = await api.getSettings();
       setSettings(fresh);
-      toast("success", "备份目标已保存");
+      toast("success", t("settings.targetsSaved"));
     } catch (error) {
       toast("error", String(error));
     }
   }
 
+  /** 由「从服务器添加」生成的目标先进入草稿，点「保存目标」后持久化。 */
+  function handleAddTargetFromServer(target: BackupTarget) {
+    setTargetDraft((current) => [...current, target]);
+  }
+
   /** 把旧版单连接串转成正式备份目标，并立即持久化，避免只改本地状态导致数据丢失。 */
   async function handleConvertLegacy(url: string) {
-    const next = [...targetDraft, { id: "", name: "旧版连接串", url }];
+    const next = [...targetDraft, { id: "", name: t("settings.backupTargets.legacyName"), url }];
     try {
       const saved = await api.saveBackupTargets(next);
       setTargetDraft(saved);
       await refreshBackupTargets();
-      const savedSettings = await api.saveSettings({ ...draft, supabaseUrl: "" });
+      const savedSettings = await api.saveSettings(
+        normalizedSettings({ ...draft, supabaseUrl: "" }),
+      );
       setSettings(savedSettings);
-      toast("success", "已将旧连接串转为备份目标");
+      toast("success", t("settings.legacyConverted"));
     } catch (error) {
       toast("error", String(error));
     }
   }
 
   return (
-    <Page title="设置" subtitle="全局参数与数据目录">
+    <Page title={t("settings.title")} subtitle={t("settings.subtitle")}>
       <div className="flex max-w-4xl flex-col gap-8">
         <section>
           <SectionTitle
-            title="部署参数"
-            description="打包、上传与脚本执行相关配置"
+            title={t("settings.deploy.title")}
+            description={t("settings.deploy.description")}
             actions={
               <Button
                 icon={<Settings2 className="size-4" />}
                 onClick={() => void handleSaveSettings()}
               >
-                保存设置
+                {t("settings.deploy.save")}
               </Button>
             }
           />
           <Card className="p-5">
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <Field label="默认脚本目录" hint="相对项目根目录">
+              <Field label={t("settings.deploy.scriptDir")} hint={t("settings.deploy.scriptDirHint")}>
                 <Input
                   value={draft.scriptDir}
                   onChange={(event) => setDraft({ ...draft, scriptDir: event.target.value })}
                   placeholder="docker"
                 />
               </Field>
-              <Field label="部署记录保留条数">
+              <Field label={t("settings.deploy.historyLimit")}>
                 <Input
                   type="number"
                   value={draft.historyLimit}
@@ -132,7 +153,7 @@ export default function SettingsPage() {
                   }
                 />
               </Field>
-              <Field label="SSH 连接超时（秒）">
+              <Field label={t("settings.deploy.connectTimeout")}>
                 <Input
                   type="number"
                   value={draft.connectTimeoutSecs}
@@ -141,7 +162,7 @@ export default function SettingsPage() {
                   }
                 />
               </Field>
-              <Field label="脚本执行超时（秒）">
+              <Field label={t("settings.deploy.scriptTimeout")}>
                 <Input
                   type="number"
                   value={draft.scriptTimeoutSecs}
@@ -160,7 +181,7 @@ export default function SettingsPage() {
                   onChange={(event) => setDraft({ ...draft, runScripts: event.target.checked })}
                   className="size-3.5 accent-primary"
                 />
-                默认开启「上传解压后执行项目脚本」
+                {t("settings.deploy.runScripts")}
               </label>
               <label className="flex items-center gap-2.5 text-xs text-ink">
                 <input
@@ -171,7 +192,7 @@ export default function SettingsPage() {
                   }
                   className="size-3.5 accent-primary"
                 />
-                在服务器上保留上传的代码包（默认解压后删除）
+                {t("settings.deploy.keepRemoteArchive")}
               </label>
             </div>
           </Card>
@@ -179,20 +200,20 @@ export default function SettingsPage() {
 
         <section>
           <SectionTitle
-            title="数据库备份目标"
-            description="Supabase / Aiven / Neon 等 PostgreSQL，可配置多个，备份时选择一个"
+            title={t("settings.backupTargets.title")}
+            description={t("settings.backupTargets.description")}
             actions={
               <Button
                 icon={<Save className="size-4" />}
                 onClick={() => void handleSaveTargets()}
               >
-                保存目标
+                {t("settings.backupTargets.save")}
               </Button>
             }
           />
           <Card className="flex flex-col gap-3 p-5">
             {targetDraft.length === 0 && (
-              <p className="text-xs text-ink-faint">还没有备份目标，点击下方「添加目标」。</p>
+              <p className="text-xs text-ink-faint">{t("settings.backupTargets.empty")}</p>
             )}
             {targetDraft.map((target, index) => (
               <div
@@ -201,7 +222,7 @@ export default function SettingsPage() {
               >
                 <Input
                   value={target.name}
-                  placeholder="名称（如 Supabase）"
+                  placeholder={t("settings.backupTargets.namePlaceholder")}
                   onChange={(event) => {
                     const next = [...targetDraft];
                     next[index] = { ...target, name: event.target.value };
@@ -210,7 +231,7 @@ export default function SettingsPage() {
                 />
                 <Input
                   value={target.url}
-                  placeholder="postgresql://user:password@host:5432/postgres"
+                  placeholder={t("settings.backupTargets.urlPlaceholder")}
                   onChange={(event) => {
                     const next = [...targetDraft];
                     next[index] = { ...target, url: event.target.value };
@@ -220,7 +241,7 @@ export default function SettingsPage() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  title="删除目标"
+                  title={t("settings.backupTargets.deleteTarget")}
                   onClick={() => setTargetDraft(targetDraft.filter((_, i) => i !== index))}
                 >
                   <Trash2 className="size-3.5" />
@@ -239,12 +260,24 @@ export default function SettingsPage() {
                   ])
                 }
               >
-                添加目标
+                {t("settings.backupTargets.addTarget")}
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Server className="size-3.5" />}
+                disabled={servers.length === 0}
+                onClick={() => setFromServerOpen(true)}
+              >
+                {t("settings.backupTargets.fromServer")}
               </Button>
             </div>
 
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <Field label="全局默认目标" hint="服务器未指定时使用">
+              <Field
+                label={t("settings.backupTargets.defaultTarget")}
+                hint={t("settings.backupTargets.defaultTargetHint")}
+              >
                 <Select
                   value={draft.defaultBackupTargetId ?? ""}
                   onChange={(event) =>
@@ -254,7 +287,7 @@ export default function SettingsPage() {
                     })
                   }
                 >
-                  <option value="">无（不备份）</option>
+                  <option value="">{t("settings.backupTargets.none")}</option>
                   {backupTargets.map((target) => (
                     <option key={target.id} value={target.id}>
                       {target.name}
@@ -262,7 +295,7 @@ export default function SettingsPage() {
                   ))}
                 </Select>
               </Field>
-              <Field label="备份记录保留条数">
+              <Field label={t("settings.backupTargets.historyLimit")}>
                 <Input
                   type="number"
                   value={draft.backupHistoryLimit}
@@ -271,7 +304,7 @@ export default function SettingsPage() {
                   }
                 />
               </Field>
-              <Field label="备份超时（秒）">
+              <Field label={t("settings.backupTargets.timeout")}>
                 <Input
                   type="number"
                   value={draft.backupTimeoutSecs}
@@ -285,20 +318,18 @@ export default function SettingsPage() {
             <div className="flex items-center justify-between gap-3 border-t border-line pt-3">
               {draft.supabaseUrl.trim() ? (
                 <div className="flex min-w-0 items-center gap-2 text-[11px] text-warn">
-                  <span className="min-w-0">
-                    检测到旧版单连接串配置，将作为最低优先级兜底。
-                  </span>
+                  <span className="min-w-0">{t("settings.backupTargets.legacy")}</span>
                   <Button
                     variant="ghost"
                     size="sm"
                     onClick={() => void handleConvertLegacy(draft.supabaseUrl.trim())}
                   >
-                    转为备份目标
+                    {t("settings.backupTargets.convertLegacy")}
                   </Button>
                 </div>
               ) : (
                 <span className="text-[11px] text-ink-faint">
-                  全量覆盖：执行时清空目标 schema 后重新导入，并恢复默认角色授权
+                  {t("settings.backupTargets.fullOverwrite")}
                 </span>
               )}
               <Button
@@ -307,7 +338,7 @@ export default function SettingsPage() {
                 icon={<Save className="size-3.5" />}
                 onClick={() => void handleSaveSettings()}
               >
-                保存备份参数
+                {t("settings.backupTargets.saveParams")}
               </Button>
             </div>
           </Card>
@@ -315,12 +346,15 @@ export default function SettingsPage() {
 
         <section>
           <SectionTitle
-            title="Cloudflare Pages"
-            description="用于「构建并部署」到 Cloudflare Pages，Token 需 Pages:Edit 权限"
+            title={t("settings.cloudflare.title")}
+            description={t("settings.cloudflare.description")}
           />
           <Card className="p-5">
             <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-              <Field label="API Token" hint="Cloudflare 控制台创建">
+              <Field
+                label={t("settings.cloudflare.apiToken")}
+                hint={t("settings.cloudflare.apiTokenHint")}
+              >
                 <Input
                   type="password"
                   value={draft.cloudflareApiToken}
@@ -330,7 +364,7 @@ export default function SettingsPage() {
                   placeholder="Cloudflare API Token"
                 />
               </Field>
-              <Field label="Account ID">
+              <Field label={t("settings.cloudflare.accountId")}>
                 <Input
                   value={draft.cloudflareAccountId}
                   onChange={(event) =>
@@ -339,7 +373,7 @@ export default function SettingsPage() {
                   placeholder="Cloudflare Account ID"
                 />
               </Field>
-              <Field label="Pages 记录保留条数">
+              <Field label={t("settings.cloudflare.historyLimit")}>
                 <Input
                   type="number"
                   value={draft.pagesHistoryLimit}
@@ -356,25 +390,92 @@ export default function SettingsPage() {
                 icon={<Save className="size-3.5" />}
                 onClick={() => void handleSaveSettings()}
               >
-                保存 Cloudflare 配置
+                {t("settings.cloudflare.save")}
               </Button>
             </div>
           </Card>
         </section>
 
         <section>
-          <SectionTitle title="外观" description="界面主题，「系统」跟随操作系统深浅色自动切换" />
-          <Card className="flex items-center gap-4 p-4">
-            <span className="min-w-0 flex-1 text-[13px] text-ink-dim">界面主题</span>
-            <ThemeToggle className="w-72 shrink-0" />
+          <SectionTitle
+            title={t("settings.github.title")}
+            description={t("settings.github.description")}
+          />
+          <Card className="p-5">
+            <Field
+              label={t("settings.github.token")}
+              hint={t("settings.github.tokenHint")}
+            >
+              <Input
+                type="password"
+                value={draft.githubToken}
+                onChange={(event) => setDraft({ ...draft, githubToken: event.target.value })}
+                placeholder="ghp_... / github_pat_..."
+              />
+            </Field>
+            <div className="mt-4 flex justify-end border-t border-line pt-4">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Save className="size-3.5" />}
+                onClick={() => void handleSaveSettings()}
+              >
+                {t("settings.github.save")}
+              </Button>
+            </div>
           </Card>
         </section>
 
         <section>
-          <SectionTitle title="数据目录" description="配置、部署记录与临时文件存放位置" />
+          <SectionTitle
+            title={t("settings.appearance.title")}
+            description={t("settings.appearance.description")}
+            actions={
+              <Button
+                icon={<Settings2 className="size-4" />}
+                onClick={() => void handleSaveSettings()}
+              >
+                {t("settings.deploy.save")}
+              </Button>
+            }
+          />
+          <Card className="flex flex-col p-4">
+            <div className="flex items-center gap-4">
+              <span className="min-w-0 flex-1 text-[13px] text-ink-dim">
+                {t("settings.appearance.theme")}
+              </span>
+              <ThemeToggle className="w-72 shrink-0" />
+            </div>
+            <div className="mt-4 flex items-center gap-4 border-t border-line pt-4">
+              <span className="min-w-0 flex-1 text-[13px] text-ink-dim">
+                {t("settings.appearance.language")}
+              </span>
+              <div className="w-72 shrink-0">
+                <Select
+                  value={normalizeLanguagePreference(draft.language)}
+                  onChange={(event) => {
+                    const next = { ...draft, language: event.target.value };
+                    setDraft(next);
+                    applyLanguage(next.language);
+                  }}
+                >
+                  <option value="">{t("language.system")}</option>
+                  <option value="zh-CN">{t("language.zhCN")}</option>
+                  <option value="en-US">{t("language.enUS")}</option>
+                </Select>
+              </div>
+            </div>
+          </Card>
+        </section>
+
+        <section>
+          <SectionTitle
+            title={t("settings.dataDir.title")}
+            description={t("settings.dataDir.description")}
+          />
           <Card className="flex items-center gap-3 p-5">
             <p className="min-w-0 flex-1 truncate font-mono text-xs text-ink-dim" title={dataDir}>
-              {dataDir || "读取中 ..."}
+              {dataDir || t("common.loading")}
             </p>
             <Button
               variant="secondary"
@@ -382,11 +483,18 @@ export default function SettingsPage() {
               disabled={!dataDir}
               onClick={() => void api.revealPath(dataDir).catch((e) => toast("error", String(e)))}
             >
-              打开目录
+              {t("settings.dataDir.openDir")}
             </Button>
           </Card>
         </section>
       </div>
+
+      <BackupTargetFromServerModal
+        open={fromServerOpen}
+        servers={servers}
+        onClose={() => setFromServerOpen(false)}
+        onAdd={handleAddTargetFromServer}
+      />
     </Page>
   );
 }

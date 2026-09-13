@@ -1,12 +1,15 @@
 import { GitBranch, Plus, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 
 import { openRepoFolder } from "../lib/openRepo";
 import { useApp } from "../lib/store";
+import { runGuarded } from "../lib/unsavedGuard";
 import { cn } from "../lib/utils";
 
 /** 顶部仓库标签栏：打开多个仓库时可快速切换（类 IDE 编辑器标签）。 */
 export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
+  const { t } = useTranslation();
   const tabs = useApp((state) => state.tabs);
   const repos = useApp((state) => state.repos);
   const closeTab = useApp((state) => state.closeTab);
@@ -20,10 +23,18 @@ export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
 
   function handleClose(repoId: string) {
     const rest = tabs.filter((id) => id !== repoId);
-    closeTab(repoId);
-    if (repoId !== activeRepoId) return;
-    if (rest.length > 0) navigate(`/repos/${rest[rest.length - 1]}`);
-    else navigate("/repos");
+    // 关闭当前标签会离开工作区，可能丢失草稿，走统一守卫。
+    const close = () => {
+      closeTab(repoId);
+      if (repoId !== activeRepoId) return;
+      if (rest.length > 0) {
+        navigate(`/repos/${rest[rest.length - 1]}`);
+      } else {
+        navigate("/repos");
+      }
+    };
+    if (repoId === activeRepoId) runGuarded(close);
+    else close();
   }
 
   return (
@@ -37,9 +48,11 @@ export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
               role="tab"
               tabIndex={0}
               aria-selected={active}
-              onClick={() => active || navigate(`/repos/${repo.id}`)}
+              onClick={() => active || runGuarded(() => navigate(`/repos/${repo.id}`))}
               onKeyDown={(event) => {
-                if (event.key === "Enter") navigate(`/repos/${repo.id}`);
+                if (event.key === "Enter" && !active) {
+                  runGuarded(() => navigate(`/repos/${repo.id}`));
+                }
               }}
               className={cn(
                 "group/tab flex shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2.5 py-1 text-xs select-none transition-colors",
@@ -63,7 +76,7 @@ export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
                   "rounded p-0.5 text-ink-faint hover:bg-hover hover:text-ink",
                   active ? "opacity-100" : "opacity-0 group-hover/tab:opacity-100",
                 )}
-                title="关闭标签"
+                title={t("tabs.close")}
               >
                 <X className="size-3" />
               </button>
@@ -74,7 +87,7 @@ export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
           type="button"
           onClick={() => void openRepoFolder(navigate)}
           className="grid size-6 shrink-0 place-items-center rounded-md text-ink-faint transition-colors hover:bg-hover hover:text-ink"
-          title="打开仓库"
+          title={t("nav.openRepo")}
         >
           <Plus className="size-3.5" />
         </button>

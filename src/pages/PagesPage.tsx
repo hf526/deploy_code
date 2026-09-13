@@ -1,7 +1,20 @@
 import { useEffect, useMemo, useState } from "react";
-import { ChevronDown, ChevronRight, Cloud, Play, RefreshCw, Save, ShieldCheck, Trash2 } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  Cloud,
+  Link2,
+  Play,
+  RefreshCw,
+  Save,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react";
+import { useTranslation } from "react-i18next";
 
+import { BindRemoteModal } from "../components/BindRemoteModal";
 import { LogConsole } from "../components/LogConsole";
+import { SearchSelect } from "../components/SearchSelect";
 import {
   Badge,
   Button,
@@ -16,29 +29,36 @@ import {
   Select,
 } from "../components/ui";
 import { api } from "../lib/api";
+import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
 import type { Branch, PagesConfig, PagesDeployRecord } from "../lib/types";
+import { githubTarget } from "../lib/utils";
 
 const EMPTY_CONFIG: PagesConfig = {
+  provider: "cloudflare",
   projectName: "",
   buildCommand: "",
   outputDir: "dist",
   branch: "main",
+  publishBranch: "gh-pages",
 };
 
 function statusBadge(record: PagesDeployRecord) {
-  if (record.status === "success") return <Badge kind="green">成功</Badge>;
-  if (record.status === "failed") return <Badge kind="red">失败</Badge>;
-  return <Badge kind="amber">进行中</Badge>;
+  if (record.status === "success") return <Badge kind="green">{i18n.t("status.success")}</Badge>;
+  if (record.status === "failed") return <Badge kind="red">{i18n.t("status.failed")}</Badge>;
+  return <Badge kind="amber">{i18n.t("status.running")}</Badge>;
 }
 
 export default function PagesPage() {
+  const { t } = useTranslation();
   const repos = useApp((state) => state.repos);
   const settings = useApp((state) => state.settings);
   const records = useApp((state) => state.pagesRecords);
+  const live = useApp((state) => state.live);
   const livePages = useApp((state) => state.livePages);
   const startPagesDeploy = useApp((state) => state.startPagesDeploy);
   const refreshPagesRecords = useApp((state) => state.refreshPagesRecords);
+  const refreshRepos = useApp((state) => state.refreshRepos);
   const clearLivePages = useApp((state) => state.clearLivePages);
   const toast = useApp((state) => state.toast);
 
@@ -48,9 +68,12 @@ export default function PagesPage() {
   const [saving, setSaving] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [loadError, setLoadError] = useState(false);
+  const [reloadKey, setReloadKey] = useState(0);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [branches, setBranches] = useState<Branch[]>([]);
+  const [bindOpen, setBindOpen] = useState(false);
 
   const selected = useMemo(
     () => repos.find((repo) => repo.id === repoId) ?? null,
@@ -67,10 +90,12 @@ export default function PagesPage() {
     if (!selected) {
       setDraft(EMPTY_CONFIG);
       setLoaded(false);
+      setLoadError(false);
       return;
     }
     let cancelled = false;
     setLoaded(false);
+    setLoadError(false);
     void api
       .getPagesConfig(selected.id)
       .then((config) => {
@@ -80,13 +105,17 @@ export default function PagesPage() {
         }
       })
       .catch((error) => {
-        // 加载失败时保留当前草稿，避免后续保存把已保存配置覆盖成空白。
-        if (!cancelled) toast("error", String(error));
+        // 加载失败时保留当前草稿，避免后续保存把已保存配置覆盖成空白；
+        // 同时提供「重试」，否则整个表单会被永久禁用。
+        if (!cancelled) {
+          setLoadError(true);
+          toast("error", String(error));
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [selected?.id, toast]);
+  }, [selected?.id, reloadKey, toast]);
 
   useEffect(() => {
     if (!selected) {
@@ -115,17 +144,41 @@ export default function PagesPage() {
     return names;
   }, [branches, draft.branch]);
 
-  const running = livePages?.status === "running";
+  const branchChoices = useMemo(
+    () =>
+      branchOptions.map((name) => {
+        const branch = branches.find((item) => item.name === name);
+        return {
+          value: name,
+          label: name,
+          hint: branch?.isCurrent ? t("deploy.current") : undefined,
+        };
+      }),
+    [branchOptions, branches, t],
+  );
+
+  const serverRunning = live?.status === "running";
+  const pagesRunning = livePages?.status === "running";
+  // 与部署页保持一致：任意一种部署进行中都锁定操作，避免两种任务并发争用同一工作区。
+  const running = pagesRunning || serverRunning;
   const tokenReady = settings.cloudflareApiToken.trim().length > 0;
   const accountReady = settings.cloudflareAccountId.trim().length > 0;
+  const isGitHub = draft.provider === "github";
+  const githubPreview = useMemo(
+    () => githubTarget(selected?.remote ?? null),
+    [selected?.remote],
+  );
+  const platformReady = isGitHub
+    ? !!githubPreview
+    : tokenReady && accountReady;
 
   async function handleSave() {
-    if (!selected) return;
+    if (!selected || running) return;
     setSaving(true);
     try {
       const saved = await api.savePagesConfig(selected.id, draft);
       setDraft(saved);
-      toast("success", `已保存 ${selected.name} 的 Pages 配置`);
+      toast("success", t("pages.configSaved", { name: selected.name }));
     } catch (error) {
       toast("error", String(error));
     } finally {
@@ -134,11 +187,11 @@ export default function PagesPage() {
   }
 
   async function handleTest() {
-    if (!selected || submitting) return;
+    if (!selected || submitting || running) return;
     setSubmitting(true);
     try {
       const message = await api.testPages(selected.id, draft);
-      toast("success", message || "环境检查通过");
+      toast("success", message || t("backup.testPassed"));
     } catch (error) {
       toast("error", String(error));
     } finally {
@@ -147,9 +200,14 @@ export default function PagesPage() {
   }
 
   async function handleDeploy() {
-    if (!selected || submitting) return;
-    if (!draft.projectName.trim()) {
-      toast("error", "请先填写 Pages 项目名");
+    if (!selected || submitting || running) return;
+    if (isGitHub) {
+      if (!githubPreview) {
+        toast("error", t("pages.errorBindGithub"));
+        return;
+      }
+    } else if (!draft.projectName.trim()) {
+      toast("error", t("pages.errorProjectName"));
       return;
     }
     setSubmitting(true);
@@ -185,7 +243,7 @@ export default function PagesPage() {
     try {
       await api.clearPagesRecords();
       await refreshPagesRecords();
-      toast("success", "已清空 Pages 部署记录");
+      toast("success", t("pages.cleared"));
     } catch (error) {
       toast("error", String(error));
     } finally {
@@ -196,7 +254,7 @@ export default function PagesPage() {
   async function copyUrl(url: string) {
     try {
       await navigator.clipboard.writeText(url);
-      toast("success", "部署地址已复制");
+      toast("success", t("pages.urlCopied"));
     } catch {
       toast("info", url);
     }
@@ -204,30 +262,33 @@ export default function PagesPage() {
 
   return (
     <Page
-      title="Cloudflare Pages"
-      subtitle="本地构建后通过 wrangler 一键部署到 Cloudflare Pages"
+      title={t("pages.title")}
+      subtitle={t("pages.subtitle")}
       actions={
         <Button
           icon={<RefreshCw className="size-4" />}
           variant="secondary"
           onClick={() => void refreshPagesRecords()}
         >
-          刷新记录
+          {t("pages.refreshRecords")}
         </Button>
       }
     >
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[400px_minmax(0,1fr)]">
         <div className="flex flex-col gap-6">
           <section>
-            <SectionTitle title="项目配置" description="按仓库保存，构建产物目录如 dist / build / out" />
+            <SectionTitle
+              title={t("pages.projectConfig")}
+              description={t("pages.projectConfigDescription")}
+            />
             <Card className="flex flex-col gap-4 p-5">
-              <Field label="仓库" required>
+              <Field label={t("pages.repo")} required>
                 <Select
                   value={repoId}
                   onChange={(event) => setRepoId(event.target.value)}
-                  disabled={repos.length === 0}
+                  disabled={repos.length === 0 || saving || submitting || running}
                 >
-                  {repos.length === 0 && <option value="">暂无仓库</option>}
+                  {repos.length === 0 && <option value="">{t("pages.noRepos")}</option>}
                   {repos.map((repo) => (
                     <option key={repo.id} value={repo.id}>
                       {repo.name}
@@ -236,96 +297,220 @@ export default function PagesPage() {
                 </Select>
               </Field>
 
-              <Field label="Pages 项目名" required hint="Cloudflare 控制台中的项目名">
-                <Input
-                  value={draft.projectName}
-                  onChange={(event) => setDraft({ ...draft, projectName: event.target.value })}
-                  placeholder="my-site"
-                />
-              </Field>
-
-              <Field label="构建命令" hint="留空则直接上传现有产物">
-                <Input
-                  value={draft.buildCommand}
-                  onChange={(event) => setDraft({ ...draft, buildCommand: event.target.value })}
-                  placeholder="npm run build"
-                />
-              </Field>
-
-              <div className="grid grid-cols-2 gap-4">
-                <Field label="输出目录" required>
-                  <Input
-                    value={draft.outputDir}
-                    onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
-                    placeholder="dist"
-                  />
-                </Field>
-                <Field label="分支" hint="生产分支">
-                  <Select
-                    value={draft.branch}
-                    onChange={(event) => setDraft({ ...draft, branch: event.target.value })}
-                    disabled={!selected || !loaded}
+              {loadError && (
+                <div className="flex items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn-soft px-3 py-2 text-[11px] text-warn">
+                  <span>{t("pages.configLoadFailed")}</span>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => setReloadKey((value) => value + 1)}
                   >
-                    {branchOptions.length === 0 && <option value="">请选择分支</option>}
-                    {branchOptions.map((name) => {
-                      const branch = branches.find((item) => item.name === name);
-                      return (
-                        <option key={name} value={name}>
-                          {name}
-                          {branch?.isCurrent ? "（当前）" : ""}
-                        </option>
-                      );
-                    })}
-                  </Select>
-                </Field>
-              </div>
+                    {t("common.retry")}
+                  </Button>
+                </div>
+              )}
+
+              <Field label={t("pages.provider")} required>
+                <Select
+                  value={draft.provider}
+                  onChange={(event) =>
+                    setDraft({ ...draft, provider: event.target.value as PagesConfig["provider"] })
+                  }
+                >
+                  <option value="cloudflare">Cloudflare Pages</option>
+                  <option value="github">GitHub Pages</option>
+                </Select>
+              </Field>
+
+              {isGitHub ? (
+                <>
+                  <div className="rounded-md border border-line bg-sunken px-3 py-2 text-[11px] leading-relaxed">
+                    {selected?.remote ? (
+                      githubPreview ? (
+                        <>
+                          <p className="text-ink-dim">
+                            {t("pages.repoLine", {
+                              owner: githubPreview.owner,
+                              repo: githubPreview.repo,
+                            })}
+                          </p>
+                          <p
+                            className="mt-0.5 truncate font-mono text-ink-faint"
+                            title={selected.remote}
+                          >
+                            {selected.remote}
+                          </p>
+                          <p className="mt-0.5 text-ink-faint">
+                            {t("pages.expectedUrlLabel")}
+                            <span className="font-mono">{githubPreview.url}</span>
+                          </p>
+                        </>
+                      ) : (
+                        <div className="flex flex-col gap-2">
+                          <p className="text-warn">{t("pages.remoteNotGithub")}</p>
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            className="self-start"
+                            icon={<Link2 className="size-3.5" />}
+                            onClick={() => setBindOpen(true)}
+                          >
+                            {t("remoteModal.editTitle")}
+                          </Button>
+                        </div>
+                      )
+                    ) : (
+                      <div className="flex flex-col gap-2">
+                        <p className="text-warn">{t("pages.repoNoRemote")}</p>
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          className="self-start"
+                          icon={<Link2 className="size-3.5" />}
+                          onClick={() => setBindOpen(true)}
+                        >
+                          {t("remoteModal.bindTitle")}
+                        </Button>
+                      </div>
+                    )}
+                  </div>
+
+                  <Field label={t("pages.buildCommand")} hint={t("pages.buildCommandHintGithub")}>
+                    <Input
+                      value={draft.buildCommand}
+                      onChange={(event) => setDraft({ ...draft, buildCommand: event.target.value })}
+                      placeholder="npm run build"
+                    />
+                  </Field>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label={t("pages.outputDir")} required>
+                      <Input
+                        value={draft.outputDir}
+                        onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+                        placeholder="dist"
+                      />
+                    </Field>
+                    <Field label={t("pages.publishBranch")} hint={t("pages.publishBranchHint")}>
+                      <SearchSelect
+                        value={draft.publishBranch}
+                        onChange={(value) => setDraft({ ...draft, publishBranch: value })}
+                        options={branchChoices}
+                        allowCustom
+                        placeholder="gh-pages"
+                      />
+                    </Field>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <Field label={t("pages.projectName")} required hint={t("pages.projectNameHint")}>
+                    <Input
+                      value={draft.projectName}
+                      onChange={(event) => setDraft({ ...draft, projectName: event.target.value })}
+                      placeholder="my-site"
+                    />
+                  </Field>
+
+                  <Field
+                    label={t("pages.buildCommand")}
+                    hint={t("pages.buildCommandHintCloudflare")}
+                  >
+                    <Input
+                      value={draft.buildCommand}
+                      onChange={(event) => setDraft({ ...draft, buildCommand: event.target.value })}
+                      placeholder="npm run build"
+                    />
+                  </Field>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <Field label={t("pages.outputDir")} required>
+                      <Input
+                        value={draft.outputDir}
+                        onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+                        placeholder="dist"
+                      />
+                    </Field>
+                    <Field label={t("pages.branch")} hint={t("pages.branchHint")}>
+                      <SearchSelect
+                        value={draft.branch}
+                        onChange={(value) => setDraft({ ...draft, branch: value })}
+                        options={branchChoices}
+                        placeholder={t("deploy.branchPlaceholder")}
+                        disabled={!selected || !loaded}
+                      />
+                    </Field>
+                  </div>
+                </>
+              )}
 
               <div className="flex justify-end gap-2 border-t border-line pt-4">
                 <Button
                   variant="secondary"
                   loading={submitting}
-                  disabled={!selected || !loaded}
+                  disabled={!selected || !loaded || running}
                   onClick={() => void handleTest()}
                 >
                   <ShieldCheck className="size-4" />
-                  测试环境
+                  {t("common.testEnvironment")}
                 </Button>
                 <Button
                   variant="secondary"
                   loading={saving}
-                  disabled={!selected || !loaded || submitting}
+                  disabled={!selected || !loaded || submitting || running}
                   onClick={() => void handleSave()}
                 >
                   <Save className="size-4" />
-                  保存
+                  {t("common.save")}
                 </Button>
               </div>
             </Card>
           </section>
 
           <section>
-            <SectionTitle title="部署" description="构建（可选）+ wrangler 上传" />
+            <SectionTitle
+              title={t("nav.deploy")}
+              description={
+                isGitHub
+                  ? t("pages.deployDescriptionGithub")
+                  : t("pages.deployDescriptionCloudflare")
+              }
+            />
             <Card className="flex flex-col gap-4 p-5">
               <Checkbox checked={skipBuild} onChange={setSkipBuild}>
-                跳过构建，直接上传输出目录
+                {t("pages.skipBuild")}
               </Checkbox>
-              {(!tokenReady || !accountReady) && (
-                <p className="text-[11px] leading-relaxed text-warn">
-                  尚未配置 Cloudflare API Token / Account ID，请到「设置 → Cloudflare Pages」填写。
-                </p>
+              {isGitHub ? (
+                <>
+                  {!githubPreview && (
+                    <p className="text-[11px] leading-relaxed text-warn">
+                      {t("pages.needBindGithub")}
+                    </p>
+                  )}
+                  <p className="text-[11px] leading-relaxed text-ink-faint">
+                    {t("pages.githubNote")}
+                  </p>
+                </>
+              ) : (
+                <>
+                  {(!tokenReady || !accountReady) && (
+                    <p className="text-[11px] leading-relaxed text-warn">
+                      {t("pages.missingToken")}
+                    </p>
+                  )}
+                  <p className="text-[11px] leading-relaxed text-ink-faint">
+                    {t("pages.cloudflareNote")}
+                  </p>
+                </>
               )}
-              <p className="text-[11px] leading-relaxed text-ink-faint">
-                Token 与 Account ID 通过环境变量传给 wrangler，不会出现在命令行参数里。
-                需要本机安装 Node.js（wrangler 通过 npx 调用）。
-              </p>
               <Button
                 size="lg"
-                loading={running || submitting}
-                disabled={!selected || !loaded || !tokenReady || !accountReady}
+                loading={pagesRunning || submitting}
+                disabled={!selected || !loaded || !platformReady || running}
                 onClick={() => void handleDeploy()}
               >
                 <Play className="size-4" />
-                {running ? "部署进行中 ..." : "构建并部署"}
+                {pagesRunning ? t("deploy.deploying") : t("pages.buildAndDeploy")}
               </Button>
             </Card>
           </section>
@@ -334,25 +519,25 @@ export default function PagesPage() {
         <div className="flex min-w-0 flex-col gap-6">
           <section className="flex min-h-[320px] flex-col">
             <SectionTitle
-              title="实时日志"
-              description={running ? "部署执行中，请勿关闭应用" : "最近一次部署的实时输出"}
+              title={t("backup.liveLog")}
+              description={pagesRunning ? t("pages.liveLogRunning") : t("pages.liveLogIdle")}
             />
             <LogConsole
               className="min-h-[280px] flex-1"
-              title="Pages 日志"
-              emptyText="点击「构建并部署」后这里会显示实时日志 ..."
+              title={t("pages.logTitle")}
+              emptyText={t("pages.logEmpty")}
               lines={livePages?.lines ?? []}
             />
           </section>
 
           <section>
             <SectionTitle
-              title="部署记录"
-              description={`共 ${records.length} 条`}
+              title={t("pages.records")}
+              description={t("backup.recordsCount", { count: records.length })}
               actions={
                 records.length > 0 ? (
                   <Button variant="ghost" size="sm" onClick={() => setConfirmClear(true)}>
-                    清空记录
+                    {t("backup.clearRecords")}
                   </Button>
                 ) : undefined
               }
@@ -360,8 +545,8 @@ export default function PagesPage() {
             {records.length === 0 ? (
               <EmptyState
                 icon={<Cloud className="size-4.5" />}
-                title="暂无 Pages 部署记录"
-                description="配置项目名与输出目录后，点击「构建并部署」即可。"
+                title={t("pages.emptyTitle")}
+                description={t("pages.emptyDescription")}
               />
             ) : (
               <Card className="divide-y divide-line overflow-hidden">
@@ -380,6 +565,9 @@ export default function PagesPage() {
                         <div className="min-w-0 flex-1">
                           <p className="truncate text-[13px] font-medium text-ink">
                             {record.repoName} → {record.projectName}
+                            <span className="ml-2 rounded bg-hover px-1.5 py-0.5 text-[10px] font-normal text-ink-dim">
+                              {record.provider === "github" ? "GitHub" : "Cloudflare"}
+                            </span>
                             <span className="ml-2 text-[11px] font-normal text-ink-faint">
                               {record.branch}
                               {record.commitShort ? ` · ${record.commitShort}` : ""}
@@ -394,13 +582,13 @@ export default function PagesPage() {
                       </button>
                       {record.url && (
                         <Button variant="ghost" size="sm" onClick={() => void copyUrl(record.url!)}>
-                          复制地址
+                          {t("pages.copyUrl")}
                         </Button>
                       )}
                       <Button
                         variant="ghost"
                         size="sm"
-                        title="删除记录"
+                        title={t("backup.deleteRecord")}
                         onClick={() => void handleDelete(record.id)}
                       >
                         <Trash2 className="size-3.5" />
@@ -408,8 +596,8 @@ export default function PagesPage() {
                     </div>
                     {expanded === record.id && (
                       <pre className="max-h-80 overflow-auto border-t border-line bg-sunken px-4 py-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-ink-dim">
-                        {record.error ? `错误: ${record.error}\n\n` : ""}
-                        {record.log || "（无日志）"}
+                        {record.error ? `${t("backup.errorPrefix", { error: record.error })}\n\n` : ""}
+                        {record.log || t("backup.noLog")}
                       </pre>
                     )}
                   </div>
@@ -423,11 +611,17 @@ export default function PagesPage() {
       <ConfirmModal
         open={confirmClear}
         danger
-        title="清空 Pages 部署记录"
-        confirmText="清空"
-        description="将删除全部 Pages 部署记录（不会影响 Cloudflare 上的部署），此操作不可恢复。"
+        title={t("pages.clearTitle")}
+        confirmText={t("common.clear")}
+        description={t("pages.clearDescription")}
         onCancel={() => setConfirmClear(false)}
         onConfirm={() => void handleClear()}
+      />
+
+      <BindRemoteModal
+        repo={bindOpen ? selected : null}
+        onClose={() => setBindOpen(false)}
+        onSaved={() => void refreshRepos()}
       />
     </Page>
   );

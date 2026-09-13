@@ -280,8 +280,8 @@ fn drain_lines_bytes(
     let mut start = 0usize;
     while let Some(pos) = buffer[start..].iter().position(|byte| *byte == b'\n') {
         let end = start + pos;
-        // 整行已完整，此时解码不会破坏多字节字符。
-        let line = String::from_utf8_lossy(&buffer[..end]);
+        // 整行已完整，此时解码不会破坏多字节字符；只解码本行区间，避免把之前已输出的行重复吐出。
+        let line = String::from_utf8_lossy(&buffer[start..end]);
         on_output(kind, line.trim_end_matches('\r').to_string());
         start = end + 1;
     }
@@ -306,5 +306,35 @@ fn flush_rest_bytes(
         let line = String::from_utf8_lossy(buffer);
         on_output(kind, line.trim_end_matches(['\r', '\n']).to_string());
         buffer.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drain_lines_emits_each_line_once() {
+        let mut buffer = b"line1\nline2\nline3".to_vec();
+        let mut lines: Vec<String> = Vec::new();
+        drain_lines_bytes(&mut buffer, OutputKind::Stdout, &mut |_, line| {
+            lines.push(line)
+        });
+        assert_eq!(lines, vec!["line1", "line2"]);
+        assert_eq!(buffer, b"line3");
+    }
+
+    #[test]
+    fn drain_lines_handles_chunked_utf8() {
+        let bytes = "中文\n尾部".as_bytes();
+        // 先喂入多字节字符的前半段：不完整的行不应被解码输出。
+        let mut buffer = bytes[..4].to_vec();
+        let mut lines: Vec<String> = Vec::new();
+        drain_lines_bytes(&mut buffer, OutputKind::Stdout, &mut |_, line| lines.push(line));
+        assert!(lines.is_empty());
+        buffer.extend_from_slice(&bytes[4..]);
+        drain_lines_bytes(&mut buffer, OutputKind::Stdout, &mut |_, line| lines.push(line));
+        assert_eq!(lines, vec!["中文"]);
+        assert_eq!(buffer, "尾部".as_bytes());
     }
 }

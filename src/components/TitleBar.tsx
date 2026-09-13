@@ -1,5 +1,6 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Copy, GitBranch, Minus, Square, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import { cn } from "../lib/utils";
@@ -8,6 +9,7 @@ const appWindow = getCurrentWindow();
 
 /** 无边框窗口的自绘标题栏，与侧栏 / 页头融为一体。 */
 export function TitleBar() {
+  const { t } = useTranslation();
   const [maximized, setMaximized] = useState(false);
 
   useEffect(() => {
@@ -35,22 +37,25 @@ export function TitleBar() {
           <GitBranch className="size-3" strokeWidth={2.25} />
         </span>
         <span data-tauri-drag-region className="truncate text-xs select-none">
-          <span className="font-semibold tracking-tight text-ink">DeployCode</span>
-          <span className="text-ink-faint"> · 分支部署工具</span>
+          <span className="font-semibold tracking-tight text-ink">{t("app.name")}</span>
+          <span className="text-ink-faint"> · {t("app.tagline")}</span>
         </span>
       </div>
 
-      <CaptionButton title="最小化" onClick={() => void appWindow.minimize()}>
+      <CaptionButton title={t("titlebar.minimize")} onClick={() => void appWindow.minimize()}>
         <Minus className="size-3.5" strokeWidth={1.5} />
       </CaptionButton>
-      <CaptionButton title={maximized ? "还原" : "最大化"} onClick={() => void appWindow.toggleMaximize()}>
+      <CaptionButton
+        title={maximized ? t("titlebar.restore") : t("titlebar.maximize")}
+        onClick={() => void appWindow.toggleMaximize()}
+      >
         {maximized ? (
           <Copy className="size-3" strokeWidth={1.5} />
         ) : (
           <Square className="size-3" strokeWidth={1.5} />
         )}
       </CaptionButton>
-      <CaptionButton title="关闭" danger onClick={() => void appWindow.close()}>
+      <CaptionButton title={t("titlebar.close")} danger onClick={() => void appWindow.close()}>
         <X className="size-3.5" strokeWidth={1.5} />
       </CaptionButton>
     </div>

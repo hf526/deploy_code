@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,8 +8,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::error::{CoreError, Result};
 use crate::git::Git;
 use crate::models::{
-    now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus, LogLevel, RepoConfig,
-    RepoInfo, ServerConfig, Settings,
+    now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus, EnvFileConfig, LogLevel,
+    RepoConfig, RepoInfo, ServerConfig, Settings,
 };
 use crate::process::shell_quote;
 use crate::security::SecurityReport;
@@ -57,7 +57,28 @@ impl DeployEngine {
         }
 
         let git = Git::open(&repo.path)?;
+        if !git.is_repo() {
+            return Err(CoreError::git(format!(
+                "{} 尚未初始化 Git 仓库，请先在仓库页绑定远端仓库地址",
+                repo.name
+            )));
+        }
         let resolved = git.resolve(&req.rev)?;
+
+        // 环境文件：解压后用本地文件覆盖服务器上的对应文件；提前校验，避免部署开始后才报错。
+        let env_files = if req.upload_env {
+            normalize_env_files(&repo.env_files)?
+        } else {
+            Vec::new()
+        };
+        for file in &env_files {
+            if !std::path::Path::new(&file.local_path).is_file() {
+                return Err(CoreError::deploy(format!(
+                    "环境文件不存在: {}",
+                    file.local_path
+                )));
+            }
+        }
 
         let record = DeployRecord {
             id: uuid::Uuid::new_v4().to_string(),
@@ -72,12 +93,9 @@ impl DeployEngine {
             server_name: server.name.clone(),
             target_dir,
             script_dir: normalize_script_dir(&req.script_dir, &config.settings.script_dir),
-            script: req
-                .script
-                .as_ref()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty()),
+            scripts: normalize_scripts(&req.scripts),
             run_scripts: req.run_scripts,
+            env_files,
             status: DeployStatus::Running,
             error: None,
             log: String::new(),
@@ -225,40 +243,107 @@ impl DeployEngine {
         client.mkdir_p(&remote_dir).await?;
         let remote_archive = format!("{remote_dir}/{archive_name}");
 
-        logger.info("正在上传代码包 ...");
-        let mut last_percent = u8::MAX;
-        client
-            .upload_file(&gz_path, &remote_archive, &mut |sent, total| {
-                let percent = if total > 0 {
-                    ((sent * 100 / total).min(100)) as u8
-                } else {
-                    0
-                };
-                if percent != last_percent {
-                    last_percent = percent;
-                    logger.progress(percent, &format!("上传中 {percent}%"));
-                }
-            })
-            .await?;
-        logger.success(format!("上传完成 ({})", human_size(size)));
+        // 上传、解压、替换环境文件与执行脚本包成一体：无论哪一步失败，
+        // 都在最后统一清理远端压缩包，避免失败/中止时在服务器上留下残包。
+        let deployment: Result<()> = async {
+            logger.info("正在上传代码包 ...");
+            let mut last_percent = u8::MAX;
+            client
+                .upload_file(&gz_path, &remote_archive, &mut |sent, total| {
+                    let percent = if total > 0 {
+                        ((sent * 100 / total).min(100)) as u8
+                    } else {
+                        0
+                    };
+                    if percent != last_percent {
+                        last_percent = percent;
+                        logger.progress(percent, &format!("上传中 {percent}%"));
+                    }
+                })
+                .await?;
+            logger.success(format!("上传完成 ({})", human_size(size)));
 
-        // 4. 解压到目标目录
-        logger.info("正在解压到目标目录 ...");
-        let extract_cmd = format!(
-            "tar -xzf {} -C {}",
-            shell_quote(&remote_archive),
-            shell_quote(&target)
-        );
-        let (code, output) = client
-            .exec_capture(&extract_cmd, settings.script_timeout_secs)
-            .await?;
-        if code != 0 {
-            return Err(CoreError::deploy(format!(
-                "解压失败（退出码 {code}）: {}",
-                output.trim()
-            )));
+            // 4. 解压到目标目录
+            logger.info("正在解压到目标目录 ...");
+            let extract_cmd = format!(
+                "tar -xzf {} -C {}",
+                shell_quote(&remote_archive),
+                shell_quote(&target)
+            );
+            let (code, output) = client
+                .exec_capture(&extract_cmd, settings.script_timeout_secs)
+                .await?;
+            if code != 0 {
+                return Err(CoreError::deploy(format!(
+                    "解压失败（退出码 {code}）: {}",
+                    output.trim()
+                )));
+            }
+            logger.success("解压完成");
+
+            // 5. 上传并替换环境文件（在脚本执行前覆盖，确保脚本读到的是新内容）
+            if !record.env_files.is_empty() {
+                logger.info(format!("正在上传 {} 个环境文件 ...", record.env_files.len()));
+                for file in &record.env_files {
+                    let local = std::path::Path::new(&file.local_path);
+                    let remote = format!("{}/{}", target.trim_end_matches('/'), file.remote_path);
+                    if let Some((parent, _)) = file.remote_path.rsplit_once('/') {
+                        client
+                            .mkdir_p(&format!("{}/{}", target.trim_end_matches('/'), parent))
+                            .await?;
+                    }
+                    // 先上传到同目录临时文件，再原子替换：上传中断（断网/磁盘满）时
+                    // 不会截断服务器上原有的环境文件。
+                    let temp = format!("{remote}.deploycode-tmp");
+                    if let Err(err) = client.upload_file(local, &temp, &mut |_, _| {}).await {
+                        let _ = client
+                            .exec_capture(&format!("rm -f {}", shell_quote(&temp)), 30)
+                            .await;
+                        return Err(CoreError::deploy(format!(
+                            "上传环境文件失败 {}: {err}",
+                            file.remote_path
+                        )));
+                    }
+                    // mv 会用临时文件的权限覆盖旧文件，先记录原权限再恢复。
+                    let replace = format!(
+                        "p=$(stat -c %a {remote} 2>/dev/null || stat -f %Lp {remote} 2>/dev/null); \
+                         mv -f {temp} {remote}; \
+                         if [ -n \"$p\" ]; then chmod \"$p\" {remote}; fi",
+                        remote = shell_quote(&remote),
+                        temp = shell_quote(&temp)
+                    );
+                    let (code, output) =
+                        client.exec_capture(&replace, 60).await.map_err(|err| {
+                            CoreError::deploy(format!(
+                                "替换环境文件失败 {}: {err}",
+                                file.remote_path
+                            ))
+                        })?;
+                    if code != 0 {
+                        let _ = client
+                            .exec_capture(&format!("rm -f {}", shell_quote(&temp)), 30)
+                            .await;
+                        return Err(CoreError::deploy(format!(
+                            "替换环境文件失败 {}: {}",
+                            file.remote_path,
+                            output.trim()
+                        )));
+                    }
+                    logger.success(format!("已替换环境文件: {}", file.remote_path));
+                }
+            }
+
+            // 6. 执行项目脚本
+            if record.run_scripts {
+                self.run_scripts(record, req, &client, logger, &settings)
+                    .await?;
+            } else {
+                logger.info("已按部署选项跳过脚本执行");
+            }
+
+            Ok(())
         }
-        logger.success("解压完成");
+        .await;
 
         if !settings.keep_remote_archive {
             let _ = client
@@ -266,13 +351,7 @@ impl DeployEngine {
                 .await;
         }
 
-        // 5. 执行项目脚本
-        if record.run_scripts {
-            self.run_scripts(record, req, &client, logger, &settings)
-                .await?;
-        } else {
-            logger.info("已按部署选项跳过脚本执行");
-        }
+        deployment?;
 
         client.disconnect().await;
         Ok(())
@@ -289,43 +368,40 @@ impl DeployEngine {
         let target = req.target_dir.trim().trim_end_matches('/');
         let script_dir = normalize_script_dir(&req.script_dir, &settings.script_dir);
 
-        let scripts: Vec<String> = match req
-            .script
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            Some(name) => {
+        let explicit = normalize_scripts(&req.scripts);
+        let scripts: Vec<String> = if explicit.is_empty() {
+            let cmd = format!(
+                "cd {} && find {} -maxdepth 1 -type f -name '*.sh' 2>/dev/null | sort",
+                shell_quote(target),
+                shell_quote(&script_dir)
+            );
+            let (_, output) = client.exec_capture(&cmd, 60).await?;
+            output
+                .lines()
+                .map(|line| line.trim().to_string())
+                .filter(|line| !line.is_empty() && !line.starts_with("[stderr]"))
+                .collect()
+        } else {
+            // 先全部校验存在性，避免执行到一半才发现缺失脚本。
+            let mut paths = Vec::with_capacity(explicit.len());
+            for name in explicit {
                 let path = if name.contains('/') {
                     name.trim_start_matches("./").to_string()
                 } else {
                     format!("{script_dir}/{name}")
                 };
                 let cmd = format!(
-                    "cd {} && test -f {} && echo {}",
+                    "cd {} && test -f {}",
                     shell_quote(target),
-                    shell_quote(&path),
                     shell_quote(&path)
                 );
-                let (code, output) = client.exec_capture(&cmd, 60).await?;
+                let (code, _) = client.exec_capture(&cmd, 60).await?;
                 if code != 0 {
                     return Err(CoreError::deploy(format!("未找到脚本: {path}")));
                 }
-                vec![output.trim().to_string()]
+                paths.push(path);
             }
-            None => {
-                let cmd = format!(
-                    "cd {} && find {} -maxdepth 1 -type f -name '*.sh' 2>/dev/null | sort",
-                    shell_quote(target),
-                    shell_quote(&script_dir)
-                );
-                let (_, output) = client.exec_capture(&cmd, 60).await?;
-                output
-                    .lines()
-                    .map(|line| line.trim().to_string())
-                    .filter(|line| !line.is_empty() && !line.starts_with("[stderr]"))
-                    .collect()
-            }
+            paths
         };
 
         if scripts.is_empty() {
@@ -394,9 +470,23 @@ impl DeployEngine {
         if target.is_empty() {
             return Ok(());
         }
+        let keep_remote_archive = self
+            .store
+            .load_config()
+            .map(|config| config.settings.keep_remote_archive)
+            .unwrap_or(false);
         let pidfile = remote_pidfile(target, record_id);
+        // 任务被中止时压缩包会以记录 UUID 命名残留在 .deploy_code 下，一并清理。
+        // record_id 是 UUID，可安全拼进 glob；kill_script 已用子 shell 包裹，不会中断后续命令。
+        let mut command = kill_script(&pidfile);
+        if !keep_remote_archive {
+            command.push_str(&format!(
+                "; rm -f {}/.deploy_code/*-{record_id}.tar.gz",
+                shell_quote(target)
+            ));
+        }
         let client = SshClient::connect(server, timeout_secs).await?;
-        let result = client.exec_capture(&kill_script(&pidfile), timeout_secs).await;
+        let result = client.exec_capture(&command, timeout_secs).await;
         client.disconnect().await;
         result.map(|_| ())
     }
@@ -460,8 +550,9 @@ impl DeployEngine {
 
 /// 计算仓库的展示信息（当前分支 / 远端 / 变动数量）。
 pub fn repo_info(repo: &RepoConfig) -> RepoInfo {
+    let path_exists = std::path::Path::new(&repo.path).is_dir();
     match Git::open(&repo.path) {
-        Ok(git) => {
+        Ok(git) if git.is_repo() => {
             let current_branch = git.current_branch().unwrap_or_else(|_| "-".to_string());
             let remote = git.remote_url().ok().flatten();
             let change_count = git.status().map(|s| s.changes.len()).unwrap_or(0);
@@ -469,24 +560,28 @@ pub fn repo_info(repo: &RepoConfig) -> RepoInfo {
                 id: repo.id.clone(),
                 name: repo.name.clone(),
                 path: repo.path.clone(),
+                path_exists,
                 is_repo: true,
                 current_branch,
                 remote,
                 change_count,
                 default_server_id: repo.default_server_id.clone(),
                 default_target_dir: repo.default_target_dir.clone(),
+                env_files: repo.env_files.clone(),
             }
         }
-        Err(_) => RepoInfo {
+        _ => RepoInfo {
             id: repo.id.clone(),
             name: repo.name.clone(),
             path: repo.path.clone(),
+            path_exists,
             is_repo: false,
             current_branch: "-".to_string(),
             remote: None,
             change_count: 0,
             default_server_id: repo.default_server_id.clone(),
             default_target_dir: repo.default_target_dir.clone(),
+            env_files: repo.env_files.clone(),
         },
     }
 }
@@ -559,6 +654,46 @@ fn join_log_lines(logger: &Logger) -> String {
     logger.lines.iter().cloned().collect::<Vec<_>>().join("\n")
 }
 
+/// 校验并规范化环境文件配置：跳过空条目，统一远端路径分隔符。
+pub fn normalize_env_files(files: &[EnvFileConfig]) -> Result<Vec<EnvFileConfig>> {
+    let mut normalized = Vec::with_capacity(files.len());
+    for file in files {
+        let local = file.local_path.trim();
+        let remote = file.remote_path.trim();
+        if local.is_empty() && remote.is_empty() {
+            continue;
+        }
+        if local.is_empty() {
+            return Err(CoreError::deploy("环境文件的本地路径不能为空"));
+        }
+        if remote.is_empty() {
+            return Err(CoreError::deploy("环境文件的远端路径不能为空"));
+        }
+        normalized.push(EnvFileConfig {
+            local_path: local.to_string(),
+            remote_path: normalize_env_remote(remote)?,
+        });
+    }
+    Ok(normalized)
+}
+
+/// 远端路径必须是部署目录下的相对路径：去掉 `./` 前缀，拒绝绝对路径与 `..`。
+fn normalize_env_remote(value: &str) -> Result<String> {
+    let rel = value.trim().replace('\\', "/");
+    let rel = rel.trim_start_matches("./");
+    let parts: Vec<&str> = rel.split('/').collect();
+    let invalid = rel.is_empty()
+        || rel.starts_with('/')
+        || rel.chars().any(char::is_control)
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..");
+    if invalid {
+        return Err(CoreError::deploy(format!("环境文件远端路径不合法: {value}")));
+    }
+    Ok(parts.join("/"))
+}
+
 fn normalize_script_dir(value: &str, fallback: &str) -> String {
     let value = value.trim().trim_matches('/');
     let value = value.strip_prefix("./").unwrap_or(value);
@@ -575,6 +710,18 @@ fn normalize_script_dir(value: &str, fallback: &str) -> String {
     }
 }
 
+/// 脚本列表去空白、去重，并保持用户给定顺序。
+fn normalize_scripts(values: &[String]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .filter(|value| seen.insert(value.to_string()))
+        .map(|value| value.to_string())
+        .collect()
+}
+
 /// 远端脚本 pidfile 路径（放在部署目录的 .deploy_code 下）。
 fn remote_pidfile(target: &str, record_id: &str) -> String {
     format!(
@@ -588,8 +735,10 @@ pub(crate) fn kill_script(pidfile: &str) -> String {
     let file = shell_quote(pidfile);
     // 先发信号再删 pidfile：中途被中断时，脚本仍可被下次清理定位到。
     // 进程组优先从 /proc 读取（Linux 通用），失败再退回 ps，兼容精简系统的 ps。
+    // 整段包在子 shell 里：pidfile 缺失时的 exit 0 只退出子 shell，
+    // 不会中断调用方拼在其后的 rm 等清理命令。
     format!(
-        "f={file}; p=$(cat \"$f\" 2>/dev/null); \
+        "( f={file}; p=$(cat \"$f\" 2>/dev/null); \
          case \"$p\" in ''|*[!0-9]*) rm -f \"$f\"; exit 0 ;; esac; \
          g=$(sed 's/.*) //' /proc/$p/stat 2>/dev/null | cut -d' ' -f3); \
          case \"$g\" in ''|*[!0-9]*) g=$(ps -o pgid= -p \"$p\" 2>/dev/null | tr -d ' ') ;; esac; \
@@ -599,7 +748,7 @@ pub(crate) fn kill_script(pidfile: &str) -> String {
            kill -KILL -\"$g\" 2>/dev/null || kill -KILL \"$p\" 2>/dev/null; \
          else \
            kill -TERM \"$p\" 2>/dev/null; sleep 1; kill -KILL \"$p\" 2>/dev/null; \
-         fi; rm -f \"$f\"; echo done"
+         fi; rm -f \"$f\"; echo done )"
     )
 }
 
@@ -691,5 +840,163 @@ mod tests {
     fn kill_script_ignores_invalid_pid_content() {
         let script = kill_script("/tmp/x.pid");
         assert!(script.contains("*[!0-9]*"));
+        // 无效 pid 分支的 exit 0 必须只退出子 shell，不能中断调用方的后续清理命令。
+        assert!(script.starts_with("( f="), "script = {script}");
+        assert!(script.ends_with(')'), "script = {script}");
+    }
+
+    #[test]
+    fn normalize_env_files_skips_empty_and_rejects_unsafe_paths() {
+        let files = normalize_env_files(&[
+            EnvFileConfig {
+                local_path: " .env ".to_string(),
+                remote_path: " .env ".to_string(),
+            },
+            EnvFileConfig {
+                local_path: "C:/tmp/app.env".to_string(),
+                remote_path: "docker\\app.env".to_string(),
+            },
+            EnvFileConfig {
+                local_path: "C:/tmp/root.env".to_string(),
+                remote_path: "././.env".to_string(),
+            },
+            EnvFileConfig::default(),
+        ])
+        .unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].local_path, ".env");
+        assert_eq!(files[0].remote_path, ".env");
+        assert_eq!(files[1].remote_path, "docker/app.env");
+        // `./` 前缀会被去掉，但 `.env` 这类隐藏文件名不能被误伤。
+        assert_eq!(files[2].remote_path, ".env");
+
+        for bad in ["/etc/passwd", "../secret", "a/../b", "a//b", "./", "..", "a/"] {
+            let files = vec![EnvFileConfig {
+                local_path: "x".to_string(),
+                remote_path: bad.to_string(),
+            }];
+            assert!(normalize_env_files(&files).is_err(), "应拒绝远端路径 {bad}");
+        }
+
+        let files = vec![EnvFileConfig {
+            local_path: String::new(),
+            remote_path: ".env".to_string(),
+        }];
+        assert!(normalize_env_files(&files).is_err());
+    }
+
+    #[test]
+    fn prepare_validates_and_applies_env_files() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("deploycode-env-prepare-{}", uuid::Uuid::new_v4()));
+        let repo_dir = base.join("work");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        let repo_arg = repo_dir.to_string_lossy().into_owned();
+        let git = |args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&repo_arg)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} 失败");
+        };
+        git(&["init"]);
+        git(&["config", "user.name", "Test"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo_dir.join("a.txt"), "hi").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-m", "init"]);
+
+        let env_path = base.join("deploy.env");
+        std::fs::write(&env_path, "KEY=1\n").unwrap();
+
+        let store = std::sync::Arc::new(Store::new(base.join("data")));
+        let (repo_id, server_id) = store
+            .mutate_config(|config| {
+                let mut repo = RepoConfig::new("demo".to_string(), repo_arg.clone());
+                repo.env_files = vec![EnvFileConfig {
+                    local_path: env_path.to_string_lossy().into_owned(),
+                    remote_path: "docker\\.env".to_string(),
+                }];
+                config.repos.push(repo.clone());
+                let server = ServerConfig::new(
+                    "prod".to_string(),
+                    "127.0.0.1".to_string(),
+                    "root".to_string(),
+                    crate::models::SshAuth::Password {
+                        password: "x".to_string(),
+                    },
+                );
+                let server_id = server.id.clone();
+                config.servers.push(server);
+                Ok((repo.id, server_id))
+            })
+            .unwrap();
+
+        let engine = DeployEngine::new(store.clone());
+        let request = DeployRequest {
+            repo_id,
+            rev: "HEAD".to_string(),
+            server_id,
+            target_dir: "/opt/demo".to_string(),
+            run_scripts: false,
+            script_dir: "docker".to_string(),
+            scripts: Vec::new(),
+            upload_env: true,
+        };
+
+        let record = engine.prepare(&request).unwrap();
+        assert_eq!(record.env_files.len(), 1);
+        assert_eq!(record.env_files[0].remote_path, "docker/.env");
+
+        // 本地文件缺失时在开始部署前报错。
+        std::fs::remove_file(&env_path).unwrap();
+        let err = engine.prepare(&request).unwrap_err().to_string();
+        assert!(err.contains("环境文件不存在"), "err = {err}");
+
+        // uploadEnv=false 时不校验也不记录。
+        std::fs::write(&env_path, "KEY=2\n").unwrap();
+        let mut skip = request.clone();
+        skip.upload_env = false;
+        let record = engine.prepare(&skip).unwrap();
+        assert!(record.env_files.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn repo_info_distinguishes_non_git_and_missing_dirs() {        let dir =
+            std::env::temp_dir().join(format!("deploycode-repo-info-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = RepoConfig::new("plain".to_string(), dir.to_string_lossy().into_owned());
+
+        let info = repo_info(&repo);
+        assert!(info.path_exists);
+        assert!(!info.is_repo);
+        assert_eq!(info.change_count, 0);
+
+        let missing = RepoConfig::new(
+            "gone".to_string(),
+            dir.join("not-exist").to_string_lossy().into_owned(),
+        );
+        let info = repo_info(&missing);
+        assert!(!info.path_exists);
+        assert!(!info.is_repo);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

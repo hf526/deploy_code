@@ -6,13 +6,21 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 
 ## 功能特性
 
+### 系统托盘
+
+- 关闭窗口（点 X）只隐藏到系统托盘，程序继续在后台运行；托盘左键点击可重新显示窗口
+- 托盘菜单支持「显示主窗口」与「退出程序」，只有「退出程序」才会彻底退出（退出前仍会清理远端部署/备份脚本与本地子进程）
+- 托盘菜单文案跟随界面语言（中文 / English）
+
 ### 仓库管理
 
-- 添加本地 Git 仓库（IDE 式：选目录即用），支持多仓库标签页
+- 添加本地文件夹（IDE 式：选目录即用，不要求已经是 Git 仓库），支持多仓库标签页
+- 非 Git 文件夹可绑定远端地址（origin）：自动 `git init` 后绑定，即可提交并推送到指定仓库
 - 分支切换 / 创建 / 删除，远程分支查看
 - 提交历史、提交图（含分支 / 标签引用）、工作区状态、文件 diff
 - 文件树浏览、文件预览 / 编辑、内容搜索与批量替换
 - 提交改动、硬回退、fetch / pull / push
+- 提交保护：自动检测 `.env` / `*.pem` / `id_rsa` / `credentials` 等疑似敏感文件，默认阻止提交，界面二次确认后才放行（CLI 需 `--allow-sensitive`）
 - 工作区文件监听，外部改动自动刷新界面
 
 ### 服务器管理
@@ -27,6 +35,8 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 `git archive` 打包 -> SFTP 上传 -> 远端解压 -> 执行脚本，全程实时日志：
 
 - 可选择分支 / 标签 / 提交进行部署
+- 部署方式可选「服务器」或「Pages」：选 Pages 时在部署页直接编辑该仓库的 Cloudflare / GitHub Pages 配置并一键构建发布，状态与日志同步切换
+- 环境文件替换：按仓库配置「本地文件 → 部署目录相对路径」（如 `.env`、`docker/.env`），解压后、执行脚本前上传覆盖，部署页可临时关闭
 - 上传进度显示；脚本超时或应用退出时终止远端脚本进程组（含子进程）
 - 脚本目录默认 `docker/`，自动执行其中的 `.sh` 文件，并注入环境变量：
   `DEPLOY_BRANCH` / `DEPLOY_REV` / `DEPLOY_COMMIT` / `DEPLOY_TARGET`
@@ -38,20 +48,32 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 把服务器上的 PostgreSQL schema 全量同步到远端 PostgreSQL，全程在服务器上完成，不经过本机：
 
 - 来源支持 Docker 容器（`docker exec pg_dump`）或服务器本机 `pg_dump`，可配置库名 / 用户 / 密码 / schema
-- 备份目标（Supabase / Aiven / Neon 等）可配置多个，每次备份选择其中一个；支持全局默认目标，服务器可绑定自己的默认目标
+- 备份配置可保存多个（名称 + 服务器 + 来源 + 目标），备份页选择后一键执行；升级自旧版服务器单份配置时会自动迁移
+- 备份目标（Supabase / Aiven / Neon 等）可配置多个，每次备份选择其中一个；支持全局默认目标，配置 / 服务器可绑定自己的默认目标
 - 全量覆盖：恢复前清空目标 schema 并恢复默认角色授权（Supabase 的 anon / authenticated / service_role 会自动恢复）
 - 实时日志与进度；支持环境检查（pg_dump 版本 + 目标连通性）
 - 备份记录持久化，可查看 / 删除 / 清空
 
-### Cloudflare Pages 部署
+### Pages 部署（Cloudflare / GitHub）
 
-仓库本地构建（可选）后通过 `wrangler` 一键部署到 Cloudflare Pages：
+仓库本地构建（可选）后一键发布静态产物，按仓库选择平台：
+
+Cloudflare Pages（`wrangler`）：
 
 - 按仓库配置项目名 / 构建命令 / 输出目录（dist 等）/ 生产分支
 - 一键「构建并部署」，实时日志；可跳过构建直接上传已有产物
 - 自动创建 Pages 项目（已存在则跳过），从 wrangler 输出解析部署地址
 - 支持环境检查（wrangler + Token / Account 校验）；部署记录持久化
-- 依赖本机 Node.js（wrangler 通过 `npx` 调用）；API Token 通过环境变量传递，不进入命令行
+- API Token 通过环境变量传递，不进入命令行
+
+GitHub Pages（`gh-pages`）：
+
+- 按仓库配置构建命令 / 输出目录 / 发布分支（默认 `gh-pages`）
+- 产物推送到发布分支后由 GitHub 自动发布；`--dotfiles` 会一并保留 `.nojekyll` 等隐藏文件
+- 复用本机 Git 凭据，无需额外 Token；远端地址须为 GitHub（可先在「仓库」页绑定）
+- 地址自动推导为 `https://<用户名>.github.io/<仓库名>/`；推送分支与当前分支相同会被拒绝
+
+两种平台都依赖本机 Node.js（wrangler / gh-pages 通过 `npx` 调用）。
 
 ### CLI
 
@@ -93,7 +115,7 @@ deploy_code/
 配置与部署历史保存在系统数据目录，**不会写入代码仓库**：
 
 - Windows：`%APPDATA%\deploycode\DeployCode\data`
-- 文件：`config.json`（服务器 / 仓库 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
+- 文件：`config.json`（服务器 / 仓库 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
 
 > ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
 
@@ -158,6 +180,12 @@ deploy-code-cli history list -n 10
 deploy-code-cli backup target add Aiven "postgresql://user:password@host:5432/db"
 deploy-code-cli backup target add Neon "postgresql://user:password@host:5432/db"
 deploy-code-cli backup target list
+# 保存一套备份配置（服务器 + 来源 + 目标），之后按名称一键备份
+deploy-code-cli backup config add prod-app --server prod --database app --username postgres --target Aiven
+deploy-code-cli backup config list
+deploy-code-cli backup test --config prod-app
+deploy-code-cli backup run --config prod-app
+# 也可以继续用服务器参数直接执行
 deploy-code-cli backup test prod
 deploy-code-cli backup run prod --target Aiven
 deploy-code-cli backup list -n 10

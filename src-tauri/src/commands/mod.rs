@@ -5,4 +5,5 @@ pub mod history;
 pub mod pages;
 pub mod repos;
 pub mod servers;
+pub mod tray;
 pub mod watch;

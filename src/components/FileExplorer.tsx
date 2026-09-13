@@ -7,6 +7,7 @@ import {
   FolderOpen,
   Loader2,
 } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { api } from "../lib/api";
 import type { FileEntry } from "../lib/types";
@@ -25,6 +26,7 @@ export function FileExplorer({
   activePath: string | null;
   onSelectFile: (entry: FileEntry) => void;
 }) {
+  const { t } = useTranslation();
   const [root, setRoot] = useState<FileEntry[] | null>(null);
   const [children, setChildren] = useState<Record<string, FileEntry[]>>({});
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
@@ -32,6 +34,8 @@ export function FileExplorer({
   const [dirErrors, setDirErrors] = useState<Record<string, string>>({});
   const expandedRef = useRef<Record<string, boolean>>({});
   expandedRef.current = expanded;
+  // 硬刷新（refreshKey）会递增序号，使仍在进行的软刷新结果作废。
+  const reloadSeq = useRef(0);
 
   const load = useCallback(
     (path: string) => api.listDir(repoId, path),
@@ -40,6 +44,7 @@ export function FileExplorer({
 
   useEffect(() => {
     let cancelled = false;
+    const seq = ++reloadSeq.current;
     setRoot(null);
     setChildren({});
     setExpanded({});
@@ -47,10 +52,10 @@ export function FileExplorer({
     setDirErrors({});
     void load("")
       .then((entries) => {
-        if (!cancelled) setRoot(entries);
+        if (!cancelled && reloadSeq.current === seq) setRoot(entries);
       })
       .catch((err) => {
-        if (!cancelled) setError(String(err));
+        if (!cancelled && reloadSeq.current === seq) setError(String(err));
       });
     return () => {
       cancelled = true;
@@ -65,16 +70,18 @@ export function FileExplorer({
       return;
     }
     let cancelled = false;
+    const seq = reloadSeq.current;
+    const isCurrent = () => !cancelled && reloadSeq.current === seq;
     void (async () => {
       try {
         const entries = await load("");
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setRoot(entries);
         const openPaths = Object.keys(expandedRef.current).filter((p) => expandedRef.current[p]);
         const pairs = await Promise.all(
           openPaths.map(async (p) => [p, await load(p)] as const),
         );
-        if (cancelled) return;
+        if (!isCurrent()) return;
         setChildren((prev) => {
           const next = { ...prev };
           for (const [p, list] of pairs) next[p] = list;
@@ -172,12 +179,12 @@ export function FileExplorer({
   if (!root) {
     return (
       <p className="flex items-center gap-2 px-3 py-3 text-xs text-ink-dim">
-        <Loader2 className="size-3.5 animate-spin" /> 正在读取文件树 ...
+        <Loader2 className="size-3.5 animate-spin" /> {t("files.loadingTree")}
       </p>
     );
   }
   if (root.length === 0) {
-    return <p className="px-3 py-3 text-xs text-ink-faint">空目录</p>;
+    return <p className="px-3 py-3 text-xs text-ink-faint">{t("files.emptyDir")}</p>;
   }
   return <div className="pb-2">{renderLevel(root, 0)}</div>;
 }

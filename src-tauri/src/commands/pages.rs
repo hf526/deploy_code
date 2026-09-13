@@ -98,17 +98,43 @@ pub fn save_pages_config(
     config: PagesConfig,
 ) -> Result<PagesConfig> {
     let mut normalized = config;
+    normalized.provider = normalized.provider.trim().to_lowercase();
+    if normalized.provider.is_empty() {
+        normalized.provider = "cloudflare".to_string();
+    }
+    if normalized.provider != "cloudflare" && normalized.provider != "github" {
+        return Err(CoreError::config(
+            "不支持的 Pages 平台（可选 cloudflare / github）",
+        ));
+    }
     normalized.project_name = normalized.project_name.trim().to_string();
     normalized.build_command = normalized.build_command.trim().to_string();
     normalized.output_dir = normalized.output_dir.trim().to_string();
     normalized.branch = normalized.branch.trim().to_string();
+    normalized.publish_branch = normalized.publish_branch.trim().to_string();
     if normalized.output_dir.is_empty() {
         normalized.output_dir = "dist".to_string();
     }
     if normalized.branch.is_empty() {
         normalized.branch = "main".to_string();
     }
-    if normalized.project_name.chars().any(|c| c.is_whitespace() || c.is_control()) {
+    if normalized.publish_branch.is_empty() {
+        normalized.publish_branch = "gh-pages".to_string();
+    }
+    if normalized.provider == "github" {
+        if normalized.publish_branch.starts_with('-')
+            || normalized
+                .publish_branch
+                .chars()
+                .any(|c| c.is_whitespace() || c.is_control())
+        {
+            return Err(CoreError::config("发布分支不能包含空白字符或以 - 开头"));
+        }
+    } else if normalized
+        .project_name
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
         return Err(CoreError::config("项目名不能包含空白字符"));
     }
 
@@ -118,10 +144,11 @@ pub fn save_pages_config(
             .iter_mut()
             .find(|repo| repo.id == repo_id)
             .ok_or_else(|| CoreError::not_found(format!("仓库不存在: {repo_id}")))?;
-        repo.pages = if normalized.project_name.is_empty() {
-            None
-        } else {
+        // Cloudflare 以项目名为准判断是否启用；GitHub 无项目名，保存配置即视为启用。
+        repo.pages = if normalized.provider == "github" || !normalized.project_name.is_empty() {
             Some(normalized.clone())
+        } else {
+            None
         };
         Ok(())
     })?;

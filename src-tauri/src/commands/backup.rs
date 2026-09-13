@@ -1,5 +1,5 @@
-use deploy_core::models::{BackupEvent, BackupRecord, BackupRequest, BackupTarget};
-use deploy_core::{BackupEngine, CoreError, PreparedBackup, Result};
+use deploy_core::models::{new_id, BackupConfig, BackupEvent, BackupRecord, BackupRequest, BackupTarget};
+use deploy_core::{BackupEngine, CoreError, PreparedBackup, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::{ActiveBackup, AppState, BackupTaskGuard, ClaimGuard, ClaimKind};
@@ -106,6 +106,79 @@ pub fn list_backup_targets(state: State<AppState>) -> Result<Vec<BackupTarget>> 
     Ok(state.store.load_config()?.backup_targets)
 }
 
+/// 列出保存的备份配置。
+#[tauri::command(async)]
+pub fn list_backup_configs(state: State<AppState>) -> Result<Vec<BackupConfig>> {
+    Ok(state.store.load_config()?.backup_configs)
+}
+
+/// 新建或更新一条备份配置。
+#[tauri::command(async)]
+pub fn save_backup_config(
+    state: State<AppState>,
+    mut config: BackupConfig,
+) -> Result<BackupConfig> {
+    config.name = config.name.trim().to_string();
+    if config.name.is_empty() {
+        return Err(CoreError::config("备份配置名称不能为空"));
+    }
+    if config.source.database.trim().is_empty() {
+        return Err(CoreError::config("数据库名不能为空"));
+    }
+
+    let saved = state.store.mutate_config(|app| {
+        // 服务器必须以 id 形式存在；名称 / host 也允许（兼容 CLI）。
+        let server = Store::find_server(app, &config.server_id)?.clone();
+        config.server_id = server.id.clone();
+
+        // 悬空的目标 id 一律按未绑定处理，避免执行时找不到目标。
+        if let Some(target_id) = config.target_id.clone() {
+            if !app.backup_targets.iter().any(|item| item.id == target_id) {
+                config.target_id = None;
+            }
+        }
+        if config
+            .supabase_url
+            .as_deref()
+            .map(str::trim)
+            .unwrap_or("")
+            .is_empty()
+        {
+            config.supabase_url = None;
+        }
+        if config.id.trim().is_empty() {
+            config.id = new_id();
+        }
+        if app
+            .backup_configs
+            .iter()
+            .any(|item| item.id != config.id && item.name == config.name)
+        {
+            return Err(CoreError::config(format!(
+                "备份配置名称已存在: {}",
+                config.name
+            )));
+        }
+        match app.backup_configs.iter_mut().find(|item| item.id == config.id) {
+            Some(existing) => *existing = config.clone(),
+            None => app.backup_configs.push(config.clone()),
+        }
+        Ok(config.clone())
+    })?;
+    Ok(saved)
+}
+
+/// 删除一条备份配置（不影响已有备份记录）。
+#[tauri::command(async)]
+pub fn delete_backup_config(state: State<AppState>, config_id: String) -> Result<bool> {
+    state.store.mutate_config(|app| {
+        let before = app.backup_configs.len();
+        app.backup_configs
+            .retain(|item| item.id != config_id && item.name != config_id);
+        Ok(app.backup_configs.len() != before)
+    })
+}
+
 /// 整体保存备份目标列表（前端维护列表与增删）。
 #[tauri::command(async)]
 pub fn save_backup_targets(
@@ -154,6 +227,13 @@ pub fn save_backup_targets(
             if let Some(target_id) = server.backup_target_id.clone() {
                 if !normalized.iter().any(|target| target.id == target_id) {
                     server.backup_target_id = None;
+                }
+            }
+        }
+        for saved in config.backup_configs.iter_mut() {
+            if let Some(target_id) = saved.target_id.clone() {
+                if !normalized.iter().any(|target| target.id == target_id) {
+                    saved.target_id = None;
                 }
             }
         }

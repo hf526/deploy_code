@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { Eraser, History, RefreshCw, RotateCcw, ScrollText, Trash2 } from "lucide-react";
+import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import {
@@ -24,6 +25,7 @@ import {
 } from "../lib/utils";
 
 export default function HistoryPage() {
+  const { t } = useTranslation();
   const history = useApp((state) => state.history);
   const repos = useApp((state) => state.repos);
   const refreshHistory = useApp((state) => state.refreshHistory);
@@ -41,7 +43,9 @@ export default function HistoryPage() {
   const [busy, setBusy] = useState(false);
 
   const live = useApp((state) => state.live);
-  const running = live?.status === "running";
+  const livePages = useApp((state) => state.livePages);
+  // 任意一种部署进行中都不允许重新部署 / 回滚，避免争用工作区或 reset 掉正在构建的内容。
+  const running = live?.status === "running" || livePages?.status === "running";
 
   // 过滤放在前端做，避免筛选结果与后台刷新（部署完成）互相覆盖。
   const filtered = useMemo(
@@ -80,11 +84,11 @@ export default function HistoryPage() {
   }
 
   async function handleRollback() {
-    if (!rollingBack) return;
+    if (!rollingBack || running) return;
     setBusy(true);
     try {
       const message = await api.resetHard(rollingBack.repoId, rollingBack.commit);
-      toast("success", message.trim() || "已回退");
+      toast("success", message.trim() || t("history.rollbackDone"));
       setRollingBack(null);
       await refreshRepos();
     } catch (error) {
@@ -99,7 +103,7 @@ export default function HistoryPage() {
     setBusy(true);
     try {
       await api.deleteRecord(removing.id);
-      toast("success", "记录已删除");
+      toast("success", t("history.deleted"));
       setRemoving(null);
       await refreshHistory();
     } catch (error) {
@@ -113,7 +117,7 @@ export default function HistoryPage() {
     setBusy(true);
     try {
       await api.clearHistory();
-      toast("success", "已清空部署记录");
+      toast("success", t("history.cleared"));
       setClearing(false);
       await refreshHistory();
     } catch (error) {
@@ -125,28 +129,29 @@ export default function HistoryPage() {
 
   return (
     <Page
-      title="部署记录"
-      subtitle="每次部署的版本、服务器与执行结果"
+      title={t("history.title")}
+      subtitle={t("history.subtitle")}
       actions={
         <>
-          <Select
-            value={repoFilter}
-            onChange={(event) => setRepoFilter(event.target.value)}
-            className="w-48"
-          >
-            <option value="">全部仓库</option>
-            {repos.map((repo) => (
-              <option key={repo.id} value={repo.id}>
-                {repo.name}
-              </option>
-            ))}
-          </Select>
+          <div className="w-48">
+            <Select
+              value={repoFilter}
+              onChange={(event) => setRepoFilter(event.target.value)}
+            >
+              <option value="">{t("history.allRepos")}</option>
+              {repos.map((repo) => (
+                <option key={repo.id} value={repo.id}>
+                  {repo.name}
+                </option>
+              ))}
+            </Select>
+          </div>
           <Button
             variant="secondary"
             icon={<RefreshCw className="size-4" />}
             onClick={() => void refreshHistory()}
           >
-            刷新
+            {t("common.refresh")}
           </Button>
           <Button
             variant="secondary"
@@ -154,7 +159,7 @@ export default function HistoryPage() {
             disabled={history.length === 0}
             onClick={() => setClearing(true)}
           >
-            清空
+            {t("common.clear")}
           </Button>
         </>
       }
@@ -162,11 +167,11 @@ export default function HistoryPage() {
       {filtered.length === 0 ? (
         <EmptyState
           icon={<History className="size-5" />}
-          title="暂无部署记录"
-          description="在「部署」页面发起一次部署后，这里会记录版本、服务器与完整日志，可随时重新部署。"
+          title={t("history.emptyTitle")}
+          description={t("history.emptyDescription")}
           action={
             <Button onClick={() => navigate("/deploy")} icon={<History className="size-4" />}>
-              去部署
+              {t("history.goDeploy")}
             </Button>
           }
         />
@@ -175,13 +180,15 @@ export default function HistoryPage() {
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="border-b border-line bg-field/60 text-[11px] uppercase tracking-wide text-ink-faint">
-                <th className="px-4 py-2.5 font-medium">状态</th>
-                <th className="px-4 py-2.5 font-medium">时间</th>
-                <th className="px-4 py-2.5 font-medium">仓库</th>
-                <th className="px-4 py-2.5 font-medium">版本</th>
-                <th className="px-4 py-2.5 font-medium">服务器 / 目录</th>
-                <th className="px-4 py-2.5 font-medium">耗时</th>
-                <th className="px-4 py-2.5 text-right font-medium">操作</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.status")}</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.time")}</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.repo")}</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.revision")}</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.server")}</th>
+                <th className="px-4 py-2.5 font-medium">{t("history.columns.duration")}</th>
+                <th className="px-4 py-2.5 text-right font-medium">
+                  {t("history.columns.actions")}
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-line">
@@ -227,7 +234,7 @@ export default function HistoryPage() {
                         icon={<ScrollText className="size-3.5" />}
                         onClick={() => setViewing(record)}
                       >
-                        日志
+                        {t("history.viewLog")}
                       </Button>
                       <Button
                         size="sm"
@@ -236,17 +243,18 @@ export default function HistoryPage() {
                         disabled={record.status === "running" || running}
                         onClick={() => void handleRedeploy(record)}
                       >
-                        重新部署
+                        {t("history.redeploy")}
                       </Button>
                       {record.status === "success" && (
                         <Button
                           size="sm"
                           variant="ghost"
                           icon={<RotateCcw className="size-3.5" />}
-                          title="将当前分支回退到此部署版本 (git reset --hard)"
+                          title={t("history.rollbackHint")}
+                          disabled={running}
                           onClick={() => setRollingBack(record)}
                         >
-                          回滚
+                          {t("history.rollback")}
                         </Button>
                       )}
                       <Button
@@ -268,7 +276,7 @@ export default function HistoryPage() {
       <Modal
         open={!!viewing}
         onClose={() => setViewing(null)}
-        title="部署日志"
+        title={t("history.logTitle")}
         subtitle={
           viewing
             ? `${viewing.repoName} · ${viewing.branch} · ${viewing.commitShort}`
@@ -278,7 +286,7 @@ export default function HistoryPage() {
         footer={
           <>
             <Button variant="secondary" onClick={() => setViewing(null)}>
-              关闭
+              {t("common.close")}
             </Button>
             {viewing && (
               <Button
@@ -290,7 +298,7 @@ export default function HistoryPage() {
                   void handleRedeploy(record);
                 }}
               >
-                重新部署此版本
+                {t("history.redeployVersion")}
               </Button>
             )}
           </>
@@ -299,14 +307,14 @@ export default function HistoryPage() {
         {viewing && (
           <div className="flex flex-col gap-4">
             <div className="grid grid-cols-2 gap-3 text-xs md:grid-cols-4">
-              <InfoCell label="状态">
+              <InfoCell label={t("history.info.status")}>
                 <Badge className={cn("border", deployStatusClass(viewing.status))}>
                   {deployStatusLabel(viewing.status)}
                 </Badge>
               </InfoCell>
-              <InfoCell label="服务器">{viewing.serverName}</InfoCell>
-              <InfoCell label="目录">{viewing.targetDir}</InfoCell>
-              <InfoCell label="耗时">
+              <InfoCell label={t("history.info.server")}>{viewing.serverName}</InfoCell>
+              <InfoCell label={t("history.info.dir")}>{viewing.targetDir}</InfoCell>
+              <InfoCell label={t("history.info.duration")}>
                 {viewing.status === "running" ? "-" : formatDuration(viewing.durationMs)}
               </InfoCell>
             </div>
@@ -316,7 +324,7 @@ export default function HistoryPage() {
               </div>
             )}
             <pre className="max-h-[46vh] overflow-y-auto rounded-md border border-line bg-sunken px-4 py-2.5 font-mono text-[11.5px] leading-[1.7] text-ink-dim">
-              {viewing.log || "（没有日志）"}
+              {viewing.log || t("history.noLog")}
             </pre>
           </div>
         )}
@@ -326,13 +334,14 @@ export default function HistoryPage() {
         open={!!removing}
         danger
         loading={busy}
-        title="删除部署记录"
-        confirmText="删除"
+        title={t("history.deleteTitle")}
+        confirmText={t("common.delete")}
         description={
-          <span>
-            确定删除 <b className="text-ink">{removing?.repoName}</b> 在{" "}
-            {removing?.startedAt} 的部署记录吗？
-          </span>
+          <Trans
+            i18nKey="history.deleteDescription"
+            values={{ repo: removing?.repoName, date: removing?.startedAt }}
+            components={{ b: <b className="text-ink" /> }}
+          />
         }
         onCancel={() => setRemoving(null)}
         onConfirm={() => void handleDelete()}
@@ -342,15 +351,14 @@ export default function HistoryPage() {
         open={!!rollingBack}
         danger
         loading={busy}
-        title="回滚到该部署版本"
-        confirmText="回滚"
+        title={t("history.rollbackTitle")}
+        confirmText={t("history.rollback")}
         description={
-          <span>
-            将在本地仓库 <b className="text-ink">{rollingBack?.repoName}</b> 执行{" "}
-            <code className="text-neg">git reset --hard {rollingBack?.commitShort}</code>
-            ，把当前分支回退到 {rollingBack?.startedAt} 部署的版本，
-            <b className="text-ink">未提交的改动与之后的提交将从当前分支移走</b>。确认继续吗？
-          </span>
+          <Trans
+            i18nKey="history.rollbackDescription"
+            values={{ repo: rollingBack?.repoName, commit: rollingBack?.commitShort, date: rollingBack?.startedAt }}
+            components={{ b: <b className="text-ink" />, code: <code className="text-neg" /> }}
+          />
         }
         onCancel={() => setRollingBack(null)}
         onConfirm={() => void handleRollback()}
@@ -360,9 +368,9 @@ export default function HistoryPage() {
         open={clearing}
         danger
         loading={busy}
-        title="清空部署记录"
-        confirmText="清空全部"
-        description="所有部署记录与日志都会被删除，且无法恢复。确定继续吗？"
+        title={t("history.clearTitle")}
+        confirmText={t("history.clearConfirmText")}
+        description={t("history.clearDescription")}
         onCancel={() => setClearing(false)}
         onConfirm={() => void handleClear()}
       />

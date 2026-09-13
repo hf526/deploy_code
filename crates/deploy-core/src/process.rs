@@ -15,23 +15,26 @@ fn running_children() -> &'static Mutex<HashSet<u32>> {
 }
 
 fn track_child(pid: u32) {
-    if let Ok(mut children) = running_children().lock() {
-        children.insert(pid);
-    }
+    running_children()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(pid);
 }
 
 fn untrack_child(pid: u32) {
-    if let Ok(mut children) = running_children().lock() {
-        children.remove(&pid);
-    }
+    running_children()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&pid);
 }
 
 /// 终止所有仍在运行的本地子进程（应用退出时调用；Unix 按进程组，Windows 用 taskkill /T）。
 pub fn kill_all_children() {
-    let pids: Vec<u32> = match running_children().lock() {
-        Ok(mut children) => children.drain().collect(),
-        Err(_) => return,
-    };
+    let pids: Vec<u32> = running_children()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .drain()
+        .collect();
     for pid in pids {
         #[cfg(unix)]
         unsafe {
@@ -104,9 +107,27 @@ fn base_command(program: &str, args: &[String], cwd: Option<&Path>) -> Command {
 
 /// 执行本地命令，不抛出非零退出码错误。
 pub fn run(program: &str, args: &[String], cwd: Option<&Path>) -> Result<CommandOutput> {
-    let output = base_command(program, args, cwd).output().map_err(|e| {
-        CoreError::Process(format!("无法执行 `{program}`: {e}（请确认该命令已安装并在 PATH 中）"))
-    })?;
+    // 与 run_timeout/run_stream 一致登记子进程，应用退出时才能统一终止（Git 本地操作也走这里）。
+    let child = base_command(program, args, cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            CoreError::Process(format!(
+                "无法执行 `{program}`: {e}（请确认该命令已安装并在 PATH 中）"
+            ))
+        })?;
+    let pid = child.id();
+    track_child(pid);
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            untrack_child(pid);
+            return Err(CoreError::Process(format!("`{program}` 执行失败: {e}")));
+        }
+    };
+    untrack_child(pid);
 
     Ok(CommandOutput {
         code: output.status.code().unwrap_or(-1),

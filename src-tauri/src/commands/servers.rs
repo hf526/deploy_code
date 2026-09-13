@@ -38,6 +38,10 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
 pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
     state.store.mutate_config(|config| {
         config.servers.retain(|server| server.id != server_id);
+        // 服务器已删除，其备份配置不再可用（备份记录保留作历史）。
+        config
+            .backup_configs
+            .retain(|saved| saved.server_id != server_id);
         for repo in config.repos.iter_mut() {
             if repo.default_server_id.as_deref() == Some(server_id.as_str()) {
                 repo.default_server_id = None;

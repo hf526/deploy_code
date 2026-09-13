@@ -14,6 +14,7 @@ import {
   Wifi,
   X,
 } from "lucide-react";
+import { Trans, useTranslation } from "react-i18next";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import {
@@ -29,17 +30,17 @@ import {
   Select,
 } from "../components/ui";
 import { api } from "../lib/api";
+import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
 import type { OnlineSession, SecurityReport, ServerConfig, SecuritySetting } from "../lib/types";
 import { authSummary, newServerTemplate } from "../lib/utils";
 
-const FIREWALL_LABEL: Record<string, string> = {
-  ufw: "UFW",
-  firewalld: "firewalld",
-  iptables: "iptables",
-  none: "未检测到防火墙",
-  unknown: "防火墙未知",
-};
+function firewallLabel(firewall: string): string {
+  if (firewall === "none") return i18n.t("servers.firewallNone");
+  if (firewall === "unknown") return i18n.t("servers.firewallUnknown");
+  if (firewall === "ufw") return "UFW";
+  return firewall;
+}
 
 function settingTone(setting: SecuritySetting): "green" | "red" | "amber" | "gray" {
   if (setting.key === "permitrootlogin") return setting.value.startsWith("yes") ? "red" : "green";
@@ -50,8 +51,10 @@ function settingTone(setting: SecuritySetting): "green" | "red" | "amber" | "gra
 }
 
 export default function ServersPage() {
+  const { t } = useTranslation();
   const servers = useApp((state) => state.servers);
   const refreshServers = useApp((state) => state.refreshServers);
+  const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const toast = useApp((state) => state.toast);
 
   const [formOpen, setFormOpen] = useState(false);
@@ -193,9 +196,10 @@ export default function ServersPage() {
     setBusy(true);
     try {
       await api.deleteServer(removing.id);
-      toast("success", `已删除服务器 ${removing.name}`);
+      toast("success", t("servers.deleted", { name: removing.name }));
       setRemoving(null);
-      await refreshServers();
+      // 后端会一并删除该服务器的备份配置，同步刷新避免残留悬空配置。
+      await Promise.all([refreshServers(), refreshBackupConfigs()]);
     } catch (error) {
       toast("error", String(error));
     } finally {
@@ -204,6 +208,7 @@ export default function ServersPage() {
   }
 
   async function handleTest(server: ServerConfig) {
+    if (testingId) return;
     setTestingId(server.id);
     try {
       const message = await api.testServer(server);
@@ -217,22 +222,22 @@ export default function ServersPage() {
 
   return (
     <Page
-      title="服务器"
-      subtitle="部署服务器：SSH 连接信息与默认目录"
+      title={t("nav.servers")}
+      subtitle={t("servers.subtitle")}
       actions={
         <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
-          添加服务器
+          {t("servers.add")}
         </Button>
       }
     >
       {servers.length === 0 ? (
         <EmptyState
           icon={<Server className="size-4.5" />}
-          title="还没有部署服务器"
-          description="添加一台服务器并测试连接，即可在部署页面选择它。"
+          title={t("servers.emptyTitle")}
+          description={t("servers.emptyDescription")}
           action={
             <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
-              添加服务器
+              {t("servers.add")}
             </Button>
           }
         />
@@ -268,34 +273,35 @@ export default function ServersPage() {
                       {server.defaultTargetDir}
                     </p>
                   ) : (
-                    <p className="text-[11px] text-ink-faint">未设置默认目录</p>
+                    <p className="text-[11px] text-ink-faint">{t("servers.noDefaultDir")}</p>
                   )}
                 </div>
                 <div className="flex shrink-0 items-center gap-1">
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="测试连接"
+                    title={t("servers.testConnection")}
                     loading={testingId === server.id}
+                    disabled={testingId !== null && testingId !== server.id}
                     icon={<Wifi className="size-3.5" />}
                     onClick={() => void handleTest(server)}
                   />
                   <Button
                     size="sm"
                     variant="secondary"
-                    title="安全检查"
+                    title={t("servers.securityTitle")}
                     icon={<ShieldCheck className="size-3.5" />}
                     onClick={() => openSecurity(server)}
                   >
-                    安全
+                    {t("servers.securityButton")}
                   </Button>
                   <Button size="sm" variant="secondary" onClick={() => openForm(server)}>
-                    配置
+                    {t("servers.configure")}
                   </Button>
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="删除"
+                    title={t("common.delete")}
                     className="text-neg hover:bg-neg-soft hover:text-neg"
                     icon={<Trash2 className="size-3.5" />}
                     onClick={() => setRemoving(server)}
@@ -320,7 +326,7 @@ export default function ServersPage() {
       <Modal
         open={!!securing}
         onClose={closeSecurity}
-        title="安全检查"
+        title={t("servers.securityTitle")}
         subtitle={
           securing
             ? `${securing.name} · ${securing.username}@${securing.host}:${securing.port}`
@@ -330,7 +336,7 @@ export default function ServersPage() {
         footer={
           <>
             <Button variant="secondary" onClick={closeSecurity}>
-              关闭
+              {t("common.close")}
             </Button>
             <Button
               variant="secondary"
@@ -338,14 +344,14 @@ export default function ServersPage() {
               icon={<RefreshCw className="size-4" />}
               onClick={() => securing && void scanSecurity(securing)}
             >
-              重新扫描
+              {t("servers.rescan")}
             </Button>
           </>
         }
       >
         {scanning && !report ? (
           <p className="flex items-center justify-center gap-2 py-12 text-xs text-ink-dim">
-            <Loader2 className="size-4 animate-spin" /> 正在收集登录日志与防火墙信息 ...
+            <Loader2 className="size-4 animate-spin" /> {t("servers.scanning")}
           </p>
         ) : secError ? (
           <p className="rounded-md border border-neg/30 bg-neg-soft px-4 py-3 text-xs break-all text-neg">
@@ -359,10 +365,14 @@ export default function ServersPage() {
                   report.firewall === "none" ? "red" : report.firewall === "unknown" ? "amber" : "brand"
                 }
               >
-                防火墙：{FIREWALL_LABEL[report.firewall] ?? report.firewall}
+                {t("servers.firewall", { value: firewallLabel(report.firewall) })}
               </Badge>
               <Badge kind={report.isRoot || report.hasSudo ? "green" : "amber"}>
-                {report.isRoot ? "root 权限" : report.hasSudo ? "免密 sudo 可用" : "权限受限"}
+                {report.isRoot
+                  ? t("servers.privilegeRoot")
+                  : report.hasSudo
+                    ? t("servers.privilegeSudo")
+                    : t("servers.privilegeLimited")}
               </Badge>
             </div>
 
@@ -376,19 +386,21 @@ export default function ServersPage() {
 
             <div className="flex flex-wrap items-center gap-2 text-[11px]">
               <span className="rounded-md border border-line bg-field px-2.5 py-1 text-ink-dim">
-                在线会话 <b className="ml-1 text-ink">{report.sessions.length}</b>
+                {t("servers.onlineSessions")}{" "}
+                <b className="ml-1 text-ink">{report.sessions.length}</b>
               </span>
               <span className="rounded-md border border-line bg-field px-2.5 py-1 text-ink-dim">
-                上次扫描 <b className="ml-1 text-ink">{report.scannedAt || "-"}</b>
+                {t("servers.lastScan")}{" "}
+                <b className="ml-1 text-ink">{report.scannedAt || "-"}</b>
               </span>
             </div>
 
             <section>
               <h4 className="mb-2 text-xs font-semibold text-ink">
-                登录失败（按账号 / IP 汇总，共 {report.failed.length} 组）
+                {t("servers.failedLogins", { count: report.failed.length })}
               </h4>
               {report.failed.length === 0 ? (
-                <p className="text-xs text-ink-faint">未发现失败登录记录。</p>
+                <p className="text-xs text-ink-faint">{t("servers.noFailedLogins")}</p>
               ) : (
                 <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
                   {report.failed.map((item) => (
@@ -405,7 +417,7 @@ export default function ServersPage() {
                       <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-dim">
                         {item.ip}
                       </span>
-                      <Badge kind="red">{item.count} 次</Badge>
+                      <Badge kind="red">{t("servers.times", { count: item.count })}</Badge>
                       {report.blocked.includes(item.ip) ? (
                         <Button
                           size="sm"
@@ -415,7 +427,7 @@ export default function ServersPage() {
                           icon={<X className="size-3.5" />}
                           onClick={() => void handleUnblock(item.ip)}
                         >
-                          解除
+                          {t("servers.unblock")}
                         </Button>
                       ) : (
                         <Button
@@ -426,7 +438,7 @@ export default function ServersPage() {
                           icon={<Ban className="size-3.5" />}
                           onClick={() => void handleBlock(item.ip)}
                         >
-                          拉黑
+                          {t("servers.block")}
                         </Button>
                       )}
                     </li>
@@ -436,9 +448,9 @@ export default function ServersPage() {
             </section>
 
             <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">最近成功登录</h4>
+              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.recentSuccess")}</h4>
               {report.success.length === 0 ? (
-                <p className="text-xs text-ink-faint">没有读取到登录记录。</p>
+                <p className="text-xs text-ink-faint">{t("servers.noSuccess")}</p>
               ) : (
                 <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
                   {report.success.map((item, index) => (
@@ -466,10 +478,10 @@ export default function ServersPage() {
 
             <section>
               <h4 className="mb-2 text-xs font-semibold text-ink">
-                当前在线会话（{report.sessions.length}）
+                {t("servers.sessionsTitle", { count: report.sessions.length })}
               </h4>
               {report.sessions.length === 0 ? (
-                <p className="text-xs text-ink-faint">当前没有在线登录会话。</p>
+                <p className="text-xs text-ink-faint">{t("servers.noSessions")}</p>
               ) : (
                 <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
                   {report.sessions.map((session) => (
@@ -501,7 +513,7 @@ export default function ServersPage() {
                         icon={<LogOut className="size-3.5" />}
                         onClick={() => setKicking(session)}
                       >
-                        踢出
+                        {t("servers.kick")}
                       </Button>
                     </li>
                   ))}
@@ -510,9 +522,9 @@ export default function ServersPage() {
             </section>
 
             <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">防火墙拦截（DENY / DROP）</h4>
+              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.blockedIps")}</h4>
               {report.blocked.length === 0 ? (
-                <p className="text-xs text-ink-faint">当前没有拦截中的 IP。</p>
+                <p className="text-xs text-ink-faint">{t("servers.noBlockedIps")}</p>
               ) : (
                 <div className="flex flex-wrap gap-2">
                   {report.blocked.map((ip) => (
@@ -527,7 +539,7 @@ export default function ServersPage() {
                         onClick={() => void handleUnblock(ip)}
                         className="rounded px-1.5 py-0.5 text-[10px] text-ink-faint hover:bg-hover hover:text-ink disabled:opacity-50"
                       >
-                        {ipBusy === ip ? "解除中..." : "解除"}
+                        {ipBusy === ip ? t("servers.unblocking") : t("servers.unblock")}
                       </button>
                     </span>
                   ))}
@@ -536,25 +548,23 @@ export default function ServersPage() {
             </section>
 
             <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">自动防护（服务器端）</h4>
+              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.guardTitle")}</h4>
               <div className="rounded-md border border-line bg-field p-3.5">
                 <div className="flex flex-wrap items-center gap-2">
                   <Badge kind={report.guardEnabled ? "green" : "gray"}>
-                    {report.guardEnabled ? "已启用" : "未启用"}
+                    {report.guardEnabled ? t("servers.guardEnabled") : t("servers.guardDisabled")}
                   </Badge>
-                  <span className="text-[11.5px] text-ink-dim">
-                    服务器每分钟检查一次，统计窗口内同一 IP 登录失败达到阈值后自动拉黑（不依赖本应用运行）
-                  </span>
+                  <span className="text-[11.5px] text-ink-dim">{t("servers.guardDescription")}</span>
                 </div>
                 <div className="mt-3 flex flex-wrap items-end gap-2">
-                  <Field label="失败次数阈值" className="w-28">
+                  <Field label={t("servers.guardThreshold")} className="w-28">
                     <Input
                       type="number"
                       value={guardThreshold}
                       onChange={(event) => setGuardThreshold(Number(event.target.value))}
                     />
                   </Field>
-                  <Field label="统计窗口（分钟）" className="w-32">
+                  <Field label={t("servers.guardWindow")} className="w-32">
                     <Input
                       type="number"
                       value={guardWindowMins}
@@ -567,7 +577,7 @@ export default function ServersPage() {
                     icon={<ShieldCheck className="size-3.5" />}
                     onClick={() => void handleEnableGuard()}
                   >
-                    {report.guardEnabled ? "更新配置" : "启用防护"}
+                    {report.guardEnabled ? t("servers.guardUpdate") : t("servers.guardEnable")}
                   </Button>
                   {report.guardEnabled && (
                     <Button
@@ -576,22 +586,20 @@ export default function ServersPage() {
                       disabled={guardBusy}
                       onClick={() => void handleDisableGuard()}
                     >
-                      停用
+                      {t("servers.guardDisable")}
                     </Button>
                   )}
                 </div>
                 {!report.isRoot && !report.hasSudo && (
-                  <p className="mt-2 text-[11px] text-ink-faint">
-                    需要 root 或免密 sudo 权限才能在服务器上安装防护脚本。
-                  </p>
+                  <p className="mt-2 text-[11px] text-ink-faint">{t("servers.guardNeedRoot")}</p>
                 )}
               </div>
             </section>
 
             <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">sshd 关键配置</h4>
+              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.sshdTitle")}</h4>
               {report.sshd.length === 0 ? (
-                <p className="text-xs text-ink-faint">未读取到 sshd 配置。</p>
+                <p className="text-xs text-ink-faint">{t("servers.noSshd")}</p>
               ) : (
                 <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
                   {report.sshd.map((setting) => (
@@ -616,13 +624,14 @@ export default function ServersPage() {
         open={!!removing}
         danger
         loading={busy}
-        title="删除服务器"
-        confirmText="删除"
+        title={t("servers.deleteTitle")}
+        confirmText={t("common.delete")}
         description={
-          <span>
-            确定删除服务器 <b className="text-ink">{removing?.name}</b> 吗？
-            使用该服务器的部署记录不会被删除。
-          </span>
+          <Trans
+            i18nKey="servers.deleteDescription"
+            values={{ name: removing?.name }}
+            components={{ b: <b className="text-ink" /> }}
+          />
         }
         onCancel={() => setRemoving(null)}
         onConfirm={() => void handleDelete()}
@@ -632,14 +641,14 @@ export default function ServersPage() {
         open={!!kicking}
         danger
         loading={sessionBusy !== null}
-        title="踢出在线会话"
-        confirmText="踢出"
+        title={t("servers.kickTitle")}
+        confirmText={t("servers.kick")}
         description={
-          <span>
-            确定强制断开 <b className="text-ink">{kicking?.user}</b> 在{" "}
-            <b className="text-ink">{kicking?.tty}</b>
-            {kicking?.from ? `（来源 ${kicking.from}）` : ""} 的登录会话吗？
-          </span>
+          <Trans
+            i18nKey={kicking?.from ? "servers.kickDescriptionWithFrom" : "servers.kickDescription"}
+            values={{ user: kicking?.user, tty: kicking?.tty, from: kicking?.from }}
+            components={{ b: <b className="text-ink" /> }}
+          />
         }
         onCancel={() => setKicking(null)}
         onConfirm={() => void handleKick()}
@@ -659,6 +668,7 @@ function ServerFormModal({
   onClose: () => void;
   onSaved: () => void | Promise<void>;
 }) {
+  const { t } = useTranslation();
   const toast = useApp((state) => state.toast);
   const [draft, setDraft] = useState<ServerConfig>(newServerTemplate);
   const [busy, setBusy] = useState(false);
@@ -674,7 +684,7 @@ function ServerFormModal({
   }
 
   async function browseKey() {
-    const selected = await open({ multiple: false, title: "选择 SSH 私钥文件" });
+    const selected = await open({ multiple: false, title: t("servers.keyBrowseTitle") });
     if (typeof selected === "string") {
       setDraft((current) =>
         current.auth.type === "privateKey"
@@ -685,20 +695,21 @@ function ServerFormModal({
   }
 
   async function save() {
-    if (!draft.name.trim()) return toast("error", "请填写服务器名称");
-    if (!draft.host.trim()) return toast("error", "请填写主机地址");
-    if (!draft.username.trim()) return toast("error", "请填写 SSH 用户名");
+    if (busy || testing) return;
+    if (!draft.name.trim()) return toast("error", t("servers.errorName"));
+    if (!draft.host.trim()) return toast("error", t("servers.errorHost"));
+    if (!draft.username.trim()) return toast("error", t("servers.errorUsername"));
     if (draft.auth.type === "password" && !draft.auth.password) {
-      return toast("error", "请填写登录密码");
+      return toast("error", t("servers.errorPassword"));
     }
     if (draft.auth.type === "privateKey" && !draft.auth.keyPath.trim()) {
-      return toast("error", "请选择私钥文件");
+      return toast("error", t("servers.errorKey"));
     }
 
     setBusy(true);
     try {
       const saved = await api.saveServer(draft);
-      toast("success", initial ? "服务器已更新" : "服务器已添加");
+      toast("success", initial ? t("servers.updated") : t("servers.added"));
       setDraft(saved);
       await onSaved();
     } catch (error) {
@@ -709,6 +720,7 @@ function ServerFormModal({
   }
 
   async function test() {
+    if (busy || testing) return;
     setTesting(true);
     try {
       const message = await api.testServer(draft);
@@ -720,58 +732,65 @@ function ServerFormModal({
     }
   }
 
+  /** 保存 / 测试进行中禁止关闭，避免异步结果落到另一个服务器的表单上。 */
+  function requestClose() {
+    if (busy || testing) return;
+    onClose();
+  }
+
   return (
     <Modal
       open={isOpen}
-      onClose={onClose}
-      title={initial ? `编辑服务器 · ${initial.name}` : "添加服务器"}
-      subtitle="通过 SSH 将代码上传到该服务器"
+      onClose={requestClose}
+      title={initial ? t("servers.editTitle", { name: initial.name }) : t("servers.addTitle")}
+      subtitle={t("servers.formSubtitle")}
       footer={
         <>
           <Button
             variant="secondary"
             loading={testing}
+            disabled={busy}
             icon={<Wifi className="size-4" />}
             onClick={() => void test()}
           >
-            测试连接
+            {t("servers.testConnection")}
           </Button>
-          <Button variant="secondary" onClick={onClose}>
-            取消
+          <Button variant="secondary" disabled={busy || testing} onClick={requestClose}>
+            {t("common.cancel")}
           </Button>
-          <Button loading={busy} onClick={() => void save()}>
-            保存
+          <Button loading={busy} disabled={testing} onClick={() => void save()}>
+            {t("common.save")}
           </Button>
         </>
       }
     >
       <div className="flex flex-col gap-4">
         <div className="grid grid-cols-2 gap-4">
-          <Field label="名称" required>
+          <Field label={t("servers.name")} required>
             <Input
               value={draft.name}
               onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-              placeholder="生产服务器"
+              placeholder={t("servers.namePlaceholder")}
             />
           </Field>
-          <Field label="主机地址" required>
+          <Field label={t("servers.host")} required>
             <Input
               value={draft.host}
               onChange={(event) => setDraft({ ...draft, host: event.target.value })}
-              placeholder="192.168.1.10 或 example.com"
+              placeholder={t("servers.hostPlaceholder")}
             />
           </Field>
         </div>
 
         <div className="grid grid-cols-2 gap-4">
-          <Field label="SSH 端口">
+          <Field label={t("servers.port")}>
             <Input
               type="number"
               value={draft.port}
               onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) || 22 })}
             />
           </Field>
-          <Field label="用户名" required>
+          <Field label={t("servers.username")} required>
             <Input
               value={draft.username}
               onChange={(event) => setDraft({ ...draft, username: event.target.value })}
@@ -780,7 +799,7 @@ function ServerFormModal({
           </Field>
         </div>
 
-        <Field label="认证方式">
+        <Field label={t("servers.authType")}>
           <Select
             value={draft.auth.type}
             onChange={(event) => {
@@ -795,25 +814,25 @@ function ServerFormModal({
               });
             }}
           >
-            <option value="password">密码认证</option>
-            <option value="privateKey">私钥认证</option>
+            <option value="password">{t("servers.passwordAuth")}</option>
+            <option value="privateKey">{t("servers.keyAuth")}</option>
           </Select>
         </Field>
 
         {draft.auth.type === "password" ? (
-          <Field label="登录密码" required>
+          <Field label={t("servers.password")} required>
             <Input
               type="password"
               value={draft.auth.password}
               onChange={(event) =>
                 setDraft({ ...draft, auth: { type: "password", password: event.target.value } })
               }
-              placeholder="仅保存在本机配置文件"
+              placeholder={t("servers.passwordPlaceholder")}
             />
           </Field>
         ) : (
           <>
-            <Field label="私钥文件" required>
+            <Field label={t("servers.keyPath")} required>
               <div className="flex gap-2">
                 <Input
                   value={draft.auth.keyPath}
@@ -834,11 +853,11 @@ function ServerFormModal({
                   icon={<FolderOpen className="size-4" />}
                   onClick={() => void browseKey()}
                 >
-                  浏览
+                  {t("servers.browse")}
                 </Button>
               </div>
             </Field>
-            <Field label="私钥口令" hint="没有留空">
+            <Field label={t("servers.keyPassphrase")} hint={t("servers.keyPassphraseHint")}>
               <Input
                 type="password"
                 value={draft.auth.type === "privateKey" ? (draft.auth.passphrase ?? "") : ""}
@@ -857,7 +876,7 @@ function ServerFormModal({
           </>
         )}
 
-        <Field label="默认部署目录" hint="创建部署任务时自动填充">
+        <Field label={t("servers.defaultTargetDir")} hint={t("servers.defaultTargetDirHint")}>
           <Input
             value={draft.defaultTargetDir}
             onChange={(event) => setDraft({ ...draft, defaultTargetDir: event.target.value })}

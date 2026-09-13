@@ -17,18 +17,11 @@ async fn main() {
 }
 
 /// 启动时把上次异常退出遗留的 Running 记录收敛为失败。
-/// 只有三种任务锁都能拿到（说明 GUI / 其他进程没有任务在跑）才执行，避免误伤正在进行的任务。
+/// `Store::reconcile_interrupted` 内部会先尝试三种任务锁，确认没有任务在跑才执行。
 fn reconcile_interrupted(cli: &Cli) {
     let store = match commands::open_store(cli) {
         Ok(store) => store,
         Err(_) => return,
     };
-    let locks = (
-        store.try_task_lock("deploy"),
-        store.try_task_lock("backup"),
-        store.try_task_lock("pages"),
-    );
-    if let (Ok(Some(_deploy)), Ok(Some(_backup)), Ok(Some(_pages))) = locks {
-        let _ = store.mark_interrupted();
-    }
+    let _ = store.reconcile_interrupted();
 }

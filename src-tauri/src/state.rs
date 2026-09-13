@@ -1,10 +1,19 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use deploy_core::store::TaskLock;
 use deploy_core::{DeployEngine, Result, Store};
 use tauri::{AppHandle, Manager};
+
+/// 已登记的仓库文件监听：记录被监听目录，仓库路径变化时可替换 watcher。
+pub struct WatchedRepo {
+    pub path: PathBuf,
+    /// 仅靠持有保活，drop 时自动停止监听，不需要读取。
+    #[allow(dead_code)]
+    pub watcher: notify::RecommendedWatcher,
+}
 
 /// 正在进行的部署（用于应用退出时清理远端脚本）。
 #[derive(Clone)]
@@ -138,7 +147,7 @@ impl PagesTaskGuard {
 pub struct AppState {
     pub store: Arc<Store>,
     /// 正在监听的文件系统 watcher（按仓库 id 保存），用于 GUI 实时刷新。
-    pub watchers: Mutex<HashMap<String, notify::RecommendedWatcher>>,
+    pub watchers: Mutex<HashMap<String, WatchedRepo>>,
     /// 进行中的部署（record_id -> 服务器/目录/任务句柄），退出时用于终止远端脚本。
     pub active_deploys: Mutex<HashMap<String, ActiveDeploy>>,
     /// 进行中的备份（record_id -> 服务器/记录/任务句柄），退出时用于终止远端脚本。
@@ -243,47 +252,58 @@ impl AppState {
         self.release_claim(&self.pages_claim, &self.pages_lock);
     }
 
+    /// Pages 任务是否仍在进行（退出时用于判断是否需要推迟退出并清理子进程）。
+    pub fn has_active_pages(&self) -> bool {
+        self.pages_claim.load(Ordering::SeqCst)
+    }
+
     pub fn engine(&self) -> DeployEngine {
         DeployEngine::new(self.store.clone())
     }
 
     pub fn track_deploy(&self, record_id: &str, deploy: ActiveDeploy) {
-        if let Ok(mut deploys) = self.active_deploys.lock() {
-            deploys.insert(record_id.to_string(), deploy);
-        }
+        self.active_deploys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(record_id.to_string(), deploy);
     }
 
     pub fn untrack_deploy(&self, record_id: &str) {
-        if let Ok(mut deploys) = self.active_deploys.lock() {
-            deploys.remove(record_id);
-        }
+        self.active_deploys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(record_id);
     }
 
     /// 取出并清空当前进行中的部署列表。
     pub fn take_deploys(&self) -> Vec<(String, ActiveDeploy)> {
-        match self.active_deploys.lock() {
-            Ok(mut deploys) => deploys.drain().collect(),
-            Err(_) => Vec::new(),
-        }
+        self.active_deploys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect()
     }
 
     pub fn track_backup(&self, record_id: &str, backup: ActiveBackup) {
-        if let Ok(mut backups) = self.active_backups.lock() {
-            backups.insert(record_id.to_string(), backup);
-        }
+        self.active_backups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(record_id.to_string(), backup);
     }
 
     pub fn untrack_backup(&self, record_id: &str) {
-        if let Ok(mut backups) = self.active_backups.lock() {
-            backups.remove(record_id);
-        }
+        self.active_backups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(record_id);
     }
 
     /// 取出并清空当前进行中的备份列表。
     pub fn take_backups(&self) -> Vec<(String, ActiveBackup)> {
-        match self.active_backups.lock() {
-            Ok(mut backups) => backups.drain().collect(),
-            Err(_) => Vec::new(),
-        }
+        self.active_backups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect()
     }
 }

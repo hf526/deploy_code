@@ -1,5 +1,6 @@
 import React from "react";
 import { AlertTriangle, CheckCircle2, Inbox, Info, Loader2, X } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { useApp } from "../lib/store";
 import { cn } from "../lib/utils";
@@ -319,7 +320,7 @@ export function ConfirmModal({
   open,
   title,
   description,
-  confirmText = "确认",
+  confirmText,
   danger = false,
   loading = false,
   onCancel,
@@ -334,19 +335,20 @@ export function ConfirmModal({
   onCancel: () => void;
   onConfirm: () => void;
 }) {
+  const { t } = useTranslation();
   return (
     <Modal
       open={open}
-      onClose={onCancel}
+      onClose={loading ? () => undefined : onCancel}
       title={title}
       width="max-w-md"
       footer={
         <>
-          <Button variant="secondary" onClick={onCancel}>
-            取消
+          <Button variant="secondary" disabled={loading} onClick={onCancel}>
+            {t("common.cancel")}
           </Button>
           <Button variant={danger ? "danger" : "primary"} loading={loading} onClick={onConfirm}>
-            {confirmText}
+            {confirmText ?? t("common.confirm")}
           </Button>
         </>
       }

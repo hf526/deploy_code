@@ -82,7 +82,8 @@ pub fn redeploy(app: AppHandle, state: State<AppState>, record_id: String) -> Re
         target_dir: record.target_dir.clone(),
         run_scripts: record.run_scripts,
         script_dir: record.script_dir.clone(),
-        script: record.script.clone(),
+        scripts: record.scripts.clone(),
+        upload_env: true,
     };
     let prepared = engine.prepare(&request)?;
     Ok(spawn_deploy(app, engine, prepared, request, claim))

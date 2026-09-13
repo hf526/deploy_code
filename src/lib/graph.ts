@@ -116,11 +116,10 @@ export function layoutGraph(commits: GraphCommit[]): GraphLayout {
       const pr = hashToRow[p];
       if (pr === undefined || pr <= row) return;
       const pc = hashToCol[p];
-      // 从当前行沿 col 垂直下行，直到父提交上一行再弯入 pc。
-      for (let g = row; g < pr; g++) {
-        if (g < pr - 1) pushSeg(g, col, col);
-        else pushSeg(g, col, pc);
-      }
+      // 从子提交出发：第一段弯入父提交所在车道，之后沿父车道垂直下行，
+      // 避免合并的第二父边一直占用子提交车道而与第一父边重叠。
+      pushSeg(row, col, pc);
+      for (let g = row + 1; g < pr; g++) pushSeg(g, pc, pc);
     });
   });
 

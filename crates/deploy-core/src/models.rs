@@ -92,6 +92,37 @@ impl BackupTarget {
     }
 }
 
+/// 保存的数据库备份配置（名称 + 服务器 + 来源 + 目标）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupConfig {
+    pub id: String,
+    pub name: String,
+    /// 备份来源所在的服务器 id。
+    pub server_id: String,
+    /// 数据库备份来源（docker 容器或服务器本机）。
+    pub source: DbBackupSource,
+    /// 备份目标 id（为空时回退到服务器绑定 / 全局默认目标）。
+    #[serde(default)]
+    pub target_id: Option<String>,
+    /// 该配置直接指定的目标连接串（优先级高于 target_id）。
+    #[serde(default)]
+    pub supabase_url: Option<String>,
+}
+
+impl BackupConfig {
+    pub fn new(name: String, server_id: String, source: DbBackupSource) -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name,
+            server_id,
+            source,
+            target_id: None,
+            supabase_url: None,
+        }
+    }
+}
+
 /// 部署服务器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -141,6 +172,18 @@ impl ServerConfig {
     }
 }
 
+/// 部署时要上传覆盖的环境文件（本地文件 → 部署目录下的相对路径）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct EnvFileConfig {
+    /// 本地文件路径。
+    #[serde(default)]
+    pub local_path: String,
+    /// 远端相对部署目录的路径，如 `.env` 或 `docker/.env`。
+    #[serde(default)]
+    pub remote_path: String,
+}
+
 /// 本地仓库配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -155,15 +198,22 @@ pub struct RepoConfig {
     /// Cloudflare Pages 部署配置。
     #[serde(default)]
     pub pages: Option<PagesConfig>,
+    /// 部署时上传覆盖的环境文件列表。
+    #[serde(default)]
+    pub env_files: Vec<EnvFileConfig>,
     #[serde(default)]
     pub added_at: String,
 }
 
-/// Cloudflare Pages 部署配置（按仓库保存）。
+/// Pages 部署配置（按仓库保存，支持 Cloudflare / GitHub 两种平台）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PagesConfig {
-    /// Cloudflare Pages 项目名。
+    /// 部署平台：cloudflare | github
+    #[serde(default = "default_pages_provider")]
+    pub provider: String,
+    /// Cloudflare Pages 项目名（GitHub 平台可留空）。
+    #[serde(default)]
     pub project_name: String,
     /// 构建命令（可为空，表示只上传已有产物）。
     #[serde(default)]
@@ -171,20 +221,29 @@ pub struct PagesConfig {
     /// 输出目录（相对仓库根目录）。
     #[serde(default = "default_pages_output")]
     pub output_dir: String,
-    /// 生产分支名。
+    /// Cloudflare 生产分支名。
     #[serde(default = "default_pages_branch")]
     pub branch: String,
+    /// GitHub Pages 发布分支名（推送构建产物的分支）。
+    #[serde(default = "default_pages_publish_branch")]
+    pub publish_branch: String,
 }
 
 impl Default for PagesConfig {
     fn default() -> Self {
         Self {
+            provider: default_pages_provider(),
             project_name: String::new(),
             build_command: String::new(),
             output_dir: default_pages_output(),
             branch: default_pages_branch(),
+            publish_branch: default_pages_publish_branch(),
         }
     }
+}
+
+fn default_pages_provider() -> String {
+    "cloudflare".to_string()
 }
 
 fn default_pages_output() -> String {
@@ -193,6 +252,10 @@ fn default_pages_output() -> String {
 
 fn default_pages_branch() -> String {
     "main".to_string()
+}
+
+fn default_pages_publish_branch() -> String {
+    "gh-pages".to_string()
 }
 
 impl RepoConfig {
@@ -204,6 +267,7 @@ impl RepoConfig {
             default_server_id: None,
             default_target_dir: String::new(),
             pages: None,
+            env_files: Vec::new(),
             added_at: now_string(),
         }
     }
@@ -216,12 +280,17 @@ pub struct RepoInfo {
     pub id: String,
     pub name: String,
     pub path: String,
+    /// 本地目录是否存在。
+    pub path_exists: bool,
     pub is_repo: bool,
     pub current_branch: String,
     pub remote: Option<String>,
     pub change_count: usize,
     pub default_server_id: Option<String>,
     pub default_target_dir: String,
+    /// 部署时上传覆盖的环境文件列表。
+    #[serde(default)]
+    pub env_files: Vec<EnvFileConfig>,
 }
 
 /// 分支信息。
@@ -357,8 +426,13 @@ pub struct DeployRecord {
     pub server_name: String,
     pub target_dir: String,
     pub script_dir: String,
-    pub script: Option<String>,
+    /// 指定执行的脚本列表（按顺序执行）；为空表示自动执行脚本目录下的全部 .sh。
+    #[serde(default, alias = "script", deserialize_with = "deserialize_script_list")]
+    pub scripts: Vec<String>,
     pub run_scripts: bool,
+    /// 本次部署实际替换的环境文件列表。
+    #[serde(default)]
+    pub env_files: Vec<EnvFileConfig>,
     pub status: DeployStatus,
     pub error: Option<String>,
     pub log: String,
@@ -379,8 +453,32 @@ pub struct DeployRequest {
     pub run_scripts: bool,
     #[serde(default = "default_script_dir")]
     pub script_dir: String,
-    #[serde(default)]
-    pub script: Option<String>,
+    /// 指定执行的脚本列表（按顺序执行）；为空表示自动执行脚本目录下的全部 .sh。
+    #[serde(default, alias = "script", deserialize_with = "deserialize_script_list")]
+    pub scripts: Vec<String>,
+    /// 是否在解压后、执行脚本前上传并替换 `env_files` 中配置的环境文件。
+    #[serde(default = "default_true")]
+    pub upload_env: bool,
+}
+
+/// 兼容旧数据：`script` 字段可能是单个字符串，新字段 `scripts` 是数组。
+fn deserialize_script_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        One(String),
+        Many(Vec<String>),
+    }
+
+    let raw = Option::<Raw>::deserialize(deserializer)?;
+    Ok(match raw {
+        None => Vec::new(),
+        Some(Raw::One(value)) => vec![value],
+        Some(Raw::Many(values)) => values,
+    })
 }
 
 fn default_true() -> bool {
@@ -421,7 +519,13 @@ pub enum LogLevel {
 pub struct BackupRequest {
     /// 服务器 id / 名称 / host。
     pub server_id: String,
-    /// 指定的备份目标 id / 名称（为空时使用服务器或全局默认）。
+    /// 已保存的备份配置 id / 名称（提供时服务器、来源与目标优先取自配置）。
+    #[serde(default)]
+    pub backup_config_id: Option<String>,
+    /// 直接覆盖来源配置（用于测试尚未保存的表单）。
+    #[serde(default)]
+    pub source: Option<DbBackupSource>,
+    /// 指定的备份目标 id / 名称（为空时使用配置、服务器或全局默认）。
     #[serde(default)]
     pub target_id: Option<String>,
     /// 直接覆盖目标连接串（优先级最高）。
@@ -474,12 +578,15 @@ pub enum BackupEvent {
     Finished { record: BackupRecord },
 }
 
-/// 发起一次 Cloudflare Pages 部署所需的参数。
+/// 发起一次 Pages 部署所需的参数。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PagesRequest {
     /// 仓库 id / 名称 / 路径。
     pub repo_id: String,
+    /// 覆盖部署平台（cloudflare | github）。
+    #[serde(default)]
+    pub provider: Option<String>,
     /// 覆盖项目名。
     #[serde(default)]
     pub project_name: Option<String>,
@@ -492,16 +599,22 @@ pub struct PagesRequest {
     /// 覆盖分支。
     #[serde(default)]
     pub branch: Option<String>,
+    /// 覆盖 GitHub Pages 发布分支。
+    #[serde(default)]
+    pub publish_branch: Option<String>,
     /// 跳过构建，直接上传现有产物。
     #[serde(default)]
     pub skip_build: bool,
 }
 
-/// 一条 Cloudflare Pages 部署记录。
+/// 一条 Pages 部署记录。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PagesDeployRecord {
     pub id: String,
+    /// 部署平台：cloudflare | github。
+    #[serde(default = "default_pages_provider")]
+    pub provider: String,
     pub repo_id: String,
     pub repo_name: String,
     pub project_name: String,
@@ -562,9 +675,15 @@ pub struct Settings {
     /// 全局 Cloudflare Account ID。
     #[serde(default)]
     pub cloudflare_account_id: String,
+    /// GitHub Personal Access Token（可选，用于自动配置 Pages；留空则尝试本机 gh CLI）。
+    #[serde(default)]
+    pub github_token: String,
     /// Pages 部署记录保留条数。
     #[serde(default = "default_pages_history_limit")]
     pub pages_history_limit: usize,
+    /// 界面语言偏好（空字符串表示跟随系统）。
+    #[serde(default)]
+    pub language: String,
 }
 
 fn default_backup_history_limit() -> usize {
@@ -594,12 +713,14 @@ impl Default for Settings {
             backup_timeout_secs: default_backup_timeout_secs(),
             cloudflare_api_token: String::new(),
             cloudflare_account_id: String::new(),
+            github_token: String::new(),
             pages_history_limit: default_pages_history_limit(),
+            language: String::new(),
         }
     }
 }
 
-/// 应用配置（服务器 + 仓库 + 备份目标 + 设置）。
+/// 应用配置（服务器 + 仓库 + 备份目标 + 备份配置 + 设置）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -609,6 +730,12 @@ pub struct AppConfig {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub backup_targets: Vec<BackupTarget>,
+    /// 保存的数据库备份配置列表。
+    #[serde(default)]
+    pub backup_configs: Vec<BackupConfig>,
+    /// 是否已把服务器上旧版的单份 db_backup 迁移为备份配置（只迁移一次）。
+    #[serde(default)]
+    pub backup_configs_migrated: bool,
     #[serde(default)]
     pub settings: Settings,
 }
@@ -653,5 +780,69 @@ mod tests {
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"recordId\""), "unexpected json: {json}");
+    }
+
+    #[test]
+    fn legacy_single_script_field_deserializes_into_scripts() {
+        let request: DeployRequest = serde_json::from_str(
+            r#"{"repoId":"r","rev":"main","serverId":"s","targetDir":"/opt/x","scriptDir":"docker","script":"deploy.sh"}"#,
+        )
+        .unwrap();
+        assert_eq!(request.scripts, vec!["deploy.sh".to_string()]);
+
+        let request: DeployRequest = serde_json::from_str(
+            r#"{"repoId":"r","rev":"main","serverId":"s","targetDir":"/opt/x","scripts":["a.sh","b.sh"]}"#,
+        )
+        .unwrap();
+        assert_eq!(request.scripts, vec!["a.sh".to_string(), "b.sh".to_string()]);
+
+        let request: DeployRequest = serde_json::from_str(
+            r#"{"repoId":"r","rev":"main","serverId":"s","targetDir":"/opt/x","scripts":null}"#,
+        )
+        .unwrap();
+        assert!(request.scripts.is_empty());
+    }
+
+    #[test]
+    fn legacy_deploy_record_script_field_deserializes() {
+        let record: DeployRecord = serde_json::from_str(
+            r#"{
+                "id":"1","repoId":"r","repoName":"repo","rev":"main","branch":"main",
+                "commit":"abc","commitShort":"abc","commitSubject":"s","serverId":"srv",
+                "serverName":"prod","targetDir":"/opt/x","scriptDir":"docker",
+                "script":"docker/deploy.sh","runScripts":true,"status":"success",
+                "error":null,"log":"","startedAt":"2026-01-01 00:00:00",
+                "finishedAt":null,"durationMs":0
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(record.scripts, vec!["docker/deploy.sh".to_string()]);
+    }
+
+    #[test]
+    fn legacy_config_without_env_files_deserializes() {
+        let repo: RepoConfig = serde_json::from_str(r#"{"id":"r1","name":"demo","path":"/tmp/demo"}"#)
+            .unwrap();
+        assert!(repo.env_files.is_empty());
+
+        let record: DeployRecord = serde_json::from_str(
+            r#"{
+                "id":"1","repoId":"r","repoName":"repo","rev":"main","branch":"main",
+                "commit":"abc","commitShort":"abc","commitSubject":"s","serverId":"srv",
+                "serverName":"prod","targetDir":"/opt/x","scriptDir":"docker",
+                "scripts":[],"runScripts":true,"status":"success",
+                "error":null,"log":"","startedAt":"2026-01-01 00:00:00",
+                "finishedAt":null,"durationMs":0
+            }"#,
+        )
+        .unwrap();
+        assert!(record.env_files.is_empty());
+
+        // 旧请求没有 uploadEnv 字段时默认开启上传。
+        let request: DeployRequest = serde_json::from_str(
+            r#"{"repoId":"r","rev":"main","serverId":"s","targetDir":"/opt/x"}"#,
+        )
+        .unwrap();
+        assert!(request.upload_env);
     }
 }

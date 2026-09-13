@@ -1,17 +1,22 @@
 import { useState } from "react";
 import {
   ChevronRight,
+  Download,
   FolderOpen,
   GitBranch,
+  Link2,
   Pencil,
   Rocket,
   Server,
   Terminal,
   Trash2,
 } from "lucide-react";
+import { Trans, useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
+import { open } from "@tauri-apps/plugin-dialog";
 
-import { Badge, Button, ConfirmModal, Input, Modal, Page } from "../components/ui";
+import { BindRemoteModal } from "../components/BindRemoteModal";
+import { Badge, Button, ConfirmModal, Field, Input, Modal, Page } from "../components/ui";
 import { api } from "../lib/api";
 import { openRepoFolder } from "../lib/openRepo";
 import { useApp } from "../lib/store";
@@ -19,12 +24,13 @@ import type { RepoInfo } from "../lib/types";
 import { shortPath } from "../lib/utils";
 
 const FEATURES = [
-  { icon: GitBranch, title: "分支管理", desc: "切换、创建、对比差异" },
-  { icon: Rocket, title: "一键部署", desc: "打包上传并执行脚本" },
-  { icon: Terminal, title: "实时日志", desc: "部署过程全程可见" },
+  { icon: GitBranch, titleKey: "repos.featureBranchTitle", descKey: "repos.featureBranchDesc" },
+  { icon: Rocket, titleKey: "repos.featureDeployTitle", descKey: "repos.featureDeployDesc" },
+  { icon: Terminal, titleKey: "repos.featureLogTitle", descKey: "repos.featureLogDesc" },
 ];
 
 export default function ReposPage() {
+  const { t } = useTranslation();
   const repos = useApp((state) => state.repos);
   const servers = useApp((state) => state.servers);
   const refreshRepos = useApp((state) => state.refreshRepos);
@@ -35,6 +41,11 @@ export default function ReposPage() {
   const [renaming, setRenaming] = useState<RepoInfo | null>(null);
   const [renameValue, setRenameValue] = useState("");
   const [removing, setRemoving] = useState<RepoInfo | null>(null);
+  const [remoteRepo, setRemoteRepo] = useState<RepoInfo | null>(null);
+  const [cloneOpen, setCloneOpen] = useState(false);
+  const [cloneUrl, setCloneUrl] = useState("");
+  const [cloneDir, setCloneDir] = useState("");
+  const [cloning, setCloning] = useState(false);
   const [busy, setBusy] = useState(false);
 
   const totalChanges = repos.reduce((sum, repo) => sum + repo.changeCount, 0);
@@ -48,17 +59,58 @@ export default function ReposPage() {
     }
   }
 
+  async function pickCloneDir() {
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: t("repos.pickCloneDirTitle"),
+      });
+      if (typeof selected === "string") setCloneDir(selected);
+    } catch (error) {
+      toast("error", String(error));
+    }
+  }
+
+  async function handleClone() {
+    if (cloning) return;
+    const url = cloneUrl.trim();
+    if (!url) {
+      toast("error", t("remoteModal.urlRequired"));
+      return;
+    }
+    if (!cloneDir.trim()) {
+      toast("error", t("repos.errorCloneDir"));
+      return;
+    }
+    setCloning(true);
+    try {
+      const repo = await api.cloneRepo({ url, parentDir: cloneDir.trim() });
+      toast("success", t("repos.cloned", { name: repo.name }));
+      setCloneOpen(false);
+      setCloneUrl("");
+      setCloneDir("");
+      await refreshRepos();
+      navigate(`/repos/${repo.id}`);
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setCloning(false);
+    }
+  }
+
   async function handleRename() {
-    if (!renaming) return;
+    if (!renaming || busy) return;
+    const target = renaming;
     const nextName = renameValue.trim();
     if (!nextName) {
-      toast("error", "仓库名称不能为空");
+      toast("error", t("repos.nameRequired"));
       return;
     }
     setBusy(true);
     try {
-      await api.updateRepo({ repoId: renaming.id, name: nextName });
-      setRenaming(null);
+      await api.updateRepo({ repoId: target.id, name: nextName });
+      setRenaming((current) => (current?.id === target.id ? null : current));
       await refreshRepos();
     } catch (error) {
       toast("error", String(error));
@@ -68,12 +120,13 @@ export default function ReposPage() {
   }
 
   async function handleRemove() {
-    if (!removing) return;
+    if (!removing || busy) return;
+    const target = removing;
     setBusy(true);
     try {
-      await api.removeRepo(removing.id);
-      toast("success", `已移除仓库 ${removing.name}`);
-      setRemoving(null);
+      await api.removeRepo(target.id);
+      toast("success", t("repos.removed", { name: target.name }));
+      setRemoving((current) => (current?.id === target.id ? null : current));
       await refreshRepos();
     } catch (error) {
       toast("error", String(error));
@@ -84,16 +137,25 @@ export default function ReposPage() {
 
   return (
     <Page
-      title="仓库"
-      subtitle="本地 Git 仓库的工作台：分支、差异与部署"
+      title={t("nav.repos")}
+      subtitle={t("repos.subtitle")}
       actions={
-        <Button
-          loading={opening}
-          icon={<FolderOpen className="size-4" />}
-          onClick={() => void handleOpen()}
-        >
-          打开仓库
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            icon={<Download className="size-4" />}
+            onClick={() => setCloneOpen(true)}
+          >
+            {t("repos.clone")}
+          </Button>
+          <Button
+            loading={opening}
+            icon={<FolderOpen className="size-4" />}
+            onClick={() => void handleOpen()}
+          >
+            {t("nav.openRepo")}
+          </Button>
+        </div>
       }
     >
       {repos.length === 0 ? (
@@ -103,10 +165,10 @@ export default function ReposPage() {
               <GitBranch className="size-6" strokeWidth={2} />
             </span>
             <h2 className="mt-5 text-xl font-semibold tracking-tight text-ink">
-              开始你的第一次部署
+              {t("repos.heroTitle")}
             </h2>
             <p className="mx-auto mt-2 max-w-md text-[13px] leading-relaxed text-ink-dim">
-              选择一个本地 Git 仓库文件夹即可开始，不需要任何初始化配置。
+              {t("repos.heroDescription")}
             </p>
             <div className="mt-6 flex items-center justify-center gap-3">
               <Button
@@ -115,7 +177,15 @@ export default function ReposPage() {
                 icon={<FolderOpen className="size-4" />}
                 onClick={() => void handleOpen()}
               >
-                打开仓库文件夹
+                {t("repos.openFolder")}
+              </Button>
+              <Button
+                size="lg"
+                variant="secondary"
+                icon={<Download className="size-4" />}
+                onClick={() => setCloneOpen(true)}
+              >
+                {t("repos.cloneRemote")}
               </Button>
               <Button
                 size="lg"
@@ -123,18 +193,18 @@ export default function ReposPage() {
                 icon={<Server className="size-4" />}
                 onClick={() => navigate("/servers")}
               >
-                配置服务器
+                {t("repos.configureServers")}
               </Button>
             </div>
             <div className="mt-8 flex flex-wrap items-start justify-center gap-x-8 gap-y-4 border-t border-line pt-6">
               {FEATURES.map((feature) => (
-                <div key={feature.title} className="flex items-start gap-2.5 text-left">
+                <div key={feature.titleKey} className="flex items-start gap-2.5 text-left">
                   <span className="grid size-8 shrink-0 place-items-center rounded-lg bg-brand-soft text-brand">
                     <feature.icon className="size-4" />
                   </span>
                   <div>
-                    <p className="text-[13px] font-medium text-ink">{feature.title}</p>
-                    <p className="mt-0.5 text-[11px] text-ink-faint">{feature.desc}</p>
+                    <p className="text-[13px] font-medium text-ink">{t(feature.titleKey)}</p>
+                    <p className="mt-0.5 text-[11px] text-ink-faint">{t(feature.descKey)}</p>
                   </div>
                 </div>
               ))}
@@ -144,9 +214,11 @@ export default function ReposPage() {
       ) : (
         <>
           <div className="mb-4 flex flex-wrap items-center gap-2">
-            <Badge kind="gray">仓库 {repos.length}</Badge>
-            <Badge kind="gray">服务器 {servers.length}</Badge>
-            {totalChanges > 0 && <Badge kind="amber">未提交变动 {totalChanges}</Badge>}
+            <Badge kind="gray">{t("repos.badgeRepos", { count: repos.length })}</Badge>
+            <Badge kind="gray">{t("repos.badgeServers", { count: servers.length })}</Badge>
+            {totalChanges > 0 && (
+              <Badge kind="amber">{t("repos.badgeChanges", { count: totalChanges })}</Badge>
+            )}
           </div>
           <div className="grid grid-cols-1 gap-3.5 xl:grid-cols-2">
             {repos.map((repo) => (
@@ -162,13 +234,21 @@ export default function ReposPage() {
               >
                 <span
                   className={
-                    repo.isRepo
-                      ? "grid size-10 shrink-0 place-items-center rounded-lg border border-brand-line bg-brand-soft"
-                      : "grid size-10 shrink-0 place-items-center rounded-lg border border-neg/35 bg-neg-soft"
+                    !repo.pathExists
+                      ? "grid size-10 shrink-0 place-items-center rounded-lg border border-neg/35 bg-neg-soft"
+                      : repo.isRepo
+                        ? "grid size-10 shrink-0 place-items-center rounded-lg border border-brand-line bg-brand-soft"
+                        : "grid size-10 shrink-0 place-items-center rounded-lg border border-line bg-hover"
                   }
                 >
                   <GitBranch
-                    className={repo.isRepo ? "size-5 text-brand" : "size-5 text-neg"}
+                    className={
+                      !repo.pathExists
+                        ? "size-5 text-neg"
+                        : repo.isRepo
+                          ? "size-5 text-brand"
+                          : "size-5 text-ink-dim"
+                    }
                     strokeWidth={1.75}
                   />
                 </span>
@@ -177,13 +257,15 @@ export default function ReposPage() {
                     <h3 className="truncate text-[14px] font-semibold tracking-tight text-ink">
                       {repo.name}
                     </h3>
-                    {repo.isRepo ? (
+                    {!repo.pathExists ? (
+                      <Badge kind="red">{t("repos.pathUnavailable")}</Badge>
+                    ) : repo.isRepo ? (
                       <Badge kind="brand">{repo.currentBranch}</Badge>
                     ) : (
-                      <Badge kind="red">路径不可用</Badge>
+                      <Badge kind="gray">{t("repos.notRepo")}</Badge>
                     )}
                     {repo.changeCount > 0 && (
-                      <Badge kind="amber">{repo.changeCount} 个变动</Badge>
+                      <Badge kind="amber">{t("repos.changeCount", { count: repo.changeCount })}</Badge>
                     )}
                   </div>
                   <p
@@ -191,6 +273,21 @@ export default function ReposPage() {
                     title={repo.path}
                   >
                     {shortPath(repo.path, 64)}
+                  </p>
+                  <p className="mt-1 flex min-w-0 items-center gap-1.5 text-[11px]">
+                    {repo.remote ? (
+                      <span className="truncate font-mono text-ink-dim" title={repo.remote}>
+                        {repo.remote}
+                      </span>
+                    ) : (
+                      <span className="text-ink-faint">
+                        {!repo.pathExists
+                          ? t("repos.pathUnavailable")
+                          : repo.isRepo
+                            ? t("repos.noRemote")
+                            : t("repos.notRepo")}
+                      </span>
+                    )}
                   </p>
                 </div>
                 <div
@@ -200,16 +297,25 @@ export default function ReposPage() {
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="在文件管理器中打开"
+                    title={t("repos.revealInFileManager")}
                     onClick={() =>
                       void api.revealPath(repo.path).catch((e) => toast("error", String(e)))
                     }
                     icon={<FolderOpen className="size-3.5" />}
                   />
+                  {repo.pathExists && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      title={repo.remote ? t("remoteModal.editTitle") : t("remoteModal.bindTitle")}
+                      onClick={() => setRemoteRepo(repo)}
+                      icon={<Link2 className="size-3.5" />}
+                    />
+                  )}
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="重命名"
+                    title={t("repos.rename")}
                     className="opacity-0 group-hover:opacity-100"
                     onClick={() => {
                       setRenaming(repo);
@@ -220,7 +326,7 @@ export default function ReposPage() {
                   <Button
                     size="sm"
                     variant="ghost"
-                    title="移除"
+                    title={t("repos.remove")}
                     className="text-neg opacity-0 hover:bg-neg-soft hover:text-neg group-hover:opacity-100"
                     onClick={() => setRemoving(repo)}
                     icon={<Trash2 className="size-3.5" />}
@@ -237,17 +343,19 @@ export default function ReposPage() {
 
       <Modal
         open={!!renaming}
-        onClose={() => setRenaming(null)}
-        title="重命名仓库"
+        onClose={() => {
+          if (!busy) setRenaming(null);
+        }}
+        title={t("repos.renameTitle")}
         subtitle={renaming?.path}
         width="max-w-md"
         footer={
           <>
-            <Button variant="secondary" onClick={() => setRenaming(null)}>
-              取消
+            <Button variant="secondary" disabled={busy} onClick={() => setRenaming(null)}>
+              {t("common.cancel")}
             </Button>
             <Button loading={busy} onClick={() => void handleRename()}>
-              保存
+              {t("common.save")}
             </Button>
           </>
         }
@@ -256,7 +364,7 @@ export default function ReposPage() {
           autoFocus
           value={renameValue}
           onChange={(event) => setRenameValue(event.target.value)}
-          placeholder="仓库显示名称"
+          placeholder={t("repos.renamePlaceholder")}
           onKeyDown={(event) => {
             if (event.key === "Enter") void handleRename();
           }}
@@ -267,18 +375,68 @@ export default function ReposPage() {
         open={!!removing}
         danger
         loading={busy}
-        title="移除仓库"
-        confirmText="移除"
+        title={t("repos.removeTitle")}
+        confirmText={t("repos.removeConfirmText")}
         description={
-          <span>
-            确定要移除仓库 <b className="text-ink">{removing?.name}</b> 吗？
-            <br />
-            只会从列表中移除，不会删除本地代码和部署记录。
-          </span>
+          <Trans
+            i18nKey="repos.removeDescription"
+            values={{ name: removing?.name }}
+            components={{ b: <b className="text-ink" />, br: <br /> }}
+          />
         }
         onCancel={() => setRemoving(null)}
         onConfirm={() => void handleRemove()}
       />
+
+      <BindRemoteModal
+        repo={remoteRepo}
+        onClose={() => setRemoteRepo(null)}
+        onSaved={() => void refreshRepos()}
+      />
+
+      <Modal
+        open={cloneOpen}
+        onClose={() => {
+          if (!cloning) setCloneOpen(false);
+        }}
+        title={t("repos.cloneTitle")}
+        subtitle={t("repos.cloneSubtitle")}
+        width="max-w-lg"
+        footer={
+          <>
+            <Button variant="secondary" disabled={cloning} onClick={() => setCloneOpen(false)}>
+              {t("common.cancel")}
+            </Button>
+            <Button loading={cloning} onClick={() => void handleClone()}>
+              {t("repos.cloneConfirmText")}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-4">
+          <Field label={t("repos.gitUrl")} required hint={t("repos.gitUrlHint")}>
+            <Input
+              autoFocus
+              value={cloneUrl}
+              onChange={(event) => setCloneUrl(event.target.value)}
+              placeholder="git@github.com:user/repo.git"
+            />
+          </Field>
+          <Field label={t("repos.cloneTo")} required hint={t("repos.cloneToHint")}>
+            <div className="flex items-center gap-2">
+              <Input
+                value={cloneDir}
+                onChange={(event) => setCloneDir(event.target.value)}
+                placeholder={t("repos.cloneDirPlaceholder")}
+              />
+              <Button variant="secondary" onClick={() => void pickCloneDir()}>
+                {t("repos.select")}
+              </Button>
+            </div>
+          </Field>
+          <p className="text-[11px] leading-relaxed text-ink-faint">{t("repos.cloneNote")}</p>
+        </div>
+      </Modal>
     </Page>
   );
 }

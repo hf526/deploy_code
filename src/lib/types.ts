@@ -20,6 +20,15 @@ export interface BackupTarget {
   url: string;
 }
 
+export interface BackupConfig {
+  id: string;
+  name: string;
+  serverId: string;
+  source: DbBackupSource;
+  targetId: string | null;
+  supabaseUrl: string | null;
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -34,16 +43,23 @@ export interface ServerConfig {
   createdAt: string;
 }
 
+export interface EnvFileConfig {
+  localPath: string;
+  remotePath: string;
+}
+
 export interface RepoInfo {
   id: string;
   name: string;
   path: string;
+  pathExists: boolean;
   isRepo: boolean;
   currentBranch: string;
   remote: string | null;
   changeCount: number;
   defaultServerId: string | null;
   defaultTargetDir: string;
+  envFiles: EnvFileConfig[];
 }
 
 export interface Branch {
@@ -145,8 +161,9 @@ export interface DeployRecord {
   serverName: string;
   targetDir: string;
   scriptDir: string;
-  script: string | null;
+  scripts: string[];
   runScripts: boolean;
+  envFiles: EnvFileConfig[];
   status: DeployStatus;
   error: string | null;
   log: string;
@@ -162,7 +179,8 @@ export interface DeployRequest {
   targetDir: string;
   runScripts: boolean;
   scriptDir: string;
-  script: string | null;
+  scripts: string[];
+  uploadEnv: boolean;
 }
 
 export interface Settings {
@@ -178,7 +196,9 @@ export interface Settings {
   backupTimeoutSecs: number;
   cloudflareApiToken: string;
   cloudflareAccountId: string;
+  githubToken: string;
   pagesHistoryLimit: number;
+  language: string;
 }
 
 export type DeployEvent =
@@ -219,6 +239,8 @@ export interface BackupRecord {
 
 export interface BackupRequest {
   serverId: string;
+  backupConfigId?: string | null;
+  source?: DbBackupSource | null;
   targetId?: string | null;
   supabaseUrl?: string | null;
   database?: string | null;
@@ -239,15 +261,20 @@ export interface LiveBackup {
   record: BackupRecord | null;
 }
 
+export type PagesProvider = "cloudflare" | "github";
+
 export interface PagesConfig {
+  provider: PagesProvider;
   projectName: string;
   buildCommand: string;
   outputDir: string;
   branch: string;
+  publishBranch: string;
 }
 
 export interface PagesDeployRecord {
   id: string;
+  provider: PagesProvider;
   repoId: string;
   repoName: string;
   projectName: string;
@@ -265,10 +292,12 @@ export interface PagesDeployRecord {
 
 export interface PagesRequest {
   repoId: string;
+  provider?: PagesProvider | null;
   projectName?: string | null;
   buildCommand?: string | null;
   outputDir?: string | null;
   branch?: string | null;
+  publishBranch?: string | null;
   skipBuild: boolean;
 }
 

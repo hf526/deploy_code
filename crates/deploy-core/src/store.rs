@@ -6,8 +6,8 @@ use directories::ProjectDirs;
 
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, AppConfig, BackupRecord, DeployRecord, DeployStatus, PagesDeployRecord, RepoConfig,
-    ServerConfig,
+    now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployRecord, DeployStatus,
+    PagesDeployRecord, RepoConfig, ServerConfig,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -313,11 +313,13 @@ impl Store {
 
     /// 启动时把上次异常退出（崩溃/强杀）遗留的 Running 记录收敛为失败，
     /// 避免历史里永远显示"进行中"且无法重新部署。
+    /// 全程持有写守卫，防止与并发写（如 CLI 完成任务）互相覆盖。
     pub fn mark_interrupted(&self) -> Result<usize> {
+        let _guard = self.write_guard()?;
         let message = "任务被中断（应用退出或崩溃）";
         let mut converted = 0usize;
 
-        let mut history = self.load_history()?;
+        let mut history = load_history(&self.history_path())?;
         let mut touched = false;
         for record in history.iter_mut() {
             if record.status == DeployStatus::Running {
@@ -329,10 +331,10 @@ impl Store {
             }
         }
         if touched {
-            self.save_history(&history)?;
+            write_history(&self.history_path(), &history)?;
         }
 
-        let mut backups = self.load_backups()?;
+        let mut backups = load_backups(&self.backups_path())?;
         let mut touched = false;
         for record in backups.iter_mut() {
             if record.status == DeployStatus::Running {
@@ -344,10 +346,10 @@ impl Store {
             }
         }
         if touched {
-            self.save_backups(&backups)?;
+            write_backups(&self.backups_path(), &backups)?;
         }
 
-        let mut pages = self.load_pages_records()?;
+        let mut pages = load_pages_records(&self.pages_path())?;
         let mut touched = false;
         for record in pages.iter_mut() {
             if record.status == DeployStatus::Running {
@@ -359,10 +361,22 @@ impl Store {
             }
         }
         if touched {
-            self.save_pages_records(&pages)?;
+            write_pages_records(&self.pages_path(), &pages)?;
         }
 
         Ok(converted)
+    }
+
+    /// 仅当没有其他进程正在执行部署 / 备份 / Pages 任务时，才收敛遗留的 Running 记录。
+    /// GUI 启动和 CLI 启动共用，避免误伤正在运行的任务。
+    pub fn reconcile_interrupted(&self) -> Result<usize> {
+        let deploy = self.try_task_lock("deploy")?;
+        let backup = self.try_task_lock("backup")?;
+        let pages = self.try_task_lock("pages")?;
+        if deploy.is_none() || backup.is_none() || pages.is_none() {
+            return Ok(0);
+        }
+        self.mark_interrupted()
     }
 
     /// 按 id / 名称 / 路径查找仓库。
@@ -372,6 +386,15 @@ impl Store {
             .iter()
             .find(|r| r.id == key || r.name == key || paths_equal(&r.path, key))
             .ok_or_else(|| CoreError::not_found(format!("仓库不存在: {key}")))
+    }
+
+    /// 按 id / 名称查找备份配置。
+    pub fn find_backup_config<'a>(config: &'a AppConfig, key: &str) -> Result<&'a BackupConfig> {
+        config
+            .backup_configs
+            .iter()
+            .find(|item| item.id == key || item.name == key)
+            .ok_or_else(|| CoreError::not_found(format!("备份配置不存在: {key}")))
     }
 
     /// 按 id / 名称 / host 查找服务器。
@@ -389,6 +412,71 @@ impl Store {
             None => config.servers.push(server),
         }
         Ok(())
+    }
+
+    /// 把旧版「每台服务器一份 db_backup」迁移为全局备份配置（只执行一次）。
+    /// 返回本次新建的配置数量。
+    pub fn migrate_backup_configs(&self) -> Result<usize> {
+        if self.load_config()?.backup_configs_migrated {
+            return Ok(0);
+        }
+        self.mutate_config(|config| {
+            if config.backup_configs_migrated {
+                return Ok(0);
+            }
+            let mut additions: Vec<BackupConfig> = Vec::new();
+            for server in &config.servers {
+                let Some(source) = server.db_backup.clone() else {
+                    continue;
+                };
+                if config
+                    .backup_configs
+                    .iter()
+                    .chain(additions.iter())
+                    .any(|item| item.server_id == server.id)
+                {
+                    continue;
+                }
+                let mut name = server.name.trim().to_string();
+                if name.is_empty() {
+                    name = format!("{}@{}", server.username, server.host);
+                }
+                if config
+                    .backup_configs
+                    .iter()
+                    .chain(additions.iter())
+                    .any(|item| item.name == name)
+                {
+                    let base = name.clone();
+                    let mut index = 2;
+                    loop {
+                        let candidate = format!("{base} ({index})");
+                        if !config
+                            .backup_configs
+                            .iter()
+                            .chain(additions.iter())
+                            .any(|item| item.name == candidate)
+                        {
+                            name = candidate;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                additions.push(BackupConfig {
+                    id: new_id(),
+                    name,
+                    server_id: server.id.clone(),
+                    source,
+                    target_id: server.backup_target_id.clone(),
+                    supabase_url: server.supabase_url.clone(),
+                });
+            }
+            let created = additions.len();
+            config.backup_configs.extend(additions);
+            config.backup_configs_migrated = true;
+            Ok(created)
+        })
     }
 }
 
@@ -514,6 +602,41 @@ mod tests {
     use super::*;
 
     #[test]
+    fn reconcile_interrupted_skips_when_task_lock_held() {
+        let dir = std::env::temp_dir()
+            .join(format!("deploycode-store-reconcile-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        let record: DeployRecord = serde_json::from_str(
+            r#"{
+                "id":"r1","repoId":"repo","repoName":"demo","rev":"main","branch":"main",
+                "commit":"abc","commitShort":"abc","commitSubject":"init","serverId":"srv",
+                "serverName":"prod","targetDir":"/srv/app","scriptDir":"docker","scripts":[],
+                "runScripts":false,"envFiles":[],"status":"running","error":null,"log":"",
+                "startedAt":"2026-01-01 00:00:00","finishedAt":null,"durationMs":0
+            }"#,
+        )
+        .unwrap();
+        store.upsert_history(&record, 0).unwrap();
+
+        // 其他进程 / 任务仍在运行（持有任务锁）时不得收敛。
+        let held = store.try_task_lock("deploy").unwrap().unwrap();
+        assert_eq!(store.reconcile_interrupted().unwrap(), 0);
+        assert_eq!(
+            store.load_history().unwrap()[0].status,
+            DeployStatus::Running
+        );
+        drop(held);
+
+        // 三种任务锁都空闲时才把遗留的 Running 记录收敛为失败。
+        assert_eq!(store.reconcile_interrupted().unwrap(), 1);
+        assert_eq!(
+            store.load_history().unwrap()[0].status,
+            DeployStatus::Failed
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn try_task_lock_excludes_concurrent_holders() {
         let dir =
             std::env::temp_dir().join(format!("deploycode-store-lock-{}", uuid::Uuid::new_v4()));
@@ -545,6 +668,66 @@ mod tests {
             "postgresql://u@h/db"
         );
         assert!(dir.join("locks").join("store.lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_backup_configs_copies_server_sources_once() {
+        use crate::models::{DbBackupSource, SshAuth};
+
+        fn server(name: &str, host: &str) -> ServerConfig {
+            let mut server = ServerConfig::new(
+                name.to_string(),
+                host.to_string(),
+                "u".to_string(),
+                SshAuth::Password {
+                    password: "x".to_string(),
+                },
+            );
+            server.db_backup = Some(DbBackupSource {
+                mode: "docker".to_string(),
+                container: "postgres".to_string(),
+                database: "app".to_string(),
+                username: "postgres".to_string(),
+                password: "p".to_string(),
+                schema: "public".to_string(),
+            });
+            server
+        }
+
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-store-migrate-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        let mut config = AppConfig::default();
+        let mut first = server("prod", "h1");
+        first.backup_target_id = Some("t1".to_string());
+        first.supabase_url = Some("postgresql://legacy@h/db".to_string());
+        config.servers.push(first);
+        // 同名服务器迁移时要生成不冲突的配置名。
+        config.servers.push(server("prod", "h2"));
+        store.save_config(&config).unwrap();
+
+        assert_eq!(store.migrate_backup_configs().unwrap(), 2);
+        let saved = store.load_config().unwrap();
+        assert!(saved.backup_configs_migrated);
+        assert_eq!(saved.backup_configs.len(), 2);
+        assert_eq!(saved.backup_configs[0].name, "prod");
+        assert_eq!(saved.backup_configs[1].name, "prod (2)");
+        assert_eq!(saved.backup_configs[0].source.database, "app");
+        assert_eq!(saved.backup_configs[0].target_id.as_deref(), Some("t1"));
+        assert_eq!(
+            saved.backup_configs[0].supabase_url.as_deref(),
+            Some("postgresql://legacy@h/db")
+        );
+
+        // 只迁移一次：即使配置被删除也不会在下次启动时重建。
+        let removed_id = saved.backup_configs[0].id.clone();
+        let mut pruned = saved;
+        pruned.backup_configs.retain(|item| item.id != removed_id);
+        store.save_config(&pruned).unwrap();
+        assert_eq!(store.migrate_backup_configs().unwrap(), 0);
+        assert_eq!(store.load_config().unwrap().backup_configs.len(), 1);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

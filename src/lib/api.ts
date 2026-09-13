@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  BackupConfig,
   BackupRecord,
   BackupRequest,
   BackupTarget,
@@ -8,6 +9,7 @@ import type {
   Commit,
   DeployRecord,
   DeployRequest,
+  EnvFileConfig,
   FileContent,
   FileEntry,
   GraphCommit,
@@ -49,6 +51,12 @@ export const api = {
     defaultTargetDir?: string | null;
   }) => invoke<RepoInfo>("update_repo", args),
   removeRepo: (repoId: string) => invoke<void>("remove_repo", { repoId }),
+  cloneRepo: (args: { url: string; parentDir: string; name?: string | null }) =>
+    invoke<RepoInfo>("clone_repo", args),
+  setRepoRemote: (repoId: string, url: string) =>
+    invoke<RepoInfo>("set_repo_remote", { repoId, url }),
+  saveRepoEnvFiles: (repoId: string, envFiles: EnvFileConfig[]) =>
+    invoke<RepoInfo>("save_repo_env_files", { repoId, envFiles }),
 
   // Git
   watchRepo: (repoId: string, path: string) => invoke<void>("watch_repo", { repoId, path }),
@@ -81,8 +89,9 @@ export const api = {
     paths: string[],
     caseSensitive: boolean,
   ) => invoke<ReplaceSummary>("replace_content", { repoId, search, replacement, paths, caseSensitive }),
-  commitChanges: (repoId: string, message: string) =>
-    invoke<string>("commit_changes", { repoId, message }),
+  commitChanges: (repoId: string, message: string, allowSensitive: boolean) =>
+    invoke<string>("commit_changes", { repoId, message, allowSensitive }),
+  sensitiveChanges: (repoId: string) => invoke<string[]>("sensitive_changes", { repoId }),
   resetHard: (repoId: string, rev: string) => invoke<string>("reset_hard", { repoId, rev }),
   fetchRepo: (repoId: string) => invoke<string>("fetch_repo", { repoId }),
   pullRepo: (repoId: string) => invoke<string>("pull_repo", { repoId }),
@@ -129,6 +138,11 @@ export const api = {
   listBackupTargets: () => invoke<BackupTarget[]>("list_backup_targets"),
   saveBackupTargets: (targets: BackupTarget[]) =>
     invoke<BackupTarget[]>("save_backup_targets", { targets }),
+  listBackupConfigs: () => invoke<BackupConfig[]>("list_backup_configs"),
+  saveBackupConfig: (config: BackupConfig) =>
+    invoke<BackupConfig>("save_backup_config", { config }),
+  deleteBackupConfig: (configId: string) =>
+    invoke<boolean>("delete_backup_config", { configId }),
 
   // Cloudflare Pages
   startPagesDeploy: (request: PagesRequest) => invoke<string>("start_pages_deploy", { request }),

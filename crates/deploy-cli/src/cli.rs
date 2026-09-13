@@ -132,6 +132,9 @@ pub enum BranchCommand {
         /// 提交信息
         #[arg(short, long)]
         message: String,
+        /// 允许提交疑似敏感文件（.env / *.pem / id_rsa 等）
+        #[arg(long)]
+        allow_sensitive: bool,
     },
     /// 回退到指定版本（会丢弃工作区改动）
     Reset {
@@ -166,9 +169,9 @@ pub struct ServerAddArgs {
     /// 主机地址
     #[arg(long)]
     pub host: String,
-    /// SSH 端口
-    #[arg(short, long, default_value_t = 22)]
-    pub port: u16,
+    /// SSH 端口（默认 22；更新已有服务器时省略则保留原值）
+    #[arg(short, long)]
+    pub port: Option<u16>,
     /// SSH 用户名
     #[arg(short, long)]
     pub user: String,
@@ -226,21 +229,27 @@ pub struct DeployArgs {
     /// 脚本目录（相对项目根目录）
     #[arg(long)]
     pub script_dir: Option<String>,
-    /// 只执行指定脚本（如 deploy.sh）
-    #[arg(long)]
-    pub script: Option<String>,
+    /// 只执行指定脚本（可重复或逗号分隔，按给定顺序执行）
+    #[arg(long, value_delimiter = ',')]
+    pub script: Vec<String>,
     /// 跳过脚本执行
     #[arg(long)]
     pub no_scripts: bool,
+    /// 跳过上传仓库配置的环境文件（默认会在解压后替换）
+    #[arg(long)]
+    pub no_env: bool,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum BackupCommand {
     /// 执行一次备份（pg_dump -> 全量覆盖到目标数据库）
     Run {
-        /// 服务器 id / 名称 / host
-        server: String,
-        /// 备份目标 id / 名称（默认使用服务器或全局默认目标）
+        /// 服务器 id / 名称 / host（使用 --config 时可省略）
+        server: Option<String>,
+        /// 已保存的备份配置 id / 名称（服务器、来源与目标取自配置）
+        #[arg(short, long)]
+        config: Option<String>,
+        /// 备份目标 id / 名称（默认使用配置、服务器或全局默认目标）
         #[arg(short, long)]
         target: Option<String>,
         /// 直接指定目标连接串（优先级最高）
@@ -253,6 +262,9 @@ pub enum BackupCommand {
         #[arg(long)]
         schema: Option<String>,
     },
+    /// 管理保存的备份配置（名称 + 服务器 + 来源 + 目标）
+    #[command(subcommand)]
+    Config(BackupConfigCommand),
     /// 管理备份目标（Supabase / Aiven / Neon 等）
     #[command(subcommand)]
     Target(TargetCommand),
@@ -274,7 +286,59 @@ pub enum BackupCommand {
         yes: bool,
     },
     /// 检查备份环境（pg_dump 与目标连通性）
-    Test { server: String },
+    Test {
+        /// 服务器 id / 名称 / host（使用 --config 时可省略）
+        server: Option<String>,
+        /// 已保存的备份配置 id / 名称
+        #[arg(short, long)]
+        config: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum BackupConfigCommand {
+    /// 添加或更新备份配置
+    Add(BackupConfigAddArgs),
+    /// 列出备份配置
+    List,
+    /// 删除备份配置
+    Remove {
+        /// 配置 id / 名称
+        config: String,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct BackupConfigAddArgs {
+    /// 配置名称（已存在时更新该配置）
+    pub name: String,
+    /// 服务器 id / 名称 / host
+    #[arg(short, long)]
+    pub server: String,
+    /// 采集方式：docker / system
+    #[arg(long)]
+    pub mode: Option<String>,
+    /// 数据库所在容器名（docker 模式）
+    #[arg(long)]
+    pub container: Option<String>,
+    /// 数据库名
+    #[arg(long)]
+    pub database: Option<String>,
+    /// 数据库用户名
+    #[arg(long)]
+    pub username: Option<String>,
+    /// 数据库密码
+    #[arg(long)]
+    pub password: Option<String>,
+    /// 备份的 schema（默认 public）
+    #[arg(long)]
+    pub schema: Option<String>,
+    /// 备份目标 id / 名称（默认使用服务器或全局默认目标）
+    #[arg(short, long)]
+    pub target: Option<String>,
+    /// 直接指定目标连接串（优先级最高）
+    #[arg(long)]
+    pub supabase_url: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -298,6 +362,9 @@ pub enum PagesCommand {
     Config {
         /// 仓库 id / 名称 / 路径
         repo: String,
+        /// 部署平台：cloudflare（默认）或 github
+        #[arg(long)]
+        provider: Option<String>,
         /// Cloudflare Pages 项目名
         #[arg(short, long)]
         project: Option<String>,
@@ -307,14 +374,20 @@ pub enum PagesCommand {
         /// 输出目录（默认 dist）
         #[arg(short, long)]
         output: Option<String>,
-        /// 生产分支（默认 main）
+        /// Cloudflare 生产分支（默认 main）
         #[arg(long)]
         branch: Option<String>,
+        /// GitHub Pages 发布分支（默认 gh-pages）
+        #[arg(long)]
+        publish_branch: Option<String>,
     },
-    /// 构建并部署到 Cloudflare Pages
+    /// 构建并部署到 Pages（Cloudflare / GitHub）
     Run {
         /// 仓库 id / 名称 / 路径
         repo: String,
+        /// 覆盖部署平台（cloudflare / github）
+        #[arg(long)]
+        provider: Option<String>,
         /// 覆盖项目名
         #[arg(short, long)]
         project: Option<String>,
@@ -327,6 +400,9 @@ pub enum PagesCommand {
         /// 覆盖分支
         #[arg(long)]
         branch: Option<String>,
+        /// 覆盖 GitHub Pages 发布分支
+        #[arg(long)]
+        publish_branch: Option<String>,
         /// 跳过构建，直接上传现有产物
         #[arg(long)]
         skip_build: bool,

@@ -1,22 +1,25 @@
 import { Cloud, Database, FolderOpen, GitBranch, History, Rocket, Server, Settings } from "lucide-react";
+import { useTranslation } from "react-i18next";
 import { NavLink, useNavigate } from "react-router-dom";
 
 import { openRepoFolder } from "../lib/openRepo";
 import { useApp } from "../lib/store";
+import { runGuarded } from "../lib/unsavedGuard";
 import { cn } from "../lib/utils";
 import { ThemeToggle } from "./ThemeToggle";
 
 const NAV_ITEMS = [
-  { to: "/repos", label: "仓库", icon: GitBranch },
-  { to: "/deploy", label: "部署", icon: Rocket },
-  { to: "/pages", label: "Pages", icon: Cloud },
-  { to: "/servers", label: "服务器", icon: Server },
-  { to: "/backups", label: "备份", icon: Database },
-  { to: "/history", label: "记录", icon: History },
-  { to: "/settings", label: "设置", icon: Settings },
+  { to: "/repos", labelKey: "nav.repos", icon: GitBranch },
+  { to: "/deploy", labelKey: "nav.deploy", icon: Rocket },
+  { to: "/pages", labelKey: "nav.pages", icon: Cloud },
+  { to: "/servers", labelKey: "nav.servers", icon: Server },
+  { to: "/backups", labelKey: "nav.backups", icon: Database },
+  { to: "/history", labelKey: "nav.history", icon: History },
+  { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];
 
 export function Sidebar() {
+  const { t } = useTranslation();
   const liveRunning = useApp((state) => state.live?.status === "running");
   const backupRunning = useApp((state) => state.liveBackup?.status === "running");
   const pagesRunning = useApp((state) => state.livePages?.status === "running");
@@ -31,18 +34,23 @@ export function Sidebar() {
           className="ui-btn ui-btn-primary flex h-9 w-full items-center justify-center gap-2 rounded-md text-[13px] font-medium"
         >
           <FolderOpen className="size-4 shrink-0" />
-          打开仓库
+          {t("nav.openRepo")}
         </button>
       </div>
 
       <nav className="flex flex-1 flex-col gap-0.5 px-3">
         <p className="px-2.5 pt-3 pb-1 text-[10.5px] font-medium tracking-widest text-ink-faint select-none">
-          导航
+          {t("nav.section")}
         </p>
         {NAV_ITEMS.map((item) => (
           <NavLink
             key={item.to}
             to={item.to}
+            onClick={(event) => {
+              // 离开当前页面可能丢弃编辑器草稿，统一走未保存守卫。
+              event.preventDefault();
+              runGuarded(() => navigate(item.to));
+            }}
             className={({ isActive }) =>
               cn(
                 "ui-nav-item flex h-8 items-center gap-2.5 px-2.5 text-[13px] font-medium",
@@ -51,7 +59,7 @@ export function Sidebar() {
             }
           >
             <item.icon className="size-4" />
-            <span>{item.label}</span>
+            <span>{t(item.labelKey)}</span>
             {item.to === "/deploy" && liveRunning && (
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}

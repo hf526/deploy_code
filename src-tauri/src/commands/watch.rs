@@ -7,7 +7,7 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, State};
 
-use crate::state::AppState;
+use crate::state::{AppState, WatchedRepo};
 use deploy_core::{CoreError, Result, Store};
 
 const EVENT_NAME: &str = "repo://fs-changed";
@@ -56,8 +56,12 @@ pub fn watch_repo(
         .watchers
         .lock()
         .map_err(|_| CoreError::git("监听器状态异常"))?;
-    if watchers.contains_key(&repo_id) {
-        return Ok(());
+    // 同一仓库已按相同路径监听时无需重建；路径变化（重新绑定/目录重建）时必须替换，
+    // 否则会一直监听旧目录，新目录的变更收不到。
+    if let Some(existing) = watchers.get(&repo_id) {
+        if existing.path == root {
+            return Ok(());
+        }
     }
 
     let (tx, rx) = mpsc::channel::<()>();
@@ -95,16 +99,25 @@ pub fn watch_repo(
         let _ = app.emit(EVENT_NAME, FsChanged { repo_id: id.clone() });
     });
 
-    watchers.insert(repo_id, watcher);
+    // 替换旧 watcher（drop 旧值会自动停止旧目录的监听）。
+    watchers.insert(
+        repo_id,
+        WatchedRepo {
+            path: root,
+            watcher,
+        },
+    );
     Ok(())
 }
 
 /// 停止监听（watcher 移除后，去抖线程随通道关闭自动退出）。
 #[tauri::command]
 pub fn unwatch_repo(state: State<AppState>, repo_id: String) -> Result<()> {
-    if let Ok(mut watchers) = state.watchers.lock() {
-        watchers.remove(&repo_id);
-    }
+    state
+        .watchers
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&repo_id);
     Ok(())
 }
 

@@ -121,7 +121,15 @@ pub async fn collect(server: &ServerConfig, connect_timeout_secs: u64) -> Result
     let client = SshClient::connect(server, connect_timeout_secs).await?;
     let result = client.exec_capture(SCAN_SCRIPT, 60).await;
     client.disconnect().await;
-    let (_, output) = result?;
+    let (code, output) = result?;
+    // 脚本正常结束时最后一条 echo 返回 0；非 0 说明中途失败，避免把残缺报告当成功展示。
+    if code > 0 {
+        let clean = clean_output(&output);
+        return Err(CoreError::ssh(format!(
+            "安全扫描脚本执行失败（退出码 {code}）：{}",
+            if clean.is_empty() { "无输出" } else { clean.as_str() }
+        )));
+    }
     Ok(parse_report(&output))
 }
 
@@ -204,23 +212,29 @@ failed() {
 
 blocked_ips() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw status 2>/dev/null | grep -i deny | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
+    ufw status 2>/dev/null | grep -i deny | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
   elif command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --list-rich-rules 2>/dev/null | grep -oE 'address="[^"]+"' | cut -d'"' -f2
   else
-    iptables -S INPUT 2>/dev/null | grep -Ei 'DROP|REJECT' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}'
+    { iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null; } | grep -Ei 'DROP|REJECT' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
   fi
 }
 
 block() {
   ip=$1
+  case "$ip" in
+    *:*) family=ipv6 ;;
+    *) family=ipv4 ;;
+  esac
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw deny from $ip >/dev/null 2>&1
+    ufw deny from "$ip" >/dev/null 2>&1
   elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address=$ip drop" >/dev/null 2>&1
-    firewall-cmd --reload >/dev/null 2>&1
+    firewall-cmd --permanent --add-rich-rule="rule family=$family source address=$ip drop" >/dev/null 2>&1 &&
+      firewall-cmd --reload >/dev/null 2>&1
+  elif [ "$family" = "ipv6" ] && command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
   else
-    iptables -I INPUT -s $ip -j DROP >/dev/null 2>&1
+    iptables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
   fi
 }
 
@@ -228,8 +242,11 @@ BLOCKED=$(blocked_ips)
 failed | grep -oE 'from [0-9a-fA-F:.]+' | awk '{print $2}' | sort | uniq -c | while read count ip; do
   [ "${count}" -ge "${THRESHOLD}" ] 2>/dev/null || continue
   echo "$BLOCKED" | grep -qxF "$ip" && continue
-  block "$ip"
-  echo "$(date '+%F %T') blocked $ip after ${count} failed logins" >> "$LOG"
+  if block "$ip"; then
+    echo "$(date '+%F %T') blocked $ip after ${count} failed logins" >> "$LOG"
+  else
+    echo "$(date '+%F %T') FAILED to block $ip after ${count} failed logins" >> "$LOG"
+  fi
 done
 "#;
 
@@ -408,7 +425,8 @@ fn parse_report(output: &str) -> SecurityReport {
         match section {
             "f2b" => {
                 if let Some(idx) = line.to_ascii_lowercase().find("banned ip list") {
-                    for token in line[idx..].split([':', ' ', ',', '\t']) {
+                    // 不能按 ':' 切分：IPv6 地址本身含冒号。
+                    for token in line[idx..].split([' ', ',', '\t']) {
                         let token = token.trim();
                         if is_ip(token) && !blocked.iter().any(|b| b == token) {
                             blocked.push(token.to_string());
@@ -708,6 +726,16 @@ mod tests {
             find_ip("Failed password for root from 10.0.0.8 port 22"),
             Some("10.0.0.8".to_string())
         );
+    }
+
+    #[test]
+    fn parse_report_collects_ipv6_banned_ips() {
+        let report = parse_report(
+            "###FW ufw\n###F2B\nBanned IP list: 1.2.3.4 2001:db8::1,fe80::2%eth0\n###DONE\n",
+        );
+        assert!(report.blocked.iter().any(|ip| ip == "1.2.3.4"));
+        assert!(report.blocked.iter().any(|ip| ip == "2001:db8::1"));
+        assert!(report.blocked.iter().any(|ip| ip == "fe80::2%eth0"));
     }
 
     #[test]

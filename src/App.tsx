@@ -7,6 +7,7 @@ import { Sidebar } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/ui";
+import { applyLanguage } from "./lib/i18n";
 import { useApp } from "./lib/store";
 import type { BackupEvent, DeployEvent, PagesEvent } from "./lib/types";
 import BackupsPage from "./pages/BackupsPage";
@@ -57,6 +58,7 @@ function TabsAndRoutes() {
 
 export default function App() {
   const loadAll = useApp((state) => state.loadAll);
+  const settingsLanguage = useApp((state) => state.settings.language);
   const handleDeployEvent = useApp((state) => state.handleDeployEvent);
   const handleBackupEvent = useApp((state) => state.handleBackupEvent);
   const handlePagesEvent = useApp((state) => state.handlePagesEvent);
@@ -64,6 +66,10 @@ export default function App() {
   useEffect(() => {
     void loadAll();
   }, [loadAll]);
+
+  useEffect(() => {
+    applyLanguage(settingsLanguage);
+  }, [settingsLanguage]);
 
   useEffect(() => {
     let disposed = false;

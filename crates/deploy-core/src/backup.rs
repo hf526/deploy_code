@@ -15,7 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, BackupEvent, BackupRecord, BackupRequest, BackupTarget, DbBackupSource,
+    now_string, AppConfig, BackupEvent, BackupRecord, BackupRequest, BackupTarget, DbBackupSource,
     DeployStatus, LogLevel, ServerConfig, Settings,
 };
 use crate::process::shell_quote;
@@ -58,38 +58,16 @@ impl BackupEngine {
     /// 校验参数、解析来源与目标，并生成一条「运行中」的备份记录（写入历史）。
     pub fn prepare(&self, req: &BackupRequest) -> Result<PreparedBackup> {
         let config = self.store.load_config()?;
-        let server = Store::find_server(&config, &req.server_id)?.clone();
-
-        let mut source = normalize_source(
-            server
-                .db_backup
-                .clone()
-                .ok_or_else(|| CoreError::config("请先为该服务器配置数据库备份来源"))?,
-        )?;
-        if let Some(database) = non_empty(&req.database) {
-            source.database = database.to_string();
-        }
-        if let Some(schema) = non_empty(&req.schema) {
-            source.schema = schema.to_string();
-        }
-        validate_source(&source)?;
-
-        let target = resolve_target(
-            &config.backup_targets,
-            &server,
-            &config.settings,
-            &req.target_id,
-            &req.supabase_url,
-        )?;
+        let resolved = resolve_backup(&config, req)?;
 
         let record = BackupRecord {
             id: uuid::Uuid::new_v4().to_string(),
-            server_id: server.id.clone(),
-            server_name: server.name.clone(),
-            database: source.database.clone(),
-            schema: source.schema.clone(),
-            target_name: target.name.clone(),
-            target: mask_database_url(&target.url),
+            server_id: resolved.server.id.clone(),
+            server_name: resolved.server.name.clone(),
+            database: resolved.source.database.clone(),
+            schema: resolved.source.schema.clone(),
+            target_name: resolved.target.name.clone(),
+            target: mask_database_url(&resolved.target.url),
             status: DeployStatus::Running,
             error: None,
             log: String::new(),
@@ -102,8 +80,8 @@ impl BackupEngine {
             .upsert_backup(&record, config.settings.backup_history_limit)?;
         Ok(PreparedBackup {
             record,
-            source,
-            target: target.url,
+            source: resolved.source,
+            target: resolved.target.url,
         })
     }
 
@@ -307,9 +285,19 @@ impl BackupEngine {
             return Err(err);
         }
 
-        let (code, output) = client
+        let (code, output) = match client
             .exec_capture(&format!("chmod 700 {quoted}"), 30)
-            .await?;
+            .await
+        {
+            Ok(value) => value,
+            Err(err) => {
+                // 权限设置命令本身失败时也要删除含密码的远端脚本，避免残留。
+                let _ = client
+                    .exec_capture(&format!("rm -f {quoted}"), 15)
+                    .await;
+                return Err(err);
+            }
+        };
         if code != 0 {
             let _ = client
                 .exec_capture(&format!("rm -f {quoted}"), 15)
@@ -326,29 +314,10 @@ impl BackupEngine {
     /// 与真实备份使用同一套来源/目标解析优先级。
     pub async fn test(&self, req: &BackupRequest) -> Result<String> {
         let config = self.store.load_config()?;
-        let server = Store::find_server(&config, &req.server_id)?.clone();
-
-        let mut source = normalize_source(
-            server
-                .db_backup
-                .clone()
-                .ok_or_else(|| CoreError::config("请先为该服务器配置数据库备份来源"))?,
-        )?;
-        if let Some(database) = non_empty(&req.database) {
-            source.database = database.to_string();
-        }
-        if let Some(schema) = non_empty(&req.schema) {
-            source.schema = schema.to_string();
-        }
-        validate_source(&source)?;
-        let target = resolve_target(
-            &config.backup_targets,
-            &server,
-            &config.settings,
-            &req.target_id,
-            &req.supabase_url,
-        )?;
-        let (target_url, target_password) = split_database_url(&target.url)?;
+        let resolved = resolve_backup(&config, req)?;
+        let server = resolved.server;
+        let source = resolved.source;
+        let (target_url, target_password) = split_database_url(&resolved.target.url)?;
 
         let settings = &config.settings;
         let client = SshClient::connect(&server, settings.connect_timeout_secs).await?;
@@ -449,10 +418,78 @@ fn validate_source(source: &DbBackupSource) -> Result<()> {
     if source.username.is_empty() {
         return Err(CoreError::config("数据库用户名不能为空"));
     }
-    if source.schema.contains('"') || source.schema.contains('\0') {
-        return Err(CoreError::config("schema 名称包含非法字符"));
+    if source.schema.contains('"') || source.schema.chars().any(char::is_control) {
+        return Err(CoreError::config(
+            "schema 名称包含非法字符（不能含双引号或换行等控制字符）",
+        ));
+    }
+    // reset SQL 使用 $do$ 作为 dollar-quote 标签，schema 中出现同名标签会截断 DO 块。
+    if source.schema.contains("$do$") {
+        return Err(CoreError::config("schema 名称不能包含 $do$"));
     }
     Ok(())
+}
+
+/// 已解析的备份任务来源（服务器 + 来源 + 目标）。
+struct ResolvedBackup {
+    server: ServerConfig,
+    source: DbBackupSource,
+    target: ResolvedTarget,
+}
+
+/// 解析一次备份请求：
+/// - 指定了 `backup_config_id` 时，服务器 / 来源 / 目标取自保存的配置；
+/// - 否则沿用服务器上的旧版单份来源配置；
+/// - `source` 字段可直接覆盖来源（测试未保存的表单），`database` / `schema` 再覆盖对应字段。
+fn resolve_backup(config: &AppConfig, req: &BackupRequest) -> Result<ResolvedBackup> {
+    let (server, source, config_target_id, config_url) =
+        match non_empty(&req.backup_config_id) {
+            Some(key) => {
+                let saved = Store::find_backup_config(config, key)?;
+                (
+                    Store::find_server(config, &saved.server_id)?.clone(),
+                    req.source.clone().unwrap_or_else(|| saved.source.clone()),
+                    saved.target_id.clone(),
+                    saved.supabase_url.clone(),
+                )
+            }
+            None => {
+                let server = Store::find_server(config, &req.server_id)?.clone();
+                let source = req
+                    .source
+                    .clone()
+                    .or_else(|| server.db_backup.clone())
+                    .ok_or_else(|| CoreError::config("请先为该服务器配置数据库备份来源"))?;
+                (server, source, None, None)
+            }
+        };
+
+    let mut source = normalize_source(source)?;
+    if let Some(database) = non_empty(&req.database) {
+        source.database = database.to_string();
+    }
+    if let Some(schema) = non_empty(&req.schema) {
+        source.schema = schema.to_string();
+    }
+    validate_source(&source)?;
+
+    // 请求参数（连接串 / 目标）> 配置自身的覆盖目标 > 服务器 / 全局默认。
+    // 必须按来源区分：请求里显式指定的目标不能被配置里保存的连接串压过，反之亦然。
+    let target = resolve_target(
+        &config.backup_targets,
+        &server,
+        &config.settings,
+        &req.target_id,
+        &req.supabase_url,
+        &config_target_id,
+        &config_url,
+    )?;
+
+    Ok(ResolvedBackup {
+        server,
+        source,
+        target,
+    })
 }
 
 /// 已解析的备份目标。
@@ -462,22 +499,33 @@ struct ResolvedTarget {
 }
 
 /// 解析备份目标，优先级：
-/// 接口/命令行直接连接串 > 指定目标 > 服务器绑定目标 > 服务器自定义连接串 >
-/// 全局默认目标 > 旧版全局连接串。
+/// 请求直接连接串 > 请求指定目标 > 配置连接串 > 配置指定目标 >
+/// 服务器绑定目标 > 服务器自定义连接串 > 全局默认目标 > 旧版全局连接串。
 fn resolve_target(
     targets: &[BackupTarget],
     server: &ServerConfig,
     settings: &Settings,
-    target_id: &Option<String>,
-    override_url: &Option<String>,
+    request_target_id: &Option<String>,
+    request_url: &Option<String>,
+    config_target_id: &Option<String>,
+    config_url: &Option<String>,
 ) -> Result<ResolvedTarget> {
-    if let Some(url) = non_empty(override_url) {
+    if let Some(url) = non_empty(request_url) {
         return Ok(ResolvedTarget {
             name: "自定义连接串".to_string(),
             url: validate_target_url(url)?,
         });
     }
-    if let Some(key) = non_empty(target_id) {
+    if let Some(key) = non_empty(request_target_id) {
+        return find_target(targets, key);
+    }
+    if let Some(url) = non_empty(config_url) {
+        return Ok(ResolvedTarget {
+            name: "自定义连接串".to_string(),
+            url: validate_target_url(url)?,
+        });
+    }
+    if let Some(key) = non_empty(config_target_id) {
         return find_target(targets, key);
     }
     if let Some(key) = non_empty(&server.backup_target_id) {
@@ -532,26 +580,36 @@ pub fn mask_database_url(url: &str) -> String {
     };
     let scheme = &url[..scheme_end];
     let rest = &url[scheme_end + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let authority = &rest[..authority_end];
-    let remainder = &rest[authority_end..];
 
-    // 以最后一个 '@' 作为 userinfo 与 host 的分界，避免未编码的 '@' 出现在密码里时把密码带出来。
-    let authority = match authority.rfind('@') {
+    // 用户信息分界：只在查询 / 片段之前找最后一个 '@'，避免把查询参数里的 '@' 当成 host 分界；
+    // 密码里可能出现未编码的 '/'，因此不能用第一个 '/' 截断 authority。
+    let query_limit = rest.find(['?', '#']).unwrap_or(rest.len());
+    let (authority_end, authority) = match rest[..query_limit].rfind('@') {
         Some(at) => {
-            let creds = &authority[..at];
-            let host = &authority[at + 1..];
+            let host_end = rest[at + 1..]
+                .find(['/', '?', '#'])
+                .map(|offset| at + 1 + offset)
+                .unwrap_or(rest.len());
+            let creds = &rest[..at];
             let user = creds.split(':').next().unwrap_or(creds);
-            if creds.contains(':') {
+            let host = &rest[at + 1..host_end];
+            let masked = if creds.contains(':') {
                 format!("{user}:***@{host}")
             } else {
                 format!("{user}@{host}")
-            }
+            };
+            (host_end, masked)
         }
-        None => authority.to_string(),
+        None => {
+            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+            (end, rest[..end].to_string())
+        }
     };
 
-    format!("{scheme}://{authority}{}", mask_query_password(remainder))
+    format!(
+        "{scheme}://{authority}{}",
+        mask_query_password(&rest[authority_end..])
+    )
 }
 
 /// 把查询串中的 `password=...` 值替换为 `***`，保留其他参数。
@@ -1053,6 +1111,16 @@ mod tests {
             mask_database_url("postgresql://u@host:5432/db?a=1&Password=secret#frag"),
             "postgresql://u@host:5432/db?a=1&Password=***#frag"
         );
+        // 密码含未编码 '/' 时也必须遮蔽（不能按第一个 '/' 截断 authority）。
+        assert_eq!(
+            mask_database_url("postgresql://user:p/ss@host:5432/db"),
+            "postgresql://user:***@host:5432/db"
+        );
+        // 查询参数里的 '@' 不应被当作 host 分界。
+        assert_eq!(
+            mask_database_url("postgresql://host/db?user=a@b&password=s@cret"),
+            "postgresql://host/db?user=a@b&password=***"
+        );
         assert_eq!(mask_database_url("not-a-url"), "not-a-url");
     }
 
@@ -1201,7 +1269,7 @@ mod tests {
             },
         );
         let mut settings = Settings::default();
-        assert!(resolve_target(&[], &server, &settings, &None, &None).is_err());
+        assert!(resolve_target(&[], &server, &settings, &None, &None, &None, &None).is_err());
 
         let targets = vec![
             BackupTarget::new("Aiven".to_string(), "postgresql://aiven@host/db".to_string()),
@@ -1210,44 +1278,85 @@ mod tests {
 
         // 全局旧连接串作为兜底。
         settings.supabase_url = "postgresql://legacy@host/db".to_string();
-        let resolved = resolve_target(&targets, &server, &settings, &None, &None).unwrap();
+        let resolved =
+            resolve_target(&targets, &server, &settings, &None, &None, &None, &None).unwrap();
         assert_eq!(resolved.url, "postgresql://legacy@host/db");
 
         // 全局默认目标优先于旧连接串。
         settings.default_backup_target_id = Some(targets[0].id.clone());
-        let resolved = resolve_target(&targets, &server, &settings, &None, &None).unwrap();
+        let resolved =
+            resolve_target(&targets, &server, &settings, &None, &None, &None, &None).unwrap();
         assert_eq!(resolved.name, "Aiven");
 
         // 服务器绑定目标优先于全局默认。
         server.backup_target_id = Some(targets[1].id.clone());
-        let resolved = resolve_target(&targets, &server, &settings, &None, &None).unwrap();
+        let resolved =
+            resolve_target(&targets, &server, &settings, &None, &None, &None, &None).unwrap();
         assert_eq!(resolved.name, "Neon");
 
-        // 指定目标（可用名称匹配）优先于服务器绑定。
+        // 请求指定目标（可用名称匹配）优先于服务器绑定。
         let resolved = resolve_target(
             &targets,
             &server,
             &settings,
             &Some("Aiven".to_string()),
             &None,
+            &None,
+            &None,
         )
         .unwrap();
         assert_eq!(resolved.name, "Aiven");
 
-        // 直接连接串优先级最高。
+        // 请求指定目标优先于配置自身的连接串（否则会被配置覆盖到错误的库）。
+        let resolved = resolve_target(
+            &targets,
+            &server,
+            &settings,
+            &Some("Aiven".to_string()),
+            &None,
+            &None,
+            &Some("postgresql://config@host/db".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved.name, "Aiven");
+
+        // 请求直接连接串优先级最高。
         let resolved = resolve_target(
             &targets,
             &server,
             &settings,
             &Some("Aiven".to_string()),
             &Some("postgresql://raw@host/db".to_string()),
+            &None,
+            &None,
         )
         .unwrap();
         assert_eq!(resolved.url, "postgresql://raw@host/db");
 
+        // 无请求参数时，配置连接串优先于配置目标。
+        let resolved = resolve_target(
+            &targets,
+            &server,
+            &settings,
+            &None,
+            &None,
+            &Some(targets[1].id.clone()),
+            &Some("postgresql://config@host/db".to_string()),
+        )
+        .unwrap();
+        assert_eq!(resolved.url, "postgresql://config@host/db");
+
         // 不存在的目标报错。
         assert!(matches!(
-            resolve_target(&targets, &server, &settings, &Some("missing".to_string()), &None),
+            resolve_target(
+                &targets,
+                &server,
+                &settings,
+                &Some("missing".to_string()),
+                &None,
+                &None,
+                &None
+            ),
             Err(CoreError::Config(_))
         ));
 
@@ -1258,9 +1367,126 @@ mod tests {
                 &server,
                 &settings,
                 &Some("mysql://x".to_string()),
+                &None,
+                &None,
                 &None
             ),
             Err(CoreError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn resolve_backup_uses_saved_config_then_request_overrides() {
+        use crate::models::{BackupConfig, SshAuth};
+
+        let server = ServerConfig::new(
+            "prod".to_string(),
+            "h".to_string(),
+            "u".to_string(),
+            SshAuth::Password {
+                password: "x".to_string(),
+            },
+        );
+        let mut config = AppConfig {
+            servers: vec![server.clone()],
+            ..AppConfig::default()
+        };
+        let targets = vec![BackupTarget::new(
+            "Aiven".to_string(),
+            "postgresql://aiven@host/db".to_string(),
+        )];
+        config.backup_targets = targets.clone();
+        let mut saved = BackupConfig::new(
+            "生产库".to_string(),
+            server.id.clone(),
+            DbBackupSource {
+                mode: "system".to_string(),
+                container: String::new(),
+                database: "app".to_string(),
+                username: "postgres".to_string(),
+                password: "p".to_string(),
+                schema: "app".to_string(),
+            },
+        );
+        saved.target_id = Some(config.backup_targets[0].id.clone());
+        config.backup_configs.push(saved.clone());
+
+        let request = BackupRequest {
+            // 使用配置时允许 server_id 留空（CLI 可只给 --config）。
+            server_id: String::new(),
+            backup_config_id: Some(saved.id.clone()),
+            source: None,
+            target_id: None,
+            supabase_url: None,
+            database: Some("override".to_string()),
+            schema: None,
+        };
+        let resolved = resolve_backup(&config, &request).unwrap();
+        assert_eq!(resolved.server.id, server.id);
+        assert_eq!(resolved.source.database, "override");
+        assert_eq!(resolved.source.mode, "system");
+        assert_eq!(resolved.target.name, "Aiven");
+
+        // 也可以在配置基础上直接覆盖来源（测试未保存的表单）。
+        let request = BackupRequest {
+            backup_config_id: Some(saved.id.clone()),
+            source: Some(source()),
+            database: None,
+            schema: None,
+            ..request
+        };
+        let resolved = resolve_backup(&config, &request).unwrap();
+        assert_eq!(resolved.source.mode, "docker");
+        assert_eq!(resolved.source.container, "postgres");
+        assert_eq!(resolved.source.database, "app");
+
+        // 配置里保存了自定义连接串时，请求显式指定的目标仍必须生效。
+        let mut with_url = config.clone();
+        with_url.backup_configs[0].supabase_url = Some("postgresql://saved@host/db".to_string());
+        with_url.backup_targets = vec![
+            BackupTarget::new("Aiven".to_string(), "postgresql://aiven@host/db".to_string()),
+            BackupTarget::new("Neon".to_string(), "postgresql://neon@host/db".to_string()),
+        ];
+        let neon = with_url.backup_targets[1].id.clone();
+        let request = BackupRequest {
+            server_id: String::new(),
+            backup_config_id: Some(saved.id.clone()),
+            source: None,
+            target_id: Some(neon),
+            supabase_url: None,
+            database: None,
+            schema: None,
+        };
+        let resolved = resolve_backup(&with_url, &request).unwrap();
+        assert_eq!(resolved.target.name, "Neon");
+
+        // 未指定配置且服务器没有来源时报错。
+        let empty = AppConfig {
+            servers: vec![server],
+            ..AppConfig::default()
+        };
+        let request = BackupRequest {
+            server_id: empty.servers[0].id.clone(),
+            backup_config_id: None,
+            source: None,
+            target_id: None,
+            supabase_url: None,
+            database: None,
+            schema: None,
+        };
+        assert!(matches!(
+            resolve_backup(&empty, &request),
+            Err(CoreError::Config(_))
+        ));
+
+        // 不存在的配置报错。
+        let request = BackupRequest {
+            backup_config_id: Some("missing".to_string()),
+            ..request
+        };
+        assert!(matches!(
+            resolve_backup(&config, &request),
+            Err(CoreError::NotFound(_))
         ));
     }
 }

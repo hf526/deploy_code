@@ -1,4 +1,5 @@
 import { GitBranch, Tag, Cloud } from "lucide-react";
+import { useTranslation } from "react-i18next";
 
 import { ROW_H, colX, laneColor, layoutGraph, rowY } from "../lib/graph";
 import type { GraphCommit, GraphRef } from "../lib/types";
@@ -31,6 +32,7 @@ export function CommitGraph({
   onCheckout,
   className,
 }: CommitGraphProps) {
+  const { t } = useTranslation();
   const layout = layoutGraph(commits);
   const { width, height, nodes, segments } = layout;
 
@@ -124,7 +126,7 @@ export function CommitGraph({
                       type="button"
                       disabled={!canCheckout || busy}
                       onClick={() => onCheckout?.(ref.name)}
-                      title={ref.kind === "remote" ? `检出 ${ref.name}` : ref.name}
+                      title={ref.kind === "remote" ? t("commitGraph.checkout", { name: ref.name }) : ref.name}
                       className={cn(
                         "inline-flex shrink-0 items-center gap-1 rounded border px-1.5 py-px text-[11px] font-medium transition",
                         wrapper,
