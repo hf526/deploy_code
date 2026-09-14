@@ -34,12 +34,15 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 
 `git archive` 打包 -> SFTP 上传 -> 远端解压 -> 执行脚本，全程实时日志：
 
-- 可选择分支 / 标签 / 提交进行部署
+- 可选择分支 / 标签 / 提交进行部署；版本留空则打包当前工作区（含未提交改动，遵循 `.gitignore`）
 - 部署方式可选「服务器」或「Pages」：选 Pages 时在部署页直接编辑该仓库的 Cloudflare / GitHub Pages 配置并一键构建发布，状态与日志同步切换
+- 原子发布（可选，设置中开启）：部署到「部署目录/releases/<版本>」，脚本成功后原子切换 `current` 软链；失败不影响线上版本，可在记录页一键回滚到任意历史版本
 - 环境文件替换：按仓库配置「本地文件 → 部署目录相对路径」（如 `.env`、`docker/.env`），解压后、执行脚本前上传覆盖，部署页可临时关闭
-- 上传进度显示；脚本超时或应用退出时终止远端脚本进程组（含子进程）
+- 上传进度显示；上传后比对本地 / 服务器 SHA-256，防止半包上线（服务器缺少校验工具时自动跳过）
+- 部署过程中可「停止部署」：中止本地任务并终止远端脚本进程组、清理残留压缩包
+- 脚本超时或应用退出时终止远端脚本进程组（含子进程）
 - 脚本目录默认 `docker/`，自动执行其中的 `.sh` 文件，并注入环境变量：
-  `DEPLOY_BRANCH` / `DEPLOY_REV` / `DEPLOY_COMMIT` / `DEPLOY_TARGET`
+  `DEPLOY_BRANCH` / `DEPLOY_REV` / `DEPLOY_COMMIT` / `DEPLOY_TARGET`（原子发布时 `DEPLOY_TARGET` 为版本目录，另有 `DEPLOY_RELEASE` 版本名与 `DEPLOY_CURRENT` 当前软链路径）
 - 支持只执行指定脚本，或跳过脚本执行
 - 部署记录持久化（版本、服务器、完整日志），可一键重新部署
 
@@ -175,6 +178,10 @@ deploy-code-cli repo add /path/to/myapp --name myapp --server prod --dir /opt/my
 deploy-code-cli branch list myapp --all
 deploy-code-cli deploy myapp --rev main
 deploy-code-cli history list -n 10
+
+# 原子发布的历史版本（需在设置中开启「原子发布」）
+deploy-code-cli release list prod --dir /opt/myapp
+deploy-code-cli release switch prod --dir /opt/myapp 20260914-153001-3b2424f-abc123
 
 # 数据库备份（服务器 PG -> Supabase / Aiven / Neon 等）
 deploy-code-cli backup target add Aiven "postgresql://user:password@host:5432/db"

@@ -1,5 +1,10 @@
-use deploy_core::models::{DeployRecord, DeployRequest};
-use deploy_core::{CoreError, DeployEngine, Result};
+use std::time::Duration;
+
+use deploy_core::models::{
+    elapsed_ms_since, now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus,
+    RemoteRelease,
+};
+use deploy_core::{release, CoreError, DeployEngine, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::{ActiveDeploy, AppState, ClaimGuard, ClaimKind, DeployTaskGuard};
@@ -77,7 +82,12 @@ pub fn redeploy(app: AppHandle, state: State<AppState>, record_id: String) -> Re
     let record = state.store.find_record(&record_id)?;
     let request = DeployRequest {
         repo_id: record.repo_id.clone(),
-        rev: record.commit.clone(),
+        // 工作区部署没有固定提交，重新部署时同样打包当前工作区。
+        rev: if record.worktree {
+            String::new()
+        } else {
+            record.commit.clone()
+        },
         server_id: record.server_id.clone(),
         target_dir: record.target_dir.clone(),
         run_scripts: record.run_scripts,
@@ -87,4 +97,98 @@ pub fn redeploy(app: AppHandle, state: State<AppState>, record_id: String) -> Re
     };
     let prepared = engine.prepare(&request)?;
     Ok(spawn_deploy(app, engine, prepared, request, claim))
+}
+
+/// 取消正在进行的部署：中止本地任务、清理远端脚本与临时包，并把记录收敛为「已取消」。
+#[tauri::command(async)]
+pub async fn cancel_deploy(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    record_id: String,
+) -> Result<String> {
+    let active = state
+        .take_deploy(&record_id)
+        .ok_or_else(|| CoreError::deploy("没有正在进行的部署（可能已完成）"))?;
+
+    // 中止本地任务：未来在下一处 await 退出，本地临时文件由 TempArchiveGuard 清理。
+    active.abort.abort();
+    // 留一点时间给任务退出，避免它与下面的记录写入互相覆盖。
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // 重连服务器终止远端脚本进程组并清理残留压缩包；清理失败不影响取消结果。
+    if let Ok(config) = state.store.load_config() {
+        if let Ok(server) = Store::find_server(&config, &active.server_id) {
+            let engine = state.engine();
+            let _ = tokio::time::timeout(
+                Duration::from_secs(15),
+                engine.cleanup_remote_script(server, &active.target_dir, &record_id, 5),
+            )
+            .await;
+        }
+    }
+
+    // 记录收敛为失败（已取消）；引擎任务被中止后不会再写这条记录。
+    // 记录可能已被手动删除（或读取失败）：此时不阻断取消流程，界面由命令成功返回收敛。
+    if let Ok(mut record) = state.store.find_record(&record_id) {
+        if record.status == DeployStatus::Running {
+            record.status = DeployStatus::Failed;
+            record.error = Some("部署已取消".to_string());
+            record.finished_at = Some(now_string());
+            record.duration_ms = elapsed_ms_since(&record.started_at);
+            record.log = format!("{}[已取消] 用户手动取消了本次部署\n", record.log);
+            let limit = state
+                .store
+                .load_config()
+                .map(|config| config.settings.history_limit)
+                .unwrap_or(500);
+            let _ = state.store.upsert_history(&record, limit);
+        }
+        // 通过 finished 事件让界面结束 running 状态并刷新历史。
+        let _ = app.emit("deploy://event", DeployEvent::Finished { record });
+    }
+    Ok("已取消".to_string())
+}
+
+/// 列出某个部署目录下的历史发布版本（原子发布）。
+#[tauri::command(async)]
+pub async fn list_releases(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_id: String,
+    target_dir: String,
+) -> Result<Vec<RemoteRelease>> {
+    // 与部署互斥：避免读到正在解压、尚未完成的版本目录。
+    let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
+        Some(claim) => claim,
+        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+    };
+    let config = state.store.load_config()?;
+    let server = Store::find_server(&config, &server_id)?.clone();
+    let releases =
+        release::list_releases(&server, &target_dir, config.settings.connect_timeout_secs).await;
+    drop(claim);
+    releases
+}
+
+/// 把 current 软链切换到指定历史版本。
+#[tauri::command(async)]
+pub async fn rollback_release(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    server_id: String,
+    target_dir: String,
+    release_name: String,
+) -> Result<String> {
+    // 与部署互斥：避免切换版本与正在进行的部署相互踩踏。
+    let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
+        Some(claim) => claim,
+        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+    };
+    let config = state.store.load_config()?;
+    let server = Store::find_server(&config, &server_id)?.clone();
+    let message =
+        release::switch_release(&server, &target_dir, &release_name, config.settings.connect_timeout_secs)
+            .await;
+    drop(claim);
+    message
 }

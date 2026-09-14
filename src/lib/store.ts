@@ -44,6 +44,8 @@ export const defaultSettings: Settings = {
   githubToken: "",
   pagesHistoryLimit: 200,
   language: "",
+  atomicRelease: false,
+  releaseKeep: 5,
 };
 
 let toastSeq = 0;
@@ -83,6 +85,7 @@ interface AppStore {
 
   startDeploy: (request: DeployRequest) => Promise<string>;
   redeploy: (recordId: string) => Promise<string>;
+  cancelDeploy: () => Promise<void>;
   handleDeployEvent: (event: DeployEvent) => void;
   clearLive: () => void;
 
@@ -321,6 +324,22 @@ export const useApp = create<AppStore>((set, get) => ({
       set({ live: null });
       get().toast("error", String(error));
       throw error;
+    }
+  },
+
+  cancelDeploy: async () => {
+    const { live } = get();
+    if (!live || live.status !== "running" || !live.recordId) return;
+    try {
+      await api.cancelDeploy(live.recordId);
+      // 后端会推送 finished 事件；这里先收敛状态，避免按钮停留在 running。
+      set((state) =>
+        state.live?.recordId === live.recordId
+          ? { live: { ...state.live, status: "failed", progress: 100 } }
+          : {},
+      );
+    } catch (error) {
+      get().toast("error", String(error));
     }
   },
 

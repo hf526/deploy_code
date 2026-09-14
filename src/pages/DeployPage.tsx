@@ -13,6 +13,7 @@ import {
   Rocket,
   Save,
   ShieldCheck,
+  Square,
   Terminal,
   Timer,
   X,
@@ -66,6 +67,7 @@ export default function DeployPage() {
   const live = useApp((state) => state.live);
   const startDeploy = useApp((state) => state.startDeploy);
   const redeploy = useApp((state) => state.redeploy);
+  const cancelDeploy = useApp((state) => state.cancelDeploy);
   const refreshRepos = useApp((state) => state.refreshRepos);
   const pagesRecords = useApp((state) => state.pagesRecords);
   const livePages = useApp((state) => state.livePages);
@@ -92,8 +94,10 @@ export default function DeployPage() {
   const [pagesReloadKey, setPagesReloadKey] = useState(0);
   const [skipBuild, setSkipBuild] = useState(false);
   const [savingPages, setSavingPages] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   const [branches, setBranches] = useState<Branch[]>([]);
+  const [branchesLoaded, setBranchesLoaded] = useState(false);
   const [resolved, setResolved] = useState<ResolvedRev | null>(null);
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
@@ -132,12 +136,21 @@ export default function DeployPage() {
   }, [repos, repoId]);
 
   useEffect(() => {
-    if (!repoId) return;
+    if (!repoId) {
+      setBranches([]);
+      setBranchesLoaded(false);
+      return;
+    }
     let cancelled = false;
+    setBranches([]);
+    setBranchesLoaded(false);
     void (async () => {
       try {
         const list = await api.listBranches(repoId, false);
-        if (!cancelled) setBranches(list);
+        if (!cancelled) {
+          setBranches(list);
+          setBranchesLoaded(true);
+        }
       } catch (error) {
         if (!cancelled) toast("error", String(error));
       }
@@ -146,6 +159,12 @@ export default function DeployPage() {
       cancelled = true;
     };
   }, [repoId, toast]);
+
+  // 仓库没有任何分支（如尚未提交的空仓库）时默认部署当前工作区，避免版本解析失败后无法部署。
+  useEffect(() => {
+    if (!repoId || !branchesLoaded || customRev) return;
+    if (branches.length === 0 && rev) setRev("");
+  }, [repoId, branchesLoaded, branches.length, customRev, rev]);
 
   // Pages 部署使用按仓库保存的配置，切换仓库时加载对应配置。
   useEffect(() => {
@@ -276,6 +295,12 @@ export default function DeployPage() {
     [branches, t],
   );
 
+  // 服务端部署的版本选项：额外提供「当前工作区」，留空表示不走分支直接打包本地目录。
+  const versionChoices = useMemo(
+    () => [{ value: "", label: t("deploy.worktreeOption") }, ...branchChoices],
+    [branchChoices, t],
+  );
+
   const selectedRepo = repos.find((item) => item.id === repoId);
   const selectedServer = servers.find((item) => item.id === serverId);
 
@@ -379,7 +404,6 @@ export default function DeployPage() {
 
   async function handleDeploy() {
     if (!repoId) return toast("error", t("deploy.errorRepo"));
-    if (!rev.trim()) return toast("error", t("deploy.errorRev"));
     if (!serverId) return toast("error", t("deploy.errorServer"));
     if (!targetDir.trim()) return toast("error", t("deploy.errorTargetDir"));
     if (resolveError) return toast("error", t("deploy.errorResolve"));
@@ -527,7 +551,6 @@ export default function DeployPage() {
               >
               <Field
                 label={t("deploy.revision")}
-                required
                 hint={resolving ? t("deploy.resolving") : resolved?.short}
               >
                 {customRev ? (
@@ -536,7 +559,7 @@ export default function DeployPage() {
                       <SearchSelect
                         value={rev}
                         onChange={setRev}
-                        options={branchChoices}
+                        options={versionChoices}
                         allowCustom
                         placeholder={t("deploy.branchOrCommit")}
                         disabled={running}
@@ -558,7 +581,7 @@ export default function DeployPage() {
                       <SearchSelect
                         value={rev}
                         onChange={setRev}
-                        options={branchChoices}
+                        options={versionChoices}
                         placeholder={t("deploy.branchPlaceholder")}
                         disabled={running}
                       />
@@ -567,6 +590,12 @@ export default function DeployPage() {
                       {t("deploy.specifyCommit")}
                     </Button>
                   </div>
+                )}
+                {!rev.trim() && !resolveError && (
+                  <p className="mt-2 flex items-start gap-1.5 text-[11px] text-ink-dim">
+                    <CircleDot className="mt-0.5 size-3 shrink-0 text-brand" />
+                    <span className="min-w-0">{t("deploy.worktreeNote")}</span>
+                  </p>
                 )}
                 {resolved && !resolveError && (
                   <p className="mt-2 flex items-start gap-1.5 text-[11px] text-ink-dim">
@@ -796,15 +825,39 @@ export default function DeployPage() {
                 )}
               </div>
 
-              <Button
-                size="lg"
-                loading={submitting || serverRunning}
-                disabled={!!resolveError}
-                icon={<Rocket className="size-4" />}
-                onClick={() => void handleDeploy()}
-              >
-                {serverRunning ? t("deploy.deploying") : t("deploy.startDeploy")}
-              </Button>
+              <div className="flex items-stretch gap-2">
+                <Button
+                  className="flex-1"
+                  size="lg"
+                  loading={submitting || serverRunning}
+                  disabled={!!resolveError}
+                  icon={<Rocket className="size-4" />}
+                  onClick={() => void handleDeploy()}
+                >
+                  {serverRunning ? t("deploy.deploying") : t("deploy.startDeploy")}
+                </Button>
+                {serverRunning && (
+                  <Button
+                    variant="secondary"
+                    size="lg"
+                    loading={cancelling}
+                    disabled={!live?.recordId}
+                    icon={<Square className="size-3.5" />}
+                    onClick={() => {
+                      setCancelling(true);
+                      void cancelDeploy().finally(() => setCancelling(false));
+                    }}
+                  >
+                    {t("deploy.cancel")}
+                  </Button>
+                )}
+              </div>
+
+              {settings.atomicRelease && (
+                <p className="text-center text-[11px] leading-relaxed text-ink-faint">
+                  {t("deploy.atomicHint")}
+                </p>
+              )}
 
               {selectedRepo && (
                 <p className="truncate text-center text-[11px] text-ink-faint" title={selectedRepo.path}>
@@ -834,6 +887,22 @@ export default function DeployPage() {
 
                   {isGitHubPages ? (
                     <>
+                      <Field
+                        label={t("pages.publishBranch")}
+                        hint={t("pages.publishBranchHint")}
+                      >
+                        <SearchSelect
+                          value={pagesDraft.publishBranch}
+                          onChange={(value) =>
+                            setPagesDraft({ ...pagesDraft, publishBranch: value })
+                          }
+                          options={branchChoices}
+                          allowCustom
+                          placeholder="gh-pages"
+                          disabled={running || !repoId || !pagesLoaded}
+                        />
+                      </Field>
+
                       <div className="rounded-md border border-line bg-sunken px-3 py-2 text-[11px] leading-relaxed">
                         {selectedRepo?.remote ? (
                           githubPreview ? (
@@ -877,33 +946,16 @@ export default function DeployPage() {
                         />
                       </Field>
 
-                      <div className="grid grid-cols-2 gap-4">
-                        <Field label={t("pages.outputDir")} required>
-                          <Input
-                            value={pagesDraft.outputDir}
-                            onChange={(event) =>
-                              setPagesDraft({ ...pagesDraft, outputDir: event.target.value })
-                            }
-                            placeholder="dist"
-                            disabled={running}
-                          />
-                        </Field>
-                        <Field
-                          label={t("pages.publishBranch")}
-                          hint={t("pages.publishBranchHint")}
-                        >
-                          <SearchSelect
-                            value={pagesDraft.publishBranch}
-                            onChange={(value) =>
-                              setPagesDraft({ ...pagesDraft, publishBranch: value })
-                            }
-                            options={branchChoices}
-                            allowCustom
-                            placeholder="gh-pages"
-                            disabled={running}
-                          />
-                        </Field>
-                      </div>
+                      <Field label={t("pages.outputDir")} required>
+                        <Input
+                          value={pagesDraft.outputDir}
+                          onChange={(event) =>
+                            setPagesDraft({ ...pagesDraft, outputDir: event.target.value })
+                          }
+                          placeholder="dist"
+                          disabled={running}
+                        />
+                      </Field>
 
                       {!githubPreview && (
                         <p className="text-[11px] leading-relaxed text-warn">
@@ -916,6 +968,16 @@ export default function DeployPage() {
                     </>
                   ) : (
                     <>
+                      <Field label={t("pages.branch")} hint={t("pages.branchHint")}>
+                        <SearchSelect
+                          value={pagesDraft.branch}
+                          onChange={(value) => setPagesDraft({ ...pagesDraft, branch: value })}
+                          options={branchChoices}
+                          placeholder={t("deploy.branchPlaceholder")}
+                          disabled={running || !repoId || !pagesLoaded}
+                        />
+                      </Field>
+
                       <Field
                         label={t("pages.projectName")}
                         required
@@ -945,27 +1007,16 @@ export default function DeployPage() {
                         />
                       </Field>
 
-                      <div className="grid grid-cols-2 gap-4">
-                        <Field label={t("pages.outputDir")} required>
-                          <Input
-                            value={pagesDraft.outputDir}
-                            onChange={(event) =>
-                              setPagesDraft({ ...pagesDraft, outputDir: event.target.value })
-                            }
-                            placeholder="dist"
-                            disabled={running}
-                          />
-                        </Field>
-                        <Field label={t("pages.branch")} hint={t("pages.branchHint")}>
-                          <SearchSelect
-                            value={pagesDraft.branch}
-                            onChange={(value) => setPagesDraft({ ...pagesDraft, branch: value })}
-                            options={branchChoices}
-                            placeholder={t("deploy.branchPlaceholder")}
-                            disabled={running || !repoId || !pagesLoaded}
-                          />
-                        </Field>
-                      </div>
+                      <Field label={t("pages.outputDir")} required>
+                        <Input
+                          value={pagesDraft.outputDir}
+                          onChange={(event) =>
+                            setPagesDraft({ ...pagesDraft, outputDir: event.target.value })
+                          }
+                          placeholder="dist"
+                          disabled={running}
+                        />
+                      </Field>
 
                       {(!tokenReady || !accountReady) && (
                         <p className="text-[11px] leading-relaxed text-warn">
@@ -1144,8 +1195,9 @@ export default function DeployPage() {
                   <XCircle className="size-4 shrink-0" />
                 )}
                 <span className="min-w-0 flex-1 truncate">
-                  {live.record.repoName} · {live.record.commitShort} · {live.record.serverName} ·{" "}
-                  {formatDuration(live.record.durationMs)}
+                  {live.record.repoName} ·{" "}
+                  {live.record.worktree ? t("deploy.worktree") : live.record.commitShort} ·{" "}
+                  {live.record.serverName} · {formatDuration(live.record.durationMs)}
                 </span>
                 <Button
                   size="sm"
@@ -1225,7 +1277,7 @@ function RecentDeployRow({
       />
       <div className="min-w-0 flex-1">
         <p className="truncate text-[11px] text-ink">
-          {record.branch} · {record.commitShort}
+          {record.branch} · {record.worktree ? t("deploy.worktree") : record.commitShort}
         </p>
         <p className="mt-0.5 flex items-center gap-1 text-[10px] text-ink-faint">
           <Timer className="size-2.5" />

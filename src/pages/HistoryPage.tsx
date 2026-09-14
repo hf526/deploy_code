@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import { Eraser, History, RefreshCw, RotateCcw, ScrollText, Trash2 } from "lucide-react";
+import { Eraser, History, Layers, RefreshCw, RotateCcw, ScrollText, Trash2 } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
@@ -15,7 +15,7 @@ import {
 } from "../components/ui";
 import { api } from "../lib/api";
 import { useApp } from "../lib/store";
-import type { DeployRecord } from "../lib/types";
+import type { DeployRecord, RemoteRelease } from "../lib/types";
 import {
   cn,
   deployStatusClass,
@@ -41,6 +41,11 @@ export default function HistoryPage() {
   const [rollingBack, setRollingBack] = useState<DeployRecord | null>(null);
   const [clearing, setClearing] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [releaseRecord, setReleaseRecord] = useState<DeployRecord | null>(null);
+  const [releases, setReleases] = useState<RemoteRelease[] | null>(null);
+  const [releaseError, setReleaseError] = useState<string | null>(null);
+  const [selectedRelease, setSelectedRelease] = useState("");
+  const [switchingRelease, setSwitchingRelease] = useState(false);
 
   const live = useApp((state) => state.live);
   const livePages = useApp((state) => state.livePages);
@@ -112,6 +117,47 @@ export default function HistoryPage() {
       setBusy(false);
     }
   }
+
+  /** 打开原子发布的版本列表（需要连接服务器读取 releases/）。 */
+  async function openReleases(record: DeployRecord) {
+    setReleaseRecord(record);
+    setReleases(null);
+    setReleaseError(null);
+    setSelectedRelease("");
+    try {
+      const list = await api.listReleases(record.serverId, record.targetDir);
+      setReleases(list);
+      setSelectedRelease(list.find((item) => item.current)?.name ?? "");
+    } catch (error) {
+      setReleaseError(String(error));
+    }
+  }
+
+  async function handleSwitchRelease() {
+    if (!releaseRecord || !selectedRelease) return;
+    setSwitchingRelease(true);
+    try {
+      const message = await api.rollbackRelease(
+        releaseRecord.serverId,
+        releaseRecord.targetDir,
+        selectedRelease,
+      );
+      toast("success", message.trim() || t("history.releaseSwitched"));
+      const list = await api.listReleases(releaseRecord.serverId, releaseRecord.targetDir);
+      setReleases(list);
+      setSelectedRelease(list.find((item) => item.current)?.name ?? "");
+      await refreshHistory();
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setSwitchingRelease(false);
+    }
+  }
+
+  const selectedIsCurrent = useMemo(
+    () => releases?.find((item) => item.name === selectedRelease)?.current ?? false,
+    [releases, selectedRelease],
+  );
 
   async function handleClear() {
     setBusy(true);
@@ -206,7 +252,9 @@ export default function HistoryPage() {
                   <td className="px-4 py-2.5">
                     <div className="text-ink">{record.branch}</div>
                     <div className="mt-0.5 font-mono text-[10px] text-ink-faint">
-                      {record.commitShort} · {shortPath(record.commitSubject, 28)}
+                      {record.worktree
+                        ? `${t("deploy.worktree")}${record.commitShort ? ` · ${record.commitShort}` : ""}`
+                        : `${record.commitShort} · ${shortPath(record.commitSubject, 28)}`}
                     </div>
                   </td>
                   <td className="px-4 py-2.5">
@@ -245,7 +293,7 @@ export default function HistoryPage() {
                       >
                         {t("history.redeploy")}
                       </Button>
-                      {record.status === "success" && (
+                      {record.status === "success" && !record.worktree && (
                         <Button
                           size="sm"
                           variant="ghost"
@@ -256,6 +304,16 @@ export default function HistoryPage() {
                         >
                           {t("history.rollback")}
                         </Button>
+                      )}
+                      {record.atomicRelease && record.status !== "running" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          title={t("history.releases")}
+                          disabled={running}
+                          icon={<Layers className="size-3.5" />}
+                          onClick={() => void openReleases(record)}
+                        />
                       )}
                       <Button
                         size="sm"
@@ -279,7 +337,9 @@ export default function HistoryPage() {
         title={t("history.logTitle")}
         subtitle={
           viewing
-            ? `${viewing.repoName} · ${viewing.branch} · ${viewing.commitShort}`
+            ? `${viewing.repoName} · ${viewing.branch} · ${
+                viewing.worktree ? t("deploy.worktree") : viewing.commitShort
+              }`
             : undefined
         }
         width="max-w-4xl"
@@ -317,6 +377,9 @@ export default function HistoryPage() {
               <InfoCell label={t("history.info.duration")}>
                 {viewing.status === "running" ? "-" : formatDuration(viewing.durationMs)}
               </InfoCell>
+              {viewing.releaseDir && (
+                <InfoCell label={t("history.info.release")}>{viewing.releaseDir}</InfoCell>
+              )}
             </div>
             {viewing.error && (
               <div className="rounded-md border border-neg/30 bg-neg-soft px-4 py-2.5 text-xs text-neg">
@@ -326,6 +389,75 @@ export default function HistoryPage() {
             <pre className="max-h-[46vh] overflow-y-auto rounded-md border border-line bg-sunken px-4 py-2.5 font-mono text-[11.5px] leading-[1.7] text-ink-dim">
               {viewing.log || t("history.noLog")}
             </pre>
+          </div>
+        )}
+      </Modal>
+
+      <Modal
+        open={!!releaseRecord}
+        onClose={() => setReleaseRecord(null)}
+        title={t("history.releasesTitle")}
+        subtitle={
+          releaseRecord
+            ? `${releaseRecord.repoName} → ${releaseRecord.targetDir}/releases`
+            : undefined
+        }
+        width="max-w-xl"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setReleaseRecord(null)}>
+              {t("common.close")}
+            </Button>
+            <Button
+              icon={<RotateCcw className="size-4" />}
+              loading={switchingRelease}
+              disabled={!selectedRelease || selectedIsCurrent}
+              onClick={() => void handleSwitchRelease()}
+            >
+              {t("history.releaseSwitch")}
+            </Button>
+          </>
+        }
+      >
+        {releaseError ? (
+          <div className="flex items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn-soft px-3 py-2 text-[11px] text-warn">
+            <span className="min-w-0 break-all">{releaseError}</span>
+            <Button
+              size="sm"
+              variant="secondary"
+              disabled={!releaseRecord}
+              onClick={() => releaseRecord && void openReleases(releaseRecord)}
+            >
+              {t("common.retry")}
+            </Button>
+          </div>
+        ) : releases === null ? (
+          <p className="text-xs text-ink-faint">{t("common.loading")}</p>
+        ) : releases.length === 0 ? (
+          <p className="text-xs text-ink-faint">{t("history.releasesEmpty")}</p>
+        ) : (
+          <div className="flex max-h-80 flex-col gap-1 overflow-y-auto">
+            <p className="mb-1 text-[11px] leading-relaxed text-ink-faint">
+              {t("history.releaseHint")}
+            </p>
+            {releases.map((item) => (
+              <button
+                key={item.name}
+                type="button"
+                disabled={switchingRelease}
+                onClick={() => setSelectedRelease(item.name)}
+                className={cn(
+                  "flex items-center gap-3 rounded-md border px-3 py-2 text-left text-xs transition-colors disabled:opacity-60",
+                  item.name === selectedRelease
+                    ? "border-brand bg-brand-soft text-ink"
+                    : "border-line bg-field text-ink-dim hover:bg-hover",
+                )}
+              >
+                <span className="min-w-0 flex-1 truncate font-mono">{item.name}</span>
+                {item.current && <Badge kind="green">{t("history.releaseCurrent")}</Badge>}
+                <span className="shrink-0 text-[10px] text-ink-faint">{item.modified}</span>
+              </button>
+            ))}
           </div>
         )}
       </Modal>

@@ -324,6 +324,16 @@ export default function PagesPage() {
 
               {isGitHub ? (
                 <>
+                  <Field label={t("pages.publishBranch")} hint={t("pages.publishBranchHint")}>
+                    <SearchSelect
+                      value={draft.publishBranch}
+                      onChange={(value) => setDraft({ ...draft, publishBranch: value })}
+                      options={branchChoices}
+                      allowCustom
+                      placeholder="gh-pages"
+                    />
+                  </Field>
+
                   <div className="rounded-md border border-line bg-sunken px-3 py-2 text-[11px] leading-relaxed">
                     {selected?.remote ? (
                       githubPreview ? (
@@ -383,27 +393,26 @@ export default function PagesPage() {
                     />
                   </Field>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field label={t("pages.outputDir")} required>
-                      <Input
-                        value={draft.outputDir}
-                        onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
-                        placeholder="dist"
-                      />
-                    </Field>
-                    <Field label={t("pages.publishBranch")} hint={t("pages.publishBranchHint")}>
-                      <SearchSelect
-                        value={draft.publishBranch}
-                        onChange={(value) => setDraft({ ...draft, publishBranch: value })}
-                        options={branchChoices}
-                        allowCustom
-                        placeholder="gh-pages"
-                      />
-                    </Field>
-                  </div>
+                  <Field label={t("pages.outputDir")} required>
+                    <Input
+                      value={draft.outputDir}
+                      onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+                      placeholder="dist"
+                    />
+                  </Field>
                 </>
               ) : (
                 <>
+                  <Field label={t("pages.branch")} hint={t("pages.branchHint")}>
+                    <SearchSelect
+                      value={draft.branch}
+                      onChange={(value) => setDraft({ ...draft, branch: value })}
+                      options={branchChoices}
+                      placeholder={t("deploy.branchPlaceholder")}
+                      disabled={!selected || !loaded}
+                    />
+                  </Field>
+
                   <Field label={t("pages.projectName")} required hint={t("pages.projectNameHint")}>
                     <Input
                       value={draft.projectName}
@@ -423,24 +432,13 @@ export default function PagesPage() {
                     />
                   </Field>
 
-                  <div className="grid grid-cols-2 gap-4">
-                    <Field label={t("pages.outputDir")} required>
-                      <Input
-                        value={draft.outputDir}
-                        onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
-                        placeholder="dist"
-                      />
-                    </Field>
-                    <Field label={t("pages.branch")} hint={t("pages.branchHint")}>
-                      <SearchSelect
-                        value={draft.branch}
-                        onChange={(value) => setDraft({ ...draft, branch: value })}
-                        options={branchChoices}
-                        placeholder={t("deploy.branchPlaceholder")}
-                        disabled={!selected || !loaded}
-                      />
-                    </Field>
-                  </div>
+                  <Field label={t("pages.outputDir")} required>
+                    <Input
+                      value={draft.outputDir}
+                      onChange={(event) => setDraft({ ...draft, outputDir: event.target.value })}
+                      placeholder="dist"
+                    />
+                  </Field>
                 </>
               )}
 

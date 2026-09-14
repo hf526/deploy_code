@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { TerminalSquare } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -12,6 +12,35 @@ const LEVEL_CLASS: Record<LogLine["level"], string> = {
   warn: "text-warn",
   error: "text-neg",
 };
+
+/**
+ * 行对象的稳定 key：日志数组会从头部裁剪，用下标做 key 会让所有行错位重渲染。
+ * 这里按对象身份生成自增 id（WeakMap 不阻止行对象被回收）。
+ */
+const lineIds = new WeakMap<LogLine, number>();
+let nextLineId = 1;
+function lineKey(line: LogLine): number {
+  let id = lineIds.get(line);
+  if (id === undefined) {
+    id = nextLineId++;
+    lineIds.set(line, id);
+  }
+  return id;
+}
+
+/** 单行日志：memo + content-visibility 跳过屏外行的重渲染与布局，长日志不再卡顿。 */
+const LogRow = memo(function LogRow({ line }: { line: LogLine }) {
+  return (
+    <div
+      className={cn(
+        "whitespace-pre-wrap break-all [contain-intrinsic-size:auto_20px] [content-visibility:auto]",
+        LEVEL_CLASS[line.level],
+      )}
+    >
+      {line.message}
+    </div>
+  );
+});
 
 export function LogConsole({
   lines,
@@ -70,11 +99,7 @@ export function LogConsole({
         {lines.length === 0 ? (
           <p className="text-ink-faint">{emptyText ?? t("log.waiting")}</p>
         ) : (
-          lines.map((line, index) => (
-            <div key={index} className={cn("whitespace-pre-wrap break-all", LEVEL_CLASS[line.level])}>
-              {line.message}
-            </div>
-          ))
+          lines.map((line) => <LogRow key={lineKey(line)} line={line} />)
         )}
       </div>
     </div>

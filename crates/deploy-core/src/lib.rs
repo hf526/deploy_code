@@ -8,6 +8,7 @@
 //! - [`ssh`]：SSH 连接、命令执行与 SFTP 上传
 //! - [`security`]：服务器安全检查（登录日志 / sshd 配置 / 防火墙）
 //! - [`engine`]：部署流程编排
+//! - [`release`]：原子发布（releases + current 软链）
 //! - [`backup`]：数据库备份（服务器 PG -> Supabase）
 //! - [`pages`]：Cloudflare Pages 部署（wrangler）
 //! - [`process`]：本地命令执行与 shell 工具
@@ -19,6 +20,7 @@ pub mod git;
 pub mod models;
 pub mod pages;
 pub mod process;
+pub mod release;
 pub mod security;
 pub mod ssh;
 pub mod store;

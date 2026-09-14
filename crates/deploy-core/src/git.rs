@@ -11,7 +11,7 @@ use crate::models::{
     Branch, Commit, FileChange, FileContent, FileEntry, GraphCommit, GraphRef, RepoStatus,
     ReplaceSummary, ResolvedRev, SearchHit,
 };
-use crate::process::{run, run_timeout, CommandOutput};
+use crate::process::{run, run_timeout, run_with_env, CommandOutput};
 
 /// 记录分隔符（Unit Separator），避免提交信息中的普通字符造成解析歧义。
 const SEP: char = '\u{1f}';
@@ -63,8 +63,20 @@ impl Git {
         run("git", &self.base_args(args), None)
     }
 
+    fn try_run_env(&self, args: &[&str], envs: &[(String, String)]) -> Result<CommandOutput> {
+        run_with_env("git", &self.base_args(args), None, envs)
+    }
+
     fn run(&self, args: &[&str]) -> Result<String> {
         let out = self.try_run(args)?;
+        if !out.success() {
+            return Err(CoreError::git(git_error(args, &out)));
+        }
+        Ok(out.stdout)
+    }
+
+    fn run_env(&self, args: &[&str], envs: &[(String, String)]) -> Result<String> {
+        let out = self.try_run_env(args, envs)?;
         if !out.success() {
             return Err(CoreError::git(git_error(args, &out)));
         }
@@ -545,27 +557,40 @@ impl Git {
                 &output,
             )));
         }
+        compress_tar(tar_path, gz_path)
+    }
 
-        let src = File::open(tar_path).map_err(|e| CoreError::io_path(tar_path, e))?;
-        let dst = File::create(gz_path).map_err(|e| CoreError::io_path(gz_path, e))?;
-        let mut encoder = GzEncoder::new(BufWriter::new(dst), Compression::default());
-        let mut reader = std::io::BufReader::new(src);
-        std::io::copy(&mut reader, &mut encoder)?;
-        encoder.flush()?;
-        // finish() 只把 gzip 尾部写进 BufWriter，必须显式 flush/sync，否则最终写盘错误会被 drop 静默吞掉。
-        let mut writer = encoder.finish()?;
-        writer.flush().map_err(|e| CoreError::io_path(gz_path, e))?;
-        writer
-            .into_inner()
-            .map_err(|e| CoreError::io_path(gz_path, e.into_error()))?
-            .sync_all()
-            .map_err(|e| CoreError::io_path(gz_path, e))?;
-        let _ = std::fs::remove_file(tar_path);
-        // 返回实际压缩包大小（io::copy 返回的是未压缩的 tar 字节数）。
-        let size = std::fs::metadata(gz_path)
-            .map_err(|e| CoreError::io_path(gz_path, e))?
-            .len();
-        Ok(size)
+    /// 将当前工作区（含未提交改动与未跟踪文件）打包为 tar.gz，返回压缩包大小（字节）。
+    ///
+    /// 借助临时索引执行 `git add -A` + `git write-tree` 生成工作区快照，再交给
+    /// `git archive` 打包：不会改动真实暂存区，未跟踪文件遵循 `.gitignore` 规则。
+    pub fn archive_worktree(&self, tar_path: &Path, gz_path: &Path) -> Result<u64> {
+        let index_path = tar_path.with_extension("worktree-index");
+        let _ = std::fs::remove_file(&index_path);
+        let envs = vec![(
+            "GIT_INDEX_FILE".to_string(),
+            index_path.to_string_lossy().into_owned(),
+        )];
+        let result = (|| -> Result<u64> {
+            let add = self.try_run_env(&["add", "-A"], &envs)?;
+            if !add.success() {
+                return Err(CoreError::git(git_error(&["add", "-A"], &add)));
+            }
+            let tree = self.run_env(&["write-tree"], &envs)?;
+            let tree = tree.trim().to_string();
+            let tar_str = tar_path.to_string_lossy().into_owned();
+            let output = self.try_run(&["archive", "--format=tar", "-o", &tar_str, &tree])?;
+            if !output.success() {
+                return Err(CoreError::git(git_error(
+                    &["archive", "--format=tar", "-o", &tar_str, &tree],
+                    &output,
+                )));
+            }
+            compress_tar(tar_path, gz_path)
+        })();
+        // 临时索引只是打包用的中间产物，成功失败都要清理。
+        let _ = std::fs::remove_file(&index_path);
+        result
     }
 
     /// 远端仓库地址。
@@ -959,6 +984,30 @@ impl Git {
             matches_replaced: matches,
         })
     }
+}
+
+/// 将 tar 压缩为 tar.gz，返回压缩包大小（字节），并删除原始 tar。
+fn compress_tar(tar_path: &Path, gz_path: &Path) -> Result<u64> {
+    let src = File::open(tar_path).map_err(|e| CoreError::io_path(tar_path, e))?;
+    let dst = File::create(gz_path).map_err(|e| CoreError::io_path(gz_path, e))?;
+    let mut encoder = GzEncoder::new(BufWriter::new(dst), Compression::default());
+    let mut reader = std::io::BufReader::new(src);
+    std::io::copy(&mut reader, &mut encoder)?;
+    encoder.flush()?;
+    // finish() 只把 gzip 尾部写进 BufWriter，必须显式 flush/sync，否则最终写盘错误会被 drop 静默吞掉。
+    let mut writer = encoder.finish()?;
+    writer.flush().map_err(|e| CoreError::io_path(gz_path, e))?;
+    writer
+        .into_inner()
+        .map_err(|e| CoreError::io_path(gz_path, e.into_error()))?
+        .sync_all()
+        .map_err(|e| CoreError::io_path(gz_path, e))?;
+    let _ = std::fs::remove_file(tar_path);
+    // 返回实际压缩包大小（io::copy 返回的是未压缩的 tar 字节数）。
+    let size = std::fs::metadata(gz_path)
+        .map_err(|e| CoreError::io_path(gz_path, e))?
+        .len();
+    Ok(size)
 }
 
 /// 非 Git 文件夹的文件遍历：跳过 `.git`、`node_modules` 与符号链接（避免环路），
@@ -1534,6 +1583,54 @@ mod tests {
             .output()
             .unwrap();
         assert!(out.status.success(), "远端未收到推送的分支 {branch}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn archive_worktree_includes_uncommitted_and_untracked_changes() {
+        use std::io::Read;
+
+        if !git_available() {
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("deploycode-git-worktree-{}", uuid::Uuid::new_v4()));
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("tracked.txt"), "old\n").unwrap();
+        std::fs::write(work.join(".gitignore"), "ignored.txt\n").unwrap();
+
+        let git = Git::open(&work).unwrap();
+        git.set_remote_url("https://github.com/user/repo.git").unwrap();
+        git.run(&["config", "user.name", "DeployCode Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"]).unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        git.commit_all("init", false).unwrap();
+
+        // 未提交改动 + 未跟踪文件都应进入工作区快照，被忽略的文件不进入。
+        std::fs::write(work.join("tracked.txt"), "changed\n").unwrap();
+        std::fs::write(work.join("new.txt"), "brand-new\n").unwrap();
+        std::fs::write(work.join("ignored.txt"), "secret\n").unwrap();
+
+        let tar_path = base.join("out.tar");
+        let gz_path = base.join("out.tar.gz");
+        let size = git.archive_worktree(&tar_path, &gz_path).unwrap();
+        assert!(size > 0);
+        assert!(!tar_path.exists(), "打包完成后应删除中间 tar");
+
+        let mut text = String::new();
+        flate2::read::GzDecoder::new(File::open(&gz_path).unwrap())
+            .read_to_string(&mut text)
+            .unwrap();
+        assert!(text.contains("changed"), "快照应包含未提交改动");
+        assert!(text.contains("new.txt"), "快照应包含未跟踪文件");
+        assert!(!text.contains("secret"), "快照应跳过 .gitignore 忽略的文件");
+
+        // 临时索引只是打包中间产物：真实暂存区仍保持原样（改动未被 add）。
+        let status = git.run(&["status", "--porcelain"]).unwrap();
+        assert!(status.contains("tracked.txt"), "status = {status}");
+        assert!(!status.contains("A  tracked.txt"), "status = {status}");
 
         let _ = std::fs::remove_dir_all(&base);
     }

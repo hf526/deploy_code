@@ -20,6 +20,7 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Branch(command) => branch_command(cli, command),
         Command::Server(command) => server_command(cli, command).await,
         Command::Deploy(args) => deploy_command(cli, args).await,
+        Command::Release(command) => release_command(cli, command).await,
         Command::History(command) => history_command(cli, command).await,
         Command::Backup(command) => backup_command(cli, command).await,
         Command::Pages(command) => pages_command(cli, command).await,
@@ -546,7 +547,14 @@ async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let git = Git::open(&repo.path)?;
     let rev = match &args.rev {
         Some(rev) => rev.clone(),
-        None => git.current_branch()?,
+        None => {
+            // 空仓库（没有任何提交）没有可部署的分支：与 GUI 一致，直接打包当前工作区。
+            if git.resolve("HEAD").is_err() {
+                String::new()
+            } else {
+                git.current_branch()?
+            }
+        }
     };
 
     let server = if let Some(key) = &args.server {
@@ -590,6 +598,45 @@ async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
     Ok(())
 }
 
+async fn release_command(cli: &Cli, command: &ReleaseCommand) -> Result<()> {
+    let store = open_store(cli)?;
+    let config = store.load_config()?;
+    match command {
+        ReleaseCommand::List { server, dir } => {
+            let server = Store::find_server(&config, server)?.clone();
+            let releases =
+                deploy_core::release::list_releases(&server, dir, config.settings.connect_timeout_secs)
+                    .await?;
+            if cli.json {
+                return print_json(&releases);
+            }
+            if releases.is_empty() {
+                output::dim("暂无历史版本（该目录还没有 releases/ 版本或未开启原子发布）");
+                return Ok(());
+            }
+            println!("{:<44} {:<22} 当前", "版本", "时间");
+            for item in releases {
+                println!(
+                    "{:<44} {:<22} {}",
+                    item.name,
+                    item.modified,
+                    if item.current { "✓" } else { "" }
+                );
+            }
+            Ok(())
+        }
+        ReleaseCommand::Switch { server, dir, release } => {
+            let _lock = claim_task_lock(&store, "deploy")?;
+            let server = Store::find_server(&config, server)?.clone();
+            let message =
+                deploy_core::release::switch_release(&server, dir, release, config.settings.connect_timeout_secs)
+                    .await?;
+            output::success(message);
+            Ok(())
+        }
+    }
+}
+
 async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
     let store = open_store(cli)?;
     match command {
@@ -619,7 +666,11 @@ async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
                     DeployStatus::Failed => "失败",
                     DeployStatus::Running => "进行中",
                 };
-                let rev = format!("{} {}", record.branch, record.commit_short);
+                let rev = if record.worktree {
+                    format!("{} 工作区", record.branch)
+                } else {
+                    format!("{} {}", record.branch, record.commit_short)
+                };
                 println!(
                     "{:<9} {:<19} {:<16} {:<20} {:<12} {:<6} {}",
                     short_id(&record.id),
@@ -640,10 +691,19 @@ async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
             }
             println!("记录 ID   : {}", record.id);
             println!("仓库      : {} ({})", record.repo_name, record.repo_id);
-            println!(
-                "版本      : {} [{}] {}",
-                record.commit_short, record.rev, record.commit_subject
-            );
+            if record.worktree {
+                let base = if record.commit_short.is_empty() {
+                    String::new()
+                } else {
+                    format!("（HEAD {} {}）", record.commit_short, record.commit_subject)
+                };
+                println!("版本      : 当前工作区（含未提交改动）{base}");
+            } else {
+                println!(
+                    "版本      : {} [{}] {}",
+                    record.commit_short, record.rev, record.commit_subject
+                );
+            }
             println!("提交      : {}", record.commit);
             println!(
                 "服务器    : {} -> {}",
@@ -672,7 +732,12 @@ async fn history_command(cli: &Cli, command: &HistoryCommand) -> Result<()> {
             let record = find_record(&store, record)?;
             let request = DeployRequest {
                 repo_id: record.repo_id.clone(),
-                rev: record.commit.clone(),
+                // 工作区部署没有固定提交，重新部署时同样打包当前工作区。
+                rev: if record.worktree {
+                    String::new()
+                } else {
+                    record.commit.clone()
+                },
                 server_id: record.server_id.clone(),
                 target_dir: record.target_dir.clone(),
                 run_scripts: record.run_scripts,

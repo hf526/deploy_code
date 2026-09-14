@@ -38,6 +38,10 @@ pub enum Command {
     /// 部署指定仓库的版本
     Deploy(DeployArgs),
 
+    /// 原子发布的历史版本（releases + current 软链）
+    #[command(subcommand)]
+    Release(ReleaseCommand),
+
     /// 查看与管理部署记录
     #[command(subcommand)]
     History(HistoryCommand),
@@ -151,8 +155,29 @@ pub enum BranchCommand {
 }
 
 #[derive(Subcommand, Debug)]
-pub enum ServerCommand {
-    /// 添加或更新服务器
+pub enum ReleaseCommand {
+    /// 列出服务器上的历史发布版本
+    List {
+        /// 服务器 id / 名称 / host
+        server: String,
+        /// 部署目录（服务器上的绝对路径）
+        #[arg(short, long)]
+        dir: String,
+    },
+    /// 把 current 软链切换到指定历史版本
+    Switch {
+        /// 服务器 id / 名称 / host
+        server: String,
+        /// 部署目录（服务器上的绝对路径）
+        #[arg(short, long)]
+        dir: String,
+        /// 版本目录名（releases/ 下的名称）
+        release: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServerCommand {    /// 添加或更新服务器
     Add(ServerAddArgs),
     /// 列出服务器
     List,

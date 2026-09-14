@@ -70,6 +70,7 @@ export default function SettingsPage() {
       githubToken: source.githubToken.trim(),
       pagesHistoryLimit: Math.max(10, Number(source.pagesHistoryLimit) || 200),
       language: normalizeLanguagePreference(source.language),
+      releaseKeep: Math.min(50, Math.max(1, Number(source.releaseKeep) || 5)),
     };
   }
 
@@ -194,6 +195,36 @@ export default function SettingsPage() {
                 />
                 {t("settings.deploy.keepRemoteArchive")}
               </label>
+              <label className="flex items-center gap-2.5 text-xs text-ink">
+                <input
+                  type="checkbox"
+                  checked={draft.atomicRelease}
+                  onChange={(event) =>
+                    setDraft({ ...draft, atomicRelease: event.target.checked })
+                  }
+                  className="size-3.5 accent-primary"
+                />
+                {t("settings.deploy.atomicRelease")}
+              </label>
+              {draft.atomicRelease && (
+                <div className="flex items-center gap-3 pl-6">
+                  <span className="text-[11px] text-ink-faint">
+                    {t("settings.deploy.releaseKeep")}
+                  </span>
+                  <div className="w-24">
+                    <Input
+                      type="number"
+                      value={draft.releaseKeep}
+                      onChange={(event) =>
+                        setDraft({ ...draft, releaseKeep: Number(event.target.value) })
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+              <p className="pl-6 text-[11px] leading-relaxed text-ink-faint">
+                {t("settings.deploy.atomicReleaseHint")}
+              </p>
             </div>
           </Card>
         </section>

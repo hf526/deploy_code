@@ -15,6 +15,7 @@ directories.workspace = true
 russh = { version = "0.63", default-features = false, features = ["ring", "rsa", "flate2"] }
 russh-sftp = "3"
 flate2 = "1"
+sha2.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

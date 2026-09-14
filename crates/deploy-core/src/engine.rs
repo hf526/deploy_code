@@ -8,10 +8,11 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::error::{CoreError, Result};
 use crate::git::Git;
 use crate::models::{
-    now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus, EnvFileConfig, LogLevel,
-    RepoConfig, RepoInfo, ServerConfig, Settings,
+    elapsed_ms_since, now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus,
+    EnvFileConfig, LogLevel, RepoConfig, RepoInfo, ServerConfig, Settings,
 };
-use crate::process::shell_quote;
+use crate::process::{sha256_file, shell_quote};
+use crate::release;
 use crate::security::SecurityReport;
 use crate::ssh::{OutputKind, SshClient};
 use crate::store::Store;
@@ -63,7 +64,10 @@ impl DeployEngine {
                 repo.name
             )));
         }
-        let resolved = git.resolve(&req.rev)?;
+        // 版本留空表示不走分支：直接打包当前工作区（含未提交改动）。
+        let rev = req.rev.trim().to_string();
+        let worktree = rev.is_empty();
+        let resolved = if worktree { None } else { Some(git.resolve(&rev)?) };
 
         // 环境文件：解压后用本地文件覆盖服务器上的对应文件；提前校验，避免部署开始后才报错。
         let env_files = if req.upload_env {
@@ -80,15 +84,34 @@ impl DeployEngine {
             }
         }
 
+        // 工作区部署只把当前 HEAD 作为参考信息记录；空仓库没有 HEAD 也允许部署。
+        let (commit, commit_short, commit_subject) = match &resolved {
+            Some(resolved) => (
+                resolved.hash.clone(),
+                resolved.short.clone(),
+                resolved.subject.clone(),
+            ),
+            None => git
+                .resolve("HEAD")
+                .map(|head| (head.hash, head.short, head.subject))
+                .unwrap_or_default(),
+        };
+        let branch = if worktree {
+            git.current_branch().unwrap_or_default()
+        } else {
+            rev.clone()
+        };
+
         let record = DeployRecord {
             id: uuid::Uuid::new_v4().to_string(),
             repo_id: repo.id.clone(),
             repo_name: repo.name.clone(),
-            rev: req.rev.trim().to_string(),
-            branch: req.rev.trim().to_string(),
-            commit: resolved.hash.clone(),
-            commit_short: resolved.short.clone(),
-            commit_subject: resolved.subject.clone(),
+            rev,
+            branch,
+            worktree,
+            commit,
+            commit_short,
+            commit_subject,
             server_id: server.id.clone(),
             server_name: server.name.clone(),
             target_dir,
@@ -96,6 +119,8 @@ impl DeployEngine {
             scripts: normalize_scripts(&req.scripts),
             run_scripts: req.run_scripts,
             env_files,
+            atomic_release: config.settings.atomic_release,
+            release_dir: None,
             status: DeployStatus::Running,
             error: None,
             log: String::new(),
@@ -127,11 +152,20 @@ impl DeployEngine {
             record.repo_name, record.commit_short, record.server_name
         ));
 
-        let result = self.execute(&record, &req, &mut logger).await;
+        // 原子发布：每次部署使用独立的版本目录，成功后切换 current 软链。
+        let release = if record.atomic_release {
+            Some(release::release_name(&record.commit_short, &record.id))
+        } else {
+            None
+        };
+        let result = self.execute(&record, &req, release.as_deref(), &mut logger).await;
 
         match result {
             Ok(()) => {
                 record.status = DeployStatus::Success;
+                if let Some(name) = &release {
+                    record.release_dir = Some(name.clone());
+                }
                 logger.success(format!(
                     "部署成功（耗时 {}）",
                     format_duration(started.elapsed().as_millis() as u64)
@@ -140,6 +174,13 @@ impl DeployEngine {
             Err(err) => {
                 record.status = DeployStatus::Failed;
                 record.error = Some(err.to_string());
+                if let Some(name) = &release {
+                    logger.warn(format!(
+                        "未切换 current（线上版本不受影响），失败版本保留在 {}/{}/{name} 便于排查",
+                        record.target_dir.trim_end_matches('/'),
+                        release::RELEASES_DIR
+                    ));
+                }
                 logger.error(format!("部署失败: {err}"));
             }
         }
@@ -176,6 +217,7 @@ impl DeployEngine {
         &self,
         record: &DeployRecord,
         req: &DeployRequest,
+        release: Option<&str>,
         logger: &mut Logger,
     ) -> Result<()> {
         let config = self.store.load_config()?;
@@ -187,25 +229,51 @@ impl DeployEngine {
         if target.is_empty() {
             return Err(CoreError::deploy("部署目录不能为空"));
         }
+        // 原子发布时解压 / 执行脚本都在独立的 releases/<版本> 目录内进行。
+        let deploy_dir = match release {
+            Some(name) => format!("{target}/{}/{}", release::RELEASES_DIR, name),
+            None => target.clone(),
+        };
 
         logger.info(format!("仓库: {} ({})", repo.name, repo.path));
-        logger.info(format!(
-            "版本: {} [{}] {}",
-            record.commit_short, record.rev, record.commit_subject
-        ));
+        if record.worktree {
+            let base = if record.commit_short.is_empty() {
+                String::new()
+            } else {
+                format!("（HEAD {} {}）", record.commit_short, record.commit_subject)
+            };
+            logger.info(format!("版本: 当前工作区（含未提交改动）{base}"));
+        } else {
+            logger.info(format!(
+                "版本: {} [{}] {}",
+                record.commit_short, record.rev, record.commit_subject
+            ));
+        }
         logger.info(format!(
             "服务器: {} ({}@{})",
             server.name, server.username, server.host
         ));
         logger.info(format!("部署目录: {target}"));
+        if let Some(name) = release {
+            logger.info(format!(
+                "原子发布: 版本目录 {}/{}，成功后切换 current 软链",
+                release::RELEASES_DIR,
+                name
+            ));
+        }
 
         // 1. 本地打包
         logger.info("正在打包代码 ...");
         // 文件名带记录 ID，避免同一仓库/提交并发部署时互相覆盖临时归档。
+        let revision = if record.worktree && record.commit.is_empty() {
+            "worktree".to_string()
+        } else {
+            short_hash(&record.commit)
+        };
         let stem = format!(
             "{}-{}-{}",
             sanitize_component(&repo.name),
-            short_hash(&record.commit),
+            revision,
             record.id
         );
         let archive_name = format!("{stem}.tar.gz");
@@ -217,11 +285,16 @@ impl DeployEngine {
         let size = {
             let repo_path = repo.path.clone();
             let commit = record.commit.clone();
+            let worktree = record.worktree;
             let tar = tar_path.clone();
             let gz = gz_path.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let git = Git::open(&repo_path)?;
-                git.archive(&commit, &tar, &gz)
+                if worktree {
+                    git.archive_worktree(&tar, &gz)
+                } else {
+                    git.archive(&commit, &tar, &gz)
+                }
             })
             .await
             .map_err(|err| CoreError::deploy(format!("打包任务异常: {err}")))??
@@ -240,6 +313,9 @@ impl DeployEngine {
         // 3. 准备目录并上传
         let remote_dir = format!("{target}/.deploy_code");
         client.mkdir_p(&target).await?;
+        if release.is_some() {
+            client.mkdir_p(&deploy_dir).await?;
+        }
         client.mkdir_p(&remote_dir).await?;
         let remote_archive = format!("{remote_dir}/{archive_name}");
 
@@ -263,12 +339,31 @@ impl DeployEngine {
                 .await?;
             logger.success(format!("上传完成 ({})", human_size(size)));
 
-            // 4. 解压到目标目录
+            // 上传完整性校验：本地与服务器分别计算 SHA-256 并比对，避免断网 / 磁盘写满
+            // 导致的半包被当作正常包解压；服务器缺少校验工具时跳过（老系统兼容）。
+            match remote_sha256(&client, &remote_archive).await? {
+                Some(remote_hash) => {
+                    let gz = gz_path.clone();
+                    let local_hash = tokio::task::spawn_blocking(move || sha256_file(&gz))
+                        .await
+                        .map_err(|err| CoreError::deploy(format!("校验任务异常: {err}")))??
+                        .to_ascii_lowercase();
+                    if local_hash != remote_hash {
+                        return Err(CoreError::deploy(format!(
+                            "上传校验失败：本地 {local_hash}，服务器 {remote_hash}（可能上传中断，请重试）"
+                        )));
+                    }
+                    logger.success(format!("校验通过 (sha256 {})", short_hash(&local_hash)));
+                }
+                None => logger.warn("服务器缺少 sha256sum / shasum / openssl，跳过上传校验"),
+            }
+
+            // 4. 解压到目标目录（原子发布时为该版本的独立目录）
             logger.info("正在解压到目标目录 ...");
             let extract_cmd = format!(
                 "tar -xzf {} -C {}",
                 shell_quote(&remote_archive),
-                shell_quote(&target)
+                shell_quote(&deploy_dir)
             );
             let (code, output) = client
                 .exec_capture(&extract_cmd, settings.script_timeout_secs)
@@ -284,13 +379,12 @@ impl DeployEngine {
             // 5. 上传并替换环境文件（在脚本执行前覆盖，确保脚本读到的是新内容）
             if !record.env_files.is_empty() {
                 logger.info(format!("正在上传 {} 个环境文件 ...", record.env_files.len()));
+                let base = deploy_dir.trim_end_matches('/');
                 for file in &record.env_files {
                     let local = std::path::Path::new(&file.local_path);
-                    let remote = format!("{}/{}", target.trim_end_matches('/'), file.remote_path);
+                    let remote = format!("{base}/{}", file.remote_path);
                     if let Some((parent, _)) = file.remote_path.rsplit_once('/') {
-                        client
-                            .mkdir_p(&format!("{}/{}", target.trim_end_matches('/'), parent))
-                            .await?;
+                        client.mkdir_p(&format!("{base}/{parent}")).await?;
                     }
                     // 先上传到同目录临时文件，再原子替换：上传中断（断网/磁盘满）时
                     // 不会截断服务器上原有的环境文件。
@@ -335,10 +429,62 @@ impl DeployEngine {
 
             // 6. 执行项目脚本
             if record.run_scripts {
-                self.run_scripts(record, req, &client, logger, &settings)
+                self.run_scripts(record, req, &deploy_dir, release, &client, logger, &settings)
                     .await?;
             } else {
                 logger.info("已按部署选项跳过脚本执行");
+            }
+
+            // 7. 原子发布：脚本全部成功后标记版本并切换 current 软链（失败时线上仍是旧版本）
+            if let Some(name) = release {
+                // 完成后才写标记：失败 / 中断的版本不会出现在可回滚列表中。
+                let marker = format!("{deploy_dir}/{}", release::READY_MARKER);
+                let (code, output) = client
+                    .exec_capture(&format!("touch {}", shell_quote(&marker)), 30)
+                    .await?;
+                if code != 0 {
+                    return Err(CoreError::deploy(format!(
+                        "标记版本失败: {}",
+                        output.trim()
+                    )));
+                }
+                logger.info("正在切换 current 软链 ...");
+                let (code, output) = client
+                    .exec_capture(&release::switch_command(&target, name), 60)
+                    .await?;
+                if code != 0 {
+                    return Err(CoreError::deploy(format!(
+                        "切换 current 失败: {}",
+                        output.trim()
+                    )));
+                }
+                logger.success(format!("已切换 {target}/{} -> {}/{}", release::CURRENT_LINK, release::RELEASES_DIR, name));
+                // 切换成功后部署事实已经生效：立即落库为成功，避免随后崩溃 / 取消
+                // 导致记录与线上状态不一致（清理旧版本失败不影响部署结果）。
+                if let Ok(mut saved) = self.store.find_record(&record.id) {
+                    saved.status = DeployStatus::Success;
+                    saved.release_dir = Some(name.to_string());
+                    saved.finished_at = Some(now_string());
+                    saved.duration_ms = elapsed_ms_since(&saved.started_at);
+                    saved.log = join_log_lines(logger);
+                    let limit = self
+                        .store
+                        .load_config()
+                        .map(|config| config.settings.history_limit)
+                        .unwrap_or(500);
+                    let _ = self.store.upsert_history(&saved, limit);
+                }
+                match release::prune_releases(&client, &target, settings.release_keep).await {
+                    Ok(removed) if !removed.is_empty() => {
+                        logger.info(format!("已清理旧版本: {}", removed.join(", ")));
+                    }
+                    Ok(_) => {}
+                    Err(err) => logger.warn(format!("清理旧版本失败（不影响本次部署）: {err}")),
+                }
+                logger.info(format!(
+                    "请确保服务 / Web 站点指向 {target}/{}",
+                    release::CURRENT_LINK
+                ));
             }
 
             Ok(())
@@ -357,15 +503,21 @@ impl DeployEngine {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn run_scripts(
         &self,
         record: &DeployRecord,
         req: &DeployRequest,
+        deploy_dir: &str,
+        release: Option<&str>,
         client: &SshClient,
         logger: &mut Logger,
         settings: &Settings,
     ) -> Result<()> {
-        let target = req.target_dir.trim().trim_end_matches('/');
+        // 脚本在解压出的目录内执行；pidfile 始终放在部署根目录的 .deploy_code 下，
+        // 这样应用退出时按 record.target_dir 重连也能找到并终止脚本。
+        let target = deploy_dir.trim().trim_end_matches('/');
+        let root = record.target_dir.trim().trim_end_matches('/');
         let script_dir = normalize_script_dir(&req.script_dir, &settings.script_dir);
 
         let explicit = normalize_scripts(&req.scripts);
@@ -410,9 +562,14 @@ impl DeployEngine {
         }
 
         logger.info(format!("共找到 {} 个脚本，开始执行", scripts.len()));
+        // 原子发布时告诉脚本当前生效路径（脚本执行期间仍指向旧版本，切换在成功后进行）。
+        let current_dir = match release {
+            Some(_) => format!("{root}/{}", release::CURRENT_LINK),
+            None => root.to_string(),
+        };
         for script in scripts {
             logger.command(format!("$ bash {script}"));
-            let pidfile = remote_pidfile(target, &record.id);
+            let pidfile = remote_pidfile(root, &record.id);
             // 记录脚本 PID：退出/超时时据此找到进程组并整组终止（含脚本拉起的子进程）。
             let inner = format!(
                 "echo $$ > {pid} && exec bash {script}",
@@ -420,14 +577,17 @@ impl DeployEngine {
                 script = shell_quote(&script)
             );
             let cmd = format!(
-                "cd {} && rm -f {} && DEPLOY_BRANCH={} DEPLOY_REV={} DEPLOY_COMMIT={} DEPLOY_TARGET={} bash -c {}",
-                shell_quote(target),
-                shell_quote(&pidfile),
-                shell_quote(&record.branch),
-                shell_quote(&record.rev),
-                shell_quote(&record.commit),
-                shell_quote(target),
-                shell_quote(&inner)
+                "cd {target} && rm -f {pid} && DEPLOY_BRANCH={branch} DEPLOY_REV={rev} \
+                 DEPLOY_COMMIT={commit} DEPLOY_TARGET={target} DEPLOY_RELEASE={release} \
+                 DEPLOY_CURRENT={current} bash -c {inner}",
+                target = shell_quote(target),
+                pid = shell_quote(&pidfile),
+                branch = shell_quote(&record.branch),
+                rev = shell_quote(&record.rev),
+                commit = shell_quote(&record.commit),
+                release = shell_quote(release.unwrap_or("")),
+                current = shell_quote(&current_dir),
+                inner = shell_quote(&inner)
             );
             let result = client
                 .exec_stream(&cmd, settings.script_timeout_secs, &mut |kind, line| {
@@ -766,6 +926,39 @@ async fn kill_remote_script(client: &SshClient, pidfile: &str) -> Result<()> {
         .map(|_| ())
 }
 
+/// 远端计算文件 SHA-256：优先 `sha256sum`，其次 `shasum` / `openssl`；
+/// 都没有时返回 `None`，调用方跳过校验（兼容老系统）。
+async fn remote_sha256(client: &SshClient, path: &str) -> Result<Option<String>> {
+    let quoted = shell_quote(path);
+    // 路径均为绝对路径（不以 - 开头），不带 `--` 以兼容精简系统的 sha256sum / shasum。
+    let cmd = format!(
+        "if command -v sha256sum >/dev/null 2>&1; then sha256sum {quoted}; \
+         elif command -v shasum >/dev/null 2>&1; then shasum -a 256 {quoted}; \
+         elif command -v openssl >/dev/null 2>&1; then openssl dgst -sha256 {quoted}; \
+         else exit 127; fi"
+    );
+    let (code, output) = client.exec_capture(&cmd, 120).await?;
+    if code == 127 {
+        return Ok(None);
+    }
+    if code != 0 {
+        return Err(CoreError::deploy(format!(
+            "服务器计算校验和失败: {}",
+            output.trim()
+        )));
+    }
+    Ok(parse_sha256_output(&output))
+}
+
+/// 从 sha256sum / shasum / openssl 的输出中提取 64 位十六进制摘要。
+fn parse_sha256_output(output: &str) -> Option<String> {
+    output.lines().find_map(|line| {
+        line.split_whitespace()
+            .find(|part| part.len() == 64 && part.chars().all(|c| c.is_ascii_hexdigit()))
+            .map(|part| part.to_ascii_lowercase())
+    })
+}
+
 fn sanitize_component(value: &str) -> String {
     let mut result: String = value
         .chars()
@@ -824,6 +1017,32 @@ mod tests {
         assert_eq!(
             remote_pidfile("/srv/app/", "abc"),
             "/srv/app/.deploy_code/deploy-abc.pid"
+        );
+    }
+
+    #[test]
+    fn parse_sha256_output_supports_common_formats() {
+        let hash = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824";
+        // sha256sum / shasum：hash 在前
+        assert_eq!(
+            parse_sha256_output(&format!("{hash}  /opt/app/a.tar.gz")).as_deref(),
+            Some(hash)
+        );
+        // openssl dgst：hash 在后
+        assert_eq!(
+            parse_sha256_output(&format!("SHA2-256(/opt/app/a.tar.gz)= {hash}")).as_deref(),
+            Some(hash)
+        );
+        // 大写摘要统一转小写
+        assert_eq!(
+            parse_sha256_output(&format!("{}  /opt/app/a.tar.gz", hash.to_uppercase())).as_deref(),
+            Some(hash)
+        );
+        // 无摘要 / 文件名里的短 hash 不应误匹配
+        assert_eq!(parse_sha256_output("no hash here"), None);
+        assert_eq!(
+            parse_sha256_output("abc12345  /opt/app/repo-abc12345-x.tar.gz"),
+            None
         );
     }
 
@@ -974,6 +1193,101 @@ mod tests {
         skip.upload_env = false;
         let record = engine.prepare(&skip).unwrap();
         assert!(record.env_files.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prepare_allows_worktree_deploy_without_revision() {
+        let git_ok = std::process::Command::new("git")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !git_ok {
+            return;
+        }
+        let base = std::env::temp_dir().join(format!(
+            "deploycode-worktree-prepare-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let repo_dir = base.join("with-commit");
+        let empty_dir = base.join("empty");
+        std::fs::create_dir_all(&repo_dir).unwrap();
+        std::fs::create_dir_all(&empty_dir).unwrap();
+
+        let run_git = |dir: &std::path::Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} 失败");
+        };
+        run_git(&repo_dir, &["init"]);
+        run_git(&repo_dir, &["config", "user.name", "Test"]);
+        run_git(&repo_dir, &["config", "user.email", "test@example.com"]);
+        run_git(&repo_dir, &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo_dir.join("a.txt"), "hi").unwrap();
+        run_git(&repo_dir, &["add", "-A"]);
+        run_git(&repo_dir, &["commit", "-m", "init"]);
+        // 空仓库：没有任何分支与提交，也应允许部署当前工作区。
+        run_git(&empty_dir, &["init"]);
+
+        let store = std::sync::Arc::new(Store::new(base.join("data")));
+        let (repo_id, empty_id, server_id) = store
+            .mutate_config(|config| {
+                let repo = RepoConfig::new(
+                    "demo".to_string(),
+                    repo_dir.to_string_lossy().into_owned(),
+                );
+                let empty = RepoConfig::new(
+                    "empty".to_string(),
+                    empty_dir.to_string_lossy().into_owned(),
+                );
+                let server = ServerConfig::new(
+                    "prod".to_string(),
+                    "127.0.0.1".to_string(),
+                    "root".to_string(),
+                    crate::models::SshAuth::Password {
+                        password: "x".to_string(),
+                    },
+                );
+                let server_id = server.id.clone();
+                config.repos.push(repo.clone());
+                config.repos.push(empty.clone());
+                config.servers.push(server);
+                Ok((repo.id, empty.id, server_id))
+            })
+            .unwrap();
+
+        let engine = DeployEngine::new(store);
+        let request = |repo_id: &str| DeployRequest {
+            repo_id: repo_id.to_string(),
+            rev: String::new(),
+            server_id: server_id.clone(),
+            target_dir: "/opt/demo".to_string(),
+            run_scripts: false,
+            script_dir: "docker".to_string(),
+            scripts: Vec::new(),
+            upload_env: false,
+        };
+
+        let record = engine.prepare(&request(&repo_id)).unwrap();
+        assert!(record.worktree);
+        assert!(record.rev.is_empty());
+        assert!(!record.commit.is_empty(), "工作区部署应记录当前 HEAD 作为参考");
+        assert!(!record.branch.is_empty());
+
+        let record = engine.prepare(&request(&empty_id)).unwrap();
+        assert!(record.worktree);
+        assert!(record.commit.is_empty());
+        assert!(record.commit_short.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }

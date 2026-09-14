@@ -275,6 +275,14 @@ impl AppState {
             .remove(record_id);
     }
 
+    /// 取出指定记录的部署登记项（取消部署时使用；取出后退出清理不会再处理它）。
+    pub fn take_deploy(&self, record_id: &str) -> Option<ActiveDeploy> {
+        self.active_deploys
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(record_id)
+    }
+
     /// 取出并清空当前进行中的部署列表。
     pub fn take_deploys(&self) -> Vec<(String, ActiveDeploy)> {
         self.active_deploys

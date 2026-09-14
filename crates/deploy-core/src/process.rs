@@ -107,8 +107,22 @@ fn base_command(program: &str, args: &[String], cwd: Option<&Path>) -> Command {
 
 /// 执行本地命令，不抛出非零退出码错误。
 pub fn run(program: &str, args: &[String], cwd: Option<&Path>) -> Result<CommandOutput> {
+    run_with_env(program, args, cwd, &[])
+}
+
+/// 执行本地命令（附加环境变量），不抛出非零退出码错误。
+pub fn run_with_env(
+    program: &str,
+    args: &[String],
+    cwd: Option<&Path>,
+    envs: &[(String, String)],
+) -> Result<CommandOutput> {
     // 与 run_timeout/run_stream 一致登记子进程，应用退出时才能统一终止（Git 本地操作也走这里）。
-    let child = base_command(program, args, cwd)
+    let mut cmd = base_command(program, args, cwd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -404,6 +418,23 @@ pub fn run_checked(program: &str, args: &[String], cwd: Option<&Path>) -> Result
     Ok(output.stdout)
 }
 
+/// 计算本地文件的 SHA-256（十六进制小写），用于上传完整性校验。
+pub fn sha256_file(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+
+    let mut file = std::fs::File::open(path).map_err(|e| CoreError::io_path(path, e))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| CoreError::io_path(path, e))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
 /// 将字符串安全地包成 shell 参数（用于远端 shell 命令拼接）。
 /// 注意：`~` 不在安全集合内，会被单引号包裹而不会被 shell 展开，保证字面量语义。
 pub fn shell_quote(value: &str) -> String {
@@ -469,5 +500,19 @@ mod tests {
             "超时后应尽快返回，实际耗时 {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn sha256_file_matches_known_digest() {
+        let dir = std::env::temp_dir().join(format!("deploycode-sha-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        std::fs::write(&file, b"hello").unwrap();
+        // echo -n hello | sha256sum
+        assert_eq!(
+            sha256_file(&file).unwrap(),
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -20,6 +20,7 @@ import type {
   RepoInfo,
   RepoStatus,
   ReplaceSummary,
+  RemoteRelease,
   ResolvedRev,
   SearchHit,
   SecurityReport,
@@ -119,6 +120,11 @@ export const api = {
   // 部署
   startDeploy: (request: DeployRequest) => invoke<string>("start_deploy", { request }),
   redeploy: (recordId: string) => invoke<string>("redeploy", { recordId }),
+  cancelDeploy: (recordId: string) => invoke<string>("cancel_deploy", { recordId }),
+  listReleases: (serverId: string, targetDir: string) =>
+    invoke<RemoteRelease[]>("list_releases", { serverId, targetDir }),
+  rollbackRelease: (serverId: string, targetDir: string, releaseName: string) =>
+    invoke<string>("rollback_release", { serverId, targetDir, releaseName }),
 
   // 记录
   listHistory: (repoId?: string | null) =>

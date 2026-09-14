@@ -419,6 +419,15 @@ pub struct DeployRecord {
     /// 部署时指定的版本（分支名 / 提交号 / 标签）。
     pub rev: String,
     pub branch: String,
+    /// 是否为「当前工作区」部署：未指定版本时打包本地工作区（含未提交改动）。
+    #[serde(default)]
+    pub worktree: bool,
+    /// 是否使用 releases + current 软链的原子发布方式。
+    #[serde(default)]
+    pub atomic_release: bool,
+    /// 原子发布成功切换后记录的版本目录名（releases/ 下的名称）。
+    #[serde(default)]
+    pub release_dir: Option<String>,
     pub commit: String,
     pub commit_short: String,
     pub commit_subject: String,
@@ -487,6 +496,18 @@ fn default_true() -> bool {
 
 fn default_script_dir() -> String {
     "docker".to_string()
+}
+
+/// 服务器上的一个历史发布版本（`releases/<name>`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteRelease {
+    /// 版本目录名（relative to `releases/`）。
+    pub name: String,
+    /// 是否为 `current` 软链指向的版本。
+    pub current: bool,
+    /// 目录修改时间（服务器本地时间）。
+    pub modified: String,
 }
 
 /// 部署过程中推送的事件（GUI 通过 Tauri event 转发，CLI 直接打印）。
@@ -684,6 +705,16 @@ pub struct Settings {
     /// 界面语言偏好（空字符串表示跟随系统）。
     #[serde(default)]
     pub language: String,
+    /// 原子发布：部署到 `{部署目录}/releases/<版本>` 并切换 `current` 软链。
+    #[serde(default)]
+    pub atomic_release: bool,
+    /// 原子发布保留的历史版本数（1-50，超出后清理最旧的，当前版本不删）。
+    #[serde(default = "default_release_keep")]
+    pub release_keep: usize,
+}
+
+fn default_release_keep() -> usize {
+    5
 }
 
 fn default_backup_history_limit() -> usize {
@@ -716,6 +747,8 @@ impl Default for Settings {
             github_token: String::new(),
             pages_history_limit: default_pages_history_limit(),
             language: String::new(),
+            atomic_release: false,
+            release_keep: default_release_keep(),
         }
     }
 }
@@ -742,6 +775,16 @@ pub struct AppConfig {
 
 pub fn now_string() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// 从 `started_at`（`now_string` 格式）到现在的毫秒数；解析失败返回 0。
+pub fn elapsed_ms_since(started_at: &str) -> u64 {
+    chrono::NaiveDateTime::parse_from_str(started_at, "%Y-%m-%d %H:%M:%S")
+        .map(|started| {
+            let delta = chrono::Local::now().naive_local() - started;
+            delta.num_milliseconds().max(0) as u64
+        })
+        .unwrap_or(0)
 }
 
 /// 生成一个新的唯一 ID。

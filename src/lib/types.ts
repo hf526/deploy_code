@@ -143,6 +143,12 @@ export interface ResolvedRev {
   date: string;
 }
 
+export interface RemoteRelease {
+  name: string;
+  current: boolean;
+  modified: string;
+}
+
 export interface RepoDetail {
   repo: RepoInfo;
   status: RepoStatus | null;
@@ -154,6 +160,9 @@ export interface DeployRecord {
   repoName: string;
   rev: string;
   branch: string;
+  worktree: boolean;
+  atomicRelease: boolean;
+  releaseDir: string | null;
   commit: string;
   commitShort: string;
   commitSubject: string;
@@ -199,6 +208,8 @@ export interface Settings {
   githubToken: string;
   pagesHistoryLimit: number;
   language: string;
+  atomicRelease: boolean;
+  releaseKeep: number;
 }
 
 export type DeployEvent =
