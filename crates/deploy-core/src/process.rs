@@ -270,6 +270,38 @@ fn kill_process_tree(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+/// 构造系统 shell 命令：Unix 下 `sh -c`，Windows 下 `cmd /C`。
+fn base_shell_command(command: &str, cwd: Option<&Path>) -> Command {
+    #[cfg(windows)]
+    let mut cmd = {
+        use std::os::windows::process::CommandExt;
+        let mut cmd = Command::new("cmd.exe");
+        cmd.arg("/C");
+        // 命令串必须原样传给 cmd.exe：Rust 默认按 CreateProcess 规则把参数里的 `"` 转义成 `\"`，
+        // 而 cmd.exe 不识别这种转义（如 `node -e "..."` 会静默不执行），必须用 raw_arg。
+        cmd.raw_arg(command);
+        cmd
+    };
+    #[cfg(not(windows))]
+    let mut cmd = {
+        let mut cmd = Command::new("sh");
+        cmd.arg("-c");
+        cmd.arg(command);
+        cmd
+    };
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// 本地命令流式执行：按行回调输出（stdout/stderr），支持超时终止进程树。返回退出码。
 pub fn run_stream(
     program: &str,
@@ -283,6 +315,16 @@ pub fn run_stream(
     for (key, value) in envs {
         cmd.env(key, value);
     }
+    run_stream_command(cmd, program, timeout, on_line)
+}
+
+/// 执行构造好的命令并流式消费输出（run_stream / run_shell_stream 共用）。
+fn run_stream_command(
+    mut cmd: Command,
+    program: &str,
+    timeout: Duration,
+    on_line: &mut (dyn FnMut(OutputKind, String) + Send),
+) -> Result<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
@@ -371,17 +413,12 @@ pub fn run_shell_stream(
     timeout: Duration,
     on_line: &mut (dyn FnMut(OutputKind, String) + Send),
 ) -> Result<i32> {
-    #[cfg(windows)]
-    let (program, args) = (
-        "cmd.exe".to_string(),
-        vec!["/C".to_string(), command.to_string()],
-    );
-    #[cfg(not(windows))]
-    let (program, args) = (
-        "sh".to_string(),
-        vec!["-c".to_string(), command.to_string()],
-    );
-    run_stream(&program, &args, cwd, envs, timeout, on_line)
+    let mut cmd = base_shell_command(command, cwd);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    let label = if cfg!(windows) { "cmd.exe" } else { "sh" };
+    run_stream_command(cmd, label, timeout, on_line)
 }
 
 /// 从管道按行读取并通过通道发送（在主线程回调，避免回调跨线程竞争）。
@@ -480,6 +517,33 @@ mod tests {
         assert_eq!(shell_quote("/srv/app"), "/srv/app");
         assert_eq!(shell_quote("~/app"), "'~/app'");
         assert_eq!(shell_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn run_shell_stream_passes_quotes_through() {
+        let mut lines: Vec<String> = Vec::new();
+        let code = run_shell_stream(
+            "echo \"hello world\"",
+            None,
+            &[],
+            Duration::from_secs(30),
+            &mut |_, line| lines.push(line),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        let output = lines.join("\n");
+        #[cfg(windows)]
+        {
+            // 关键是不能出现 `\"`：Windows 下若按 CreateProcess 规则转义引号，引号会变成字面量 \"
+            // 传给 cmd.exe，导致含引号的命令（如 node -e "..."）静默失效。
+            assert!(output.contains("\"hello world\""), "输出: {output}");
+            assert!(!output.contains("\\\""), "引号不应被反斜杠转义: {output}");
+        }
+        #[cfg(not(windows))]
+        {
+            // sh 会去掉引号，只校验命令正常执行。
+            assert_eq!(output.trim(), "hello world");
+        }
     }
 
     #[test]

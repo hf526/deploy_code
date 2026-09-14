@@ -152,6 +152,9 @@ pub struct AppState {
     pub active_deploys: Mutex<HashMap<String, ActiveDeploy>>,
     /// 进行中的备份（record_id -> 服务器/记录/任务句柄），退出时用于终止远端脚本。
     pub active_backups: Mutex<HashMap<String, ActiveBackup>>,
+    /// 取消部署后正在做远端清理的任务；此时任务守卫已摘除 active_deploys，
+    /// 单独登记保证清理期间退出应用仍会终止远端脚本。
+    pub pending_cleanups: Mutex<Vec<(String, ActiveDeploy)>>,
     /// 部署抢占标记：在 prepare 之前原子占位，避免两个并发命令同时通过检查。
     deploy_claim: AtomicBool,
     /// 备份抢占标记：同一时间只允许一个数据库备份。
@@ -173,6 +176,7 @@ impl AppState {
             watchers: Mutex::new(HashMap::new()),
             active_deploys: Mutex::new(HashMap::new()),
             active_backups: Mutex::new(HashMap::new()),
+            pending_cleanups: Mutex::new(Vec::new()),
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),
@@ -289,6 +293,34 @@ impl AppState {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()
+            .collect()
+    }
+
+    /// 登记一条「取消后正在远端清理」的部署；重复登记同一记录时保留先登记的项。
+    pub fn add_pending_cleanup(&self, record_id: &str, deploy: ActiveDeploy) {
+        let mut pending = self
+            .pending_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.iter().any(|(id, _)| id == record_id) {
+            pending.push((record_id.to_string(), deploy));
+        }
+    }
+
+    /// 取消流程自身的远端清理结束后移除登记；若已被退出流程取走则为空操作。
+    pub fn remove_pending_cleanup(&self, record_id: &str) {
+        self.pending_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(id, _)| id != record_id);
+    }
+
+    /// 取出并清空「取消清理中」的部署列表（退出时与 active_deploys 一起清理）。
+    pub fn take_pending_cleanups(&self) -> Vec<(String, ActiveDeploy)> {
+        self.pending_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
             .collect()
     }
 

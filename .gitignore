@@ -2,6 +2,7 @@ node_modules/
 dist/
 target/
 src-tauri/gen/
+.tauri-localappdata/
 config.json
 history.json
 backups.json

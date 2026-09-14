@@ -20,6 +20,9 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
     if server.username.trim().is_empty() {
         return Err(CoreError::config("SSH 用户名不能为空"));
     }
+    if server.port == 0 {
+        return Err(CoreError::config("SSH 端口必须在 1-65535 之间"));
+    }
     if server.id.trim().is_empty() {
         server.id = new_id();
     }
@@ -28,6 +31,14 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
     }
 
     let saved = state.store.mutate_config(|config| {
+        // 名称是 CLI / 仓库默认服务器的查找键之一，重名会导致命中错误服务器。
+        if config
+            .servers
+            .iter()
+            .any(|item| item.id != server.id && item.name == server.name)
+        {
+            return Err(CoreError::config(format!("服务器名称已存在: {}", server.name)));
+        }
         Store::upsert_server(config, server.clone())?;
         Ok(server.clone())
     })?;

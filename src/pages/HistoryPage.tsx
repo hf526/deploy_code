@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Eraser, History, Layers, RefreshCw, RotateCcw, ScrollText, Trash2 } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -46,6 +46,17 @@ export default function HistoryPage() {
   const [releaseError, setReleaseError] = useState<string | null>(null);
   const [selectedRelease, setSelectedRelease] = useState("");
   const [switchingRelease, setSwitchingRelease] = useState(false);
+  // 请求序号：快速切换记录 / 关闭弹窗后，旧请求的响应必须丢弃，避免把版本切错服务器。
+  const releaseSeq = useRef(0);
+  // 切换请求序号：关闭弹窗会让在途切换的 finally 失效，避免误清新一轮切换的 loading。
+  const switchSeq = useRef(0);
+
+  const closeReleases = () => {
+    releaseSeq.current += 1;
+    switchSeq.current += 1;
+    setSwitchingRelease(false);
+    setReleaseRecord(null);
+  };
 
   const live = useApp((state) => state.live);
   const livePages = useApp((state) => state.livePages);
@@ -120,21 +131,26 @@ export default function HistoryPage() {
 
   /** 打开原子发布的版本列表（需要连接服务器读取 releases/）。 */
   async function openReleases(record: DeployRecord) {
+    const seq = ++releaseSeq.current;
     setReleaseRecord(record);
     setReleases(null);
     setReleaseError(null);
     setSelectedRelease("");
     try {
       const list = await api.listReleases(record.serverId, record.targetDir);
+      if (releaseSeq.current !== seq) return;
       setReleases(list);
       setSelectedRelease(list.find((item) => item.current)?.name ?? "");
     } catch (error) {
+      if (releaseSeq.current !== seq) return;
       setReleaseError(String(error));
     }
   }
 
   async function handleSwitchRelease() {
     if (!releaseRecord || !selectedRelease) return;
+    const seq = releaseSeq.current;
+    const mySwitch = ++switchSeq.current;
     setSwitchingRelease(true);
     try {
       const message = await api.rollbackRelease(
@@ -142,15 +158,17 @@ export default function HistoryPage() {
         releaseRecord.targetDir,
         selectedRelease,
       );
+      if (releaseSeq.current !== seq) return;
       toast("success", message.trim() || t("history.releaseSwitched"));
       const list = await api.listReleases(releaseRecord.serverId, releaseRecord.targetDir);
+      if (releaseSeq.current !== seq) return;
       setReleases(list);
       setSelectedRelease(list.find((item) => item.current)?.name ?? "");
       await refreshHistory();
     } catch (error) {
-      toast("error", String(error));
+      if (releaseSeq.current === seq) toast("error", String(error));
     } finally {
-      setSwitchingRelease(false);
+      if (switchSeq.current === mySwitch) setSwitchingRelease(false);
     }
   }
 
@@ -395,7 +413,7 @@ export default function HistoryPage() {
 
       <Modal
         open={!!releaseRecord}
-        onClose={() => setReleaseRecord(null)}
+        onClose={closeReleases}
         title={t("history.releasesTitle")}
         subtitle={
           releaseRecord
@@ -405,7 +423,7 @@ export default function HistoryPage() {
         width="max-w-xl"
         footer={
           <>
-            <Button variant="secondary" onClick={() => setReleaseRecord(null)}>
+            <Button variant="secondary" onClick={closeReleases}>
               {t("common.close")}
             </Button>
             <Button

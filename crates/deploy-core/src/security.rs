@@ -122,8 +122,9 @@ pub async fn collect(server: &ServerConfig, connect_timeout_secs: u64) -> Result
     let result = client.exec_capture(SCAN_SCRIPT, 60).await;
     client.disconnect().await;
     let (code, output) = result?;
-    // 脚本正常结束时最后一条 echo 返回 0；非 0 说明中途失败，避免把残缺报告当成功展示。
-    if code > 0 {
+    // 脚本正常结束时最后一条 echo 返回 0；非 0（含连接中断的 -1）说明中途失败，
+    // 避免把残缺报告当成功展示。
+    if code != 0 {
         let clean = clean_output(&output);
         return Err(CoreError::ssh(format!(
             "安全扫描脚本执行失败（退出码 {code}）：{}",

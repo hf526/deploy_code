@@ -177,12 +177,13 @@ fn register_repo(
         repo.default_server_id = match default_server_id.filter(|value| !value.trim().is_empty()) {
             Some(value) => {
                 let value = value.trim().to_string();
-                config
+                // 允许按名称传入，但统一存 id，避免服务器改名后引用悬空。
+                let server = config
                     .servers
                     .iter()
                     .find(|server| server.id == value || server.name == value)
                     .ok_or_else(|| CoreError::not_found(format!("服务器不存在: {value}")))?;
-                Some(value)
+                Some(server.id.clone())
             }
             None => None,
         };
@@ -231,13 +232,13 @@ pub fn update_repo(
             if value.is_empty() {
                 repo.default_server_id = None;
             } else {
-                // 防止保存悬空引用：默认服务器必须存在。
-                config
+                // 防止保存悬空引用：默认服务器必须存在；按名称传入时统一规范化为 id。
+                let server = config
                     .servers
                     .iter()
                     .find(|server| server.id == value || server.name == value)
                     .ok_or_else(|| CoreError::not_found(format!("服务器不存在: {value}")))?;
-                repo.default_server_id = Some(value);
+                repo.default_server_id = Some(server.id.clone());
             }
         }
         if let Some(value) = default_target_dir {

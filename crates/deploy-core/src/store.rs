@@ -326,6 +326,8 @@ impl Store {
                 record.status = DeployStatus::Failed;
                 record.error = Some(message.to_string());
                 record.finished_at = Some(now_string());
+                // 崩溃后无法得知真实结束时间，duration_ms 保持 0（界面显示为未知），
+                // 不能用「下次启动时刻」计算，否则会把停机时间也算进耗时。
                 converted += 1;
                 touched = true;
             }
@@ -463,13 +465,24 @@ impl Store {
                         index += 1;
                     }
                 }
+                // 与服务器字段的优先级保持一致（绑定目标 > 自定义连接串）：两者都配置时只迁移赢家。
+                // 否则 BackupConfig 中连接串优先于目标，会连到旧连接串指向的库。
+                let target_id = server
+                    .backup_target_id
+                    .clone()
+                    .filter(|value| !value.trim().is_empty());
+                let supabase_url = if target_id.is_some() {
+                    None
+                } else {
+                    server.supabase_url.clone()
+                };
                 additions.push(BackupConfig {
                     id: new_id(),
                     name,
                     server_id: server.id.clone(),
                     source,
-                    target_id: server.backup_target_id.clone(),
-                    supabase_url: server.supabase_url.clone(),
+                    target_id,
+                    supabase_url,
                 });
             }
             let created = additions.len();
@@ -481,7 +494,13 @@ impl Store {
 }
 
 fn paths_equal(a: &str, b: &str) -> bool {
-    let normalize = |p: &str| p.replace('\\', "/").trim_end_matches('/').to_lowercase();
+    let normalize = |p: &str| {
+        let normalized = p.replace('\\', "/");
+        // 大小写不敏感只适用于 Windows；Linux 上 /srv/App 与 /srv/app 是两个不同仓库。
+        #[cfg(windows)]
+        let normalized = normalized.to_lowercase();
+        normalized.trim_end_matches('/').to_string()
+    };
     normalize(a) == normalize(b)
 }
 
@@ -703,8 +722,10 @@ mod tests {
         first.backup_target_id = Some("t1".to_string());
         first.supabase_url = Some("postgresql://legacy@h/db".to_string());
         config.servers.push(first);
-        // 同名服务器迁移时要生成不冲突的配置名。
-        config.servers.push(server("prod", "h2"));
+        // 同名服务器迁移时要生成不冲突的配置名；没有绑定目标时旧连接串照常迁移。
+        let mut second = server("prod", "h2");
+        second.supabase_url = Some("postgresql://legacy@h2/db".to_string());
+        config.servers.push(second);
         store.save_config(&config).unwrap();
 
         assert_eq!(store.migrate_backup_configs().unwrap(), 2);
@@ -714,10 +735,14 @@ mod tests {
         assert_eq!(saved.backup_configs[0].name, "prod");
         assert_eq!(saved.backup_configs[1].name, "prod (2)");
         assert_eq!(saved.backup_configs[0].source.database, "app");
+        // 服务器同时配置了绑定目标与旧连接串时，以绑定目标为准（与服务器字段优先级一致），
+        // 旧的连接串不能一起迁移，否则会因配置中 URL 优先而备份到错误的库。
         assert_eq!(saved.backup_configs[0].target_id.as_deref(), Some("t1"));
+        assert_eq!(saved.backup_configs[0].supabase_url, None);
+        assert_eq!(saved.backup_configs[1].target_id, None);
         assert_eq!(
-            saved.backup_configs[0].supabase_url.as_deref(),
-            Some("postgresql://legacy@h/db")
+            saved.backup_configs[1].supabase_url.as_deref(),
+            Some("postgresql://legacy@h2/db")
         );
 
         // 只迁移一次：即使配置被删除也不会在下次启动时重建。

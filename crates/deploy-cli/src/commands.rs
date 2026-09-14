@@ -582,7 +582,8 @@ async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
         rev,
         server_id: server.id.clone(),
         target_dir,
-        run_scripts: !args.no_scripts && config.settings.run_scripts,
+        // 显式 --script 表示用户明确要执行脚本，即使全局设置关闭了脚本执行。
+        run_scripts: !args.no_scripts && (config.settings.run_scripts || !args.script.is_empty()),
         script_dir: args
             .script_dir
             .clone()
@@ -945,10 +946,18 @@ async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result<()> {
                             ));
                         }
                     }
-                    let supabase_url = args
-                        .supabase_url
-                        .clone()
-                        .or_else(|| existing.as_ref().and_then(|item| item.supabase_url.clone()));
+                    // 自定义连接串在解析时优先于目标：显式指定其中一个时清掉另一个，
+                    // 否则旧字段会压过新指定的目标，且无法从命令行纠正。
+                    let (target_id, supabase_url) = if args.supabase_url.is_some() {
+                        (None, args.supabase_url.clone())
+                    } else if args.target.is_some() {
+                        (target_id, None)
+                    } else {
+                        (
+                            target_id,
+                            existing.as_ref().and_then(|item| item.supabase_url.clone()),
+                        )
+                    };
 
                     let item = BackupConfig {
                         id: existing

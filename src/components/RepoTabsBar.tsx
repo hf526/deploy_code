@@ -50,7 +50,8 @@ export function RepoTabsBar({ activeRepoId }: { activeRepoId: string }) {
               aria-selected={active}
               onClick={() => active || runGuarded(() => navigate(`/repos/${repo.id}`))}
               onKeyDown={(event) => {
-                if (event.key === "Enter" && !active) {
+                // 关闭按钮的回车会冒泡到这里：只处理焦点在标签自身的情况。
+                if (event.key === "Enter" && !active && event.target === event.currentTarget) {
                   runGuarded(() => navigate(`/repos/${repo.id}`));
                 }
               }}

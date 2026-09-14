@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -725,12 +725,22 @@ impl Git {
                 "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
             )));
         }
-        let bytes = std::fs::read(&file).map_err(|e| CoreError::io_path(&file, e))?;
+        let mut handle = File::open(&file).map_err(|e| CoreError::io_path(&file, e))?;
+        // 只读取上限长度，避免超大文件（如 GB 级日志）整个读进内存导致 OOM。
+        let size = handle
+            .metadata()
+            .map_err(|e| CoreError::io_path(&file, e))?
+            .len();
+        let mut bytes: Vec<u8> = Vec::with_capacity(size.min(LIMIT as u64) as usize);
+        (&mut handle)
+            .take(LIMIT as u64)
+            .read_to_end(&mut bytes)
+            .map_err(|e| CoreError::io_path(&file, e))?;
         if bytes[..bytes.len().min(8000)].contains(&0) {
             return Err(CoreError::git("二进制文件，暂不支持预览"));
         }
-        let truncated = bytes.len() > LIMIT;
-        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(LIMIT)]).into_owned();
+        let truncated = size > LIMIT as u64;
+        let text = String::from_utf8_lossy(&bytes).into_owned();
         Ok(FileContent {
             path: rel,
             content: text,

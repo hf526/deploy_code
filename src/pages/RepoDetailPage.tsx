@@ -167,10 +167,12 @@ export default function RepoDetailPage() {
     const targetRepoId = repoId;
     if (!silent) setLoading(true);
     try {
-      const [nextDetail, nextBranches] = await Promise.all([
-        api.repoDetail(repoId),
-        api.listBranches(repoId, true),
-      ]);
+      const nextDetail = await api.repoDetail(repoId);
+      if (targetRepoId !== repoIdRef.current) return;
+      // 非 Git 文件夹没有分支（分支命令会报错），跳过；Git 仓库的分支错误仍照常抛出。
+      const nextBranches = nextDetail.repo.isRepo
+        ? await api.listBranches(repoId, true)
+        : [];
       if (targetRepoId !== repoIdRef.current) return;
       setDetail(nextDetail);
       setBranches(nextBranches);

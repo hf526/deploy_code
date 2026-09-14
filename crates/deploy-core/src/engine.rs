@@ -1,5 +1,6 @@
 use std::collections::{HashSet, VecDeque};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -21,11 +22,30 @@ use crate::store::Store;
 const MAX_LOG_LINES: usize = 8000;
 
 /// 部署结束后自动删除本地临时归档（成功或失败都会触发）。
-struct TempArchiveGuard(PathBuf);
+///
+/// 打包跑在 `spawn_blocking` 中，任务被 abort 时无法中断阻塞线程：guard 释放时归档文件
+/// 可能尚未创建。因此除了立刻删除，还记录「已取消」标记，让打包线程结束后再清理一次，
+/// 避免取消部署后临时文件残留在数据目录。
+struct TempArchiveGuard {
+    paths: Vec<PathBuf>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl TempArchiveGuard {
+    fn new(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
 
 impl Drop for TempArchiveGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        self.cancelled.store(true, Ordering::SeqCst);
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
@@ -278,10 +298,10 @@ impl DeployEngine {
         );
         let archive_name = format!("{stem}.tar.gz");
         let tar_path = self.store.prepare_temp_file(&format!("{stem}.tar"))?;
-        let _tar_guard = TempArchiveGuard(tar_path.clone());
         let gz_path = self.store.prepare_temp_file(&archive_name)?;
-        // 部署结束（含失败）后删除本地临时压缩包，避免 temp 目录无限增长。
-        let _archive_guard = TempArchiveGuard(gz_path.clone());
+        // 部署结束（含失败 / 取消）后删除本地临时压缩包，避免 temp 目录无限增长。
+        let archive_guard = TempArchiveGuard::new(vec![tar_path.clone(), gz_path.clone()]);
+        let archive_cancelled = archive_guard.cancelled.clone();
         let size = {
             let repo_path = repo.path.clone();
             let commit = record.commit.clone();
@@ -290,11 +310,17 @@ impl DeployEngine {
             let gz = gz_path.clone();
             tokio::task::spawn_blocking(move || -> Result<u64> {
                 let git = Git::open(&repo_path)?;
-                if worktree {
+                let result = if worktree {
                     git.archive_worktree(&tar, &gz)
                 } else {
                     git.archive(&commit, &tar, &gz)
+                };
+                // 任务被 abort 时 guard 已先行删除（此时文件可能还没建出来）：这里补删一次。
+                if archive_cancelled.load(Ordering::SeqCst) {
+                    let _ = std::fs::remove_file(&tar);
+                    let _ = std::fs::remove_file(&gz);
                 }
+                result
             })
             .await
             .map_err(|err| CoreError::deploy(format!("打包任务异常: {err}")))??

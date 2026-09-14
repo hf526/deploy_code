@@ -103,8 +103,11 @@ export function FileExplorer({
     setExpanded((prev) => ({ ...prev, [entry.path]: open }));
     // 出错后允许重新展开重试。
     if (open && (!children[entry.path] || dirErrors[entry.path])) {
+      // 记录代际：切换仓库（硬刷新）后旧仓库的在途请求结果必须丢弃，否则会串台缓存。
+      const seq = reloadSeq.current;
       try {
         const entries = await load(entry.path);
+        if (reloadSeq.current !== seq) return;
         setChildren((prev) => ({ ...prev, [entry.path]: entries }));
         setDirErrors((prev) => {
           if (!(entry.path in prev)) return prev;
@@ -113,6 +116,7 @@ export function FileExplorer({
           return next;
         });
       } catch (err) {
+        if (reloadSeq.current !== seq) return;
         setChildren((prev) => ({ ...prev, [entry.path]: [] }));
         setDirErrors((prev) => ({ ...prev, [entry.path]: String(err) }));
       }

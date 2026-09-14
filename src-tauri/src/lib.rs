@@ -131,7 +131,9 @@ pub fn run() {
             if !EXIT_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
                 let state = app_handle.state::<AppState>();
                 let pages_active = state.has_active_pages();
-                let deploys = state.take_deploys();
+                let mut deploys = state.take_deploys();
+                // 取消部署后仍在做的远端清理也要纳入退出清理。
+                deploys.extend(state.take_pending_cleanups());
                 let backups = state.take_backups();
                 if deploys.is_empty() && backups.is_empty() && !pages_active {
                     // 没有进行中的任务：正常退出。

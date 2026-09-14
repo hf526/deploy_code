@@ -243,6 +243,9 @@ export default function DeployPage() {
     const files = repo.envFiles ?? [];
     setEnvFiles(files);
     setUploadEnv(files.length > 0);
+    // 脚本列表与跳过构建属于「单次部署选择」，切换仓库时清空，避免把上一个仓库的脚本带到新仓库。
+    setScripts([]);
+    setSkipBuild(false);
   }, [repoId, repos]);
 
   useEffect(() => {

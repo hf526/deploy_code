@@ -162,37 +162,59 @@ export const useApp = create<AppStore>((set, get) => ({
       get().toast("error", message);
     }
 
-    // 对账后台任务：重载后可能错过 finished 事件，用持久化记录收敛，避免 live 永久卡在 running。
+    // 对账后台任务：重载后可能错过 finished/started 事件，用持久化记录收敛，避免 live 永久卡在 running。
+    // history 等列表接口返回的是「新 -> 旧」，find 直接取最近一条即可。
     const { live: currentLive, liveBackup: currentBackup, livePages: currentPages } = get();
     if (currentLive?.status === "running" && historyResult.status === "fulfilled") {
       const record = currentLive.recordId
         ? historyResult.value.find((item) => item.id === currentLive.recordId)
-        : [...historyResult.value].reverse().find((item) => item.status === "running");
-      if (record && record.status !== "running") {
-        set({ live: { ...currentLive, status: record.status, record, progress: 100 } });
-      } else if (!record && !currentLive.recordId) {
+        : historyResult.value.find((item) => item.status === "running");
+      if (record) {
+        set({
+          live: {
+            ...currentLive,
+            // 补回 recordId，否则「停止部署」按钮会一直禁用。
+            recordId: currentLive.recordId || record.id,
+            ...(record.status !== "running"
+              ? { status: record.status, record, progress: 100 }
+              : {}),
+          },
+        });
+      } else if (!currentLive.recordId) {
         set({ live: null });
       }
     }
     if (currentBackup?.status === "running" && backupsResult.status === "fulfilled") {
       const record = currentBackup.recordId
         ? backupsResult.value.find((item) => item.id === currentBackup.recordId)
-        : [...backupsResult.value].reverse().find((item) => item.status === "running");
-      if (record && record.status !== "running") {
+        : backupsResult.value.find((item) => item.status === "running");
+      if (record) {
         set({
-          liveBackup: { ...currentBackup, status: record.status, record, progress: 100 },
+          liveBackup: {
+            ...currentBackup,
+            recordId: currentBackup.recordId || record.id,
+            ...(record.status !== "running"
+              ? { status: record.status, record, progress: 100 }
+              : {}),
+          },
         });
-      } else if (!record && !currentBackup.recordId) {
+      } else if (!currentBackup.recordId) {
         set({ liveBackup: null });
       }
     }
     if (currentPages?.status === "running" && pagesResult.status === "fulfilled") {
       const record = currentPages.recordId
         ? pagesResult.value.find((item) => item.id === currentPages.recordId)
-        : [...pagesResult.value].reverse().find((item) => item.status === "running");
-      if (record && record.status !== "running") {
-        set({ livePages: { ...currentPages, status: record.status, record } });
-      } else if (!record && !currentPages.recordId) {
+        : pagesResult.value.find((item) => item.status === "running");
+      if (record) {
+        set({
+          livePages: {
+            ...currentPages,
+            recordId: currentPages.recordId || record.id,
+            ...(record.status !== "running" ? { status: record.status, record } : {}),
+          },
+        });
+      } else if (!currentPages.recordId) {
         set({ livePages: null });
       }
     }
@@ -328,14 +350,19 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   cancelDeploy: async () => {
-    const { live } = get();
-    if (!live || live.status !== "running" || !live.recordId) return;
+    const { live, history } = get();
+    if (!live || live.status !== "running") return;
+    // 重载后 live.recordId 可能为空：从历史记录的 running 项兜底解析。
+    const recordId = live.recordId || history.find((item) => item.status === "running")?.id;
+    if (!recordId) return;
     try {
-      await api.cancelDeploy(live.recordId);
+      await api.cancelDeploy(recordId);
       // 后端会推送 finished 事件；这里先收敛状态，避免按钮停留在 running。
+      // 只在仍是同一任务时收敛，避免覆盖期间开始的其它任务状态。
       set((state) =>
-        state.live?.recordId === live.recordId
-          ? { live: { ...state.live, status: "failed", progress: 100 } }
+        state.live?.status === "running" &&
+        (!state.live.recordId || state.live.recordId === recordId)
+          ? { live: { ...state.live, recordId, status: "failed", progress: 100 } }
           : {},
       );
     } catch (error) {
@@ -378,7 +405,7 @@ export const useApp = create<AppStore>((set, get) => ({
       if (event.type === "log") {
         set({
           live: {
-            recordId: "",
+            recordId: get().history.find((item) => item.status === "running")?.id ?? "",
             lines: [{ level: event.level, message: event.message }],
             progress: 0,
             status: "running",
@@ -390,7 +417,7 @@ export const useApp = create<AppStore>((set, get) => ({
       if (event.type === "progress") {
         set({
           live: {
-            recordId: "",
+            recordId: get().history.find((item) => item.status === "running")?.id ?? "",
             lines: [],
             progress: event.percent,
             status: "running",
@@ -491,7 +518,7 @@ export const useApp = create<AppStore>((set, get) => ({
       if (event.type === "log") {
         set({
           liveBackup: {
-            recordId: "",
+            recordId: get().backups.find((item) => item.status === "running")?.id ?? "",
             lines: [{ level: event.level, message: event.message }],
             progress: 0,
             status: "running",
@@ -503,7 +530,7 @@ export const useApp = create<AppStore>((set, get) => ({
       if (event.type === "progress") {
         set({
           liveBackup: {
-            recordId: "",
+            recordId: get().backups.find((item) => item.status === "running")?.id ?? "",
             lines: [],
             progress: event.percent,
             status: "running",
@@ -608,7 +635,7 @@ export const useApp = create<AppStore>((set, get) => ({
       if (event.type === "log") {
         set({
           livePages: {
-            recordId: "",
+            recordId: get().pagesRecords.find((item) => item.status === "running")?.id ?? "",
             lines: [{ level: event.level, message: event.message }],
             status: "running",
             record: null,

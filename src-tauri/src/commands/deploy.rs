@@ -115,6 +115,10 @@ pub async fn cancel_deploy(
     // 留一点时间给任务退出，避免它与下面的记录写入互相覆盖。
     tokio::time::sleep(Duration::from_millis(300)).await;
 
+    // 中止后任务守卫会摘除 active_deploys；单独登记到 pending_cleanups，
+    // 保证取消清理期间退出应用时仍会终止远端脚本。
+    state.add_pending_cleanup(&record_id, active.clone());
+
     // 重连服务器终止远端脚本进程组并清理残留压缩包；清理失败不影响取消结果。
     if let Ok(config) = state.store.load_config() {
         if let Ok(server) = Store::find_server(&config, &active.server_id) {
@@ -126,6 +130,7 @@ pub async fn cancel_deploy(
             .await;
         }
     }
+    state.remove_pending_cleanup(&record_id);
 
     // 记录收敛为失败（已取消）；引擎任务被中止后不会再写这条记录。
     // 记录可能已被手动删除（或读取失败）：此时不阻断取消流程，界面由命令成功返回收敛。

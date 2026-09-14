@@ -573,6 +573,65 @@ fn validate_target_url(url: &str) -> Result<String> {
     }
 }
 
+/// 定位连接串 authority 的结束位置，以及 userinfo 分界 `@` 的位置（如果有）。
+///
+/// 常规情况：authority 截止到第一个 `/`、`?`、`#`。
+/// 密码里可能出现未编码的 `/`（如 `user:p/ss@host`），此时第一个 `/` 之前没有 `@`，
+/// 但查询 / 片段之前存在 `@`。
+///
+/// `assume_late_at_is_userinfo` 决定这种歧义输入的取舍：
+/// - `true`（脱敏展示）：一律当作 userinfo，宁可多遮蔽也不能漏出密码明文；
+///   代价是 `host:5432/db@name` 会被显示成 `host:***@name`。
+/// - `false`（连接串解析）：只有第一个 `/` 前的部分不像 `host[:port]` 时才当作 userinfo，
+///   且取第一个 `@`（避免密码含 `/` 且路径也含 `@` 时把路径的 `@` 当成分界）。
+///   歧义输入保持原样交给 psql，宁可报错也不要连到错误的主机 / 库。
+fn locate_authority(rest: &str, assume_late_at_is_userinfo: bool) -> (usize, Option<usize>) {
+    let first_sep = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let host_end_after = |at: usize| {
+        rest[at + 1..]
+            .find(['/', '?', '#'])
+            .map(|offset| at + 1 + offset)
+            .unwrap_or(rest.len())
+    };
+
+    if let Some(at) = rest[..first_sep].rfind('@') {
+        return (host_end_after(at), Some(at));
+    }
+
+    let query_limit = rest.find(['?', '#']).unwrap_or(rest.len());
+    let late = if assume_late_at_is_userinfo {
+        rest[..query_limit].rfind('@')
+    } else {
+        rest[first_sep..query_limit]
+            .find('@')
+            .map(|offset| first_sep + offset)
+    };
+    match late {
+        Some(at) if assume_late_at_is_userinfo || !looks_like_host_port(&rest[..first_sep]) => {
+            (host_end_after(at), Some(at))
+        }
+        _ => (first_sep, None),
+    }
+}
+
+/// 判断 authority 片段是否像 `host[:port]`（含 IPv6）：端口必须是纯数字。
+fn looks_like_host_port(prefix: &str) -> bool {
+    if let Some(rest) = prefix.strip_prefix('[') {
+        let Some(end) = rest.find(']') else {
+            return false;
+        };
+        let tail = &rest[end + 1..];
+        return tail.is_empty()
+            || tail
+                .strip_prefix(':')
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()));
+    }
+    match prefix.split_once(':') {
+        Some((_, port)) => !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
+        None => true,
+    }
+}
+
 /// 隐藏连接串中的密码（userinfo 与查询参数），用于日志与记录展示。
 pub fn mask_database_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
@@ -581,29 +640,20 @@ pub fn mask_database_url(url: &str) -> String {
     let scheme = &url[..scheme_end];
     let rest = &url[scheme_end + 3..];
 
-    // 用户信息分界：只在查询 / 片段之前找最后一个 '@'，避免把查询参数里的 '@' 当成 host 分界；
-    // 密码里可能出现未编码的 '/'，因此不能用第一个 '/' 截断 authority。
-    let query_limit = rest.find(['?', '#']).unwrap_or(rest.len());
-    let (authority_end, authority) = match rest[..query_limit].rfind('@') {
+    // 脱敏按「宁可多遮蔽」处理：不能因为无法区分而漏出密码明文。
+    let (authority_end, at) = locate_authority(rest, true);
+    let authority = match at {
         Some(at) => {
-            let host_end = rest[at + 1..]
-                .find(['/', '?', '#'])
-                .map(|offset| at + 1 + offset)
-                .unwrap_or(rest.len());
             let creds = &rest[..at];
             let user = creds.split(':').next().unwrap_or(creds);
-            let host = &rest[at + 1..host_end];
-            let masked = if creds.contains(':') {
+            let host = &rest[at + 1..authority_end];
+            if creds.contains(':') {
                 format!("{user}:***@{host}")
             } else {
                 format!("{user}@{host}")
-            };
-            (host_end, masked)
+            }
         }
-        None => {
-            let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-            (end, rest[..end].to_string())
-        }
+        None => rest[..authority_end].to_string(),
     };
 
     format!(
@@ -655,7 +705,8 @@ pub fn split_database_url(url: &str) -> Result<(String, Option<String>)> {
         ));
     }
     let rest = &url[scheme_end + 3..];
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    // 歧义输入（如密码含未编码 '/'）保守处理：拿不准就不剥离密码，让 psql 报错而不是连错库。
+    let (authority_end, _) = locate_authority(rest, false);
     let authority = &rest[..authority_end];
     let remainder = &rest[authority_end..];
 
@@ -1116,6 +1167,15 @@ mod tests {
             mask_database_url("postgresql://user:p/ss@host:5432/db"),
             "postgresql://user:***@host:5432/db"
         );
+        // 密码前段是纯数字时同样必须遮蔽（宁可把路径里的 '@' 一起遮掉，也不能漏明文）。
+        assert_eq!(
+            mask_database_url("postgresql://admin:888888/password@host/db"),
+            "postgresql://admin:***@host/db"
+        );
+        assert_eq!(
+            mask_database_url("postgresql://host:5432/db@name"),
+            "postgresql://host:***@name"
+        );
         // 查询参数里的 '@' 不应被当作 host 分界。
         assert_eq!(
             mask_database_url("postgresql://host/db?user=a@b&password=s@cret"),
@@ -1135,6 +1195,27 @@ mod tests {
         let (url, password) = split_database_url("postgres://u:p%40ss%3Aword@h/db").unwrap();
         assert_eq!(url, "postgres://u@h/db");
         assert_eq!(password.as_deref(), Some("p@ss:word"));
+
+        // 密码含未编码 '/' 时不能按第一个 '/' 截断（与 mask_database_url 行为一致）。
+        let (url, password) = split_database_url("postgresql://user:p/ss@host:5432/db").unwrap();
+        assert_eq!(url, "postgresql://user@host:5432/db");
+        assert_eq!(password.as_deref(), Some("p/ss"));
+
+        // 路径里的 '@'（前缀是 host:port）不能被当成 userinfo。
+        let (url, password) = split_database_url("postgresql://host:5432/db@name").unwrap();
+        assert_eq!(url, "postgresql://host:5432/db@name");
+        assert!(password.is_none());
+
+        // 密码含 '/' 且路径也含 '@'：取第一个 '@' 做分界，不能把路径的 '@' 当分界。
+        let (url, password) =
+            split_database_url("postgresql://user:p/ss@host:5432/db@name").unwrap();
+        assert_eq!(url, "postgresql://user@host:5432/db@name");
+        assert_eq!(password.as_deref(), Some("p/ss"));
+
+        // 无法区分「密码含 '/'」与「host:port + 路径」时保守处理：不剥离密码，交给 psql 报错。
+        let (url, password) = split_database_url("postgresql://admin:888888/password@host/db").unwrap();
+        assert_eq!(url, "postgresql://admin:888888/password@host/db");
+        assert!(password.is_none());
 
         // 查询参数中的 password 也会被提取并从连接串移除。
         let (url, password) =

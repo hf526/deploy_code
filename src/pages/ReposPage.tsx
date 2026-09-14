@@ -228,7 +228,10 @@ export default function ReposPage() {
                 tabIndex={0}
                 onClick={() => navigate(`/repos/${repo.id}`)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") navigate(`/repos/${repo.id}`);
+                  // 卡片内按钮的回车会冒泡到这里：只处理焦点在卡片自身的情况。
+                  if (event.key === "Enter" && event.target === event.currentTarget) {
+                    navigate(`/repos/${repo.id}`);
+                  }
                 }}
                 className="ui-card group flex cursor-pointer items-center gap-4 px-5 py-4 transition-[border-color,box-shadow,transform] duration-150 hover:-translate-y-0.5 hover:border-brand-line hover:shadow-pop"
               >
