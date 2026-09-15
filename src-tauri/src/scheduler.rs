@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use chrono::{Local, NaiveTime, TimeZone};
 use deploy_core::models::BackupRequest;
+use deploy_core::CoreError;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -110,8 +111,9 @@ pub fn spawn(app: AppHandle) {
                 }
                 Err(err) => {
                     // 已有备份（手动或 CLI）在跑：窗口内继续等待，不算失败。
+                    // 用错误类型判断而非字符串匹配，文案变化不会让重试逻辑静默失效。
                     let busy = app.state::<AppState>().is_backup_active()
-                        || err.to_string().contains("已有备份正在进行");
+                        || matches!(&err, CoreError::Busy(_));
                     if !busy {
                         pending = None;
                         emit_notice(&app, "failed", Some(err.to_string()));

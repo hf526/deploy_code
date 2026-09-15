@@ -1,5 +1,4 @@
 import { lazy, Suspense, useEffect } from "react";
-import { listen } from "@tauri-apps/api/event";
 import { useTranslation } from "react-i18next";
 import { HashRouter, Navigate, Route, Routes, useLocation } from "react-router-dom";
 
@@ -10,6 +9,7 @@ import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/ui";
 import i18n, { applyLanguage } from "./lib/i18n";
 import { useApp } from "./lib/store";
+import { useTauriEvent } from "./lib/useTauriEvent";
 import type { BackupEvent, DeployEvent, PagesEvent, SchedulerNotice } from "./lib/types";
 
 // 按页面分包：启动只加载首屏，其余页面首次访问时按需加载。
@@ -84,92 +84,18 @@ export default function App() {
     applyLanguage(settingsLanguage);
   }, [settingsLanguage]);
 
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void listen<DeployEvent>("deploy://event", (event) => {
-      handleDeployEvent(event.payload);
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [handleDeployEvent]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void listen<BackupEvent>("backup://event", (event) => {
-      handleBackupEvent(event.payload);
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [handleBackupEvent]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void listen<PagesEvent>("pages://event", (event) => {
-      handlePagesEvent(event.payload);
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [handlePagesEvent]);
-
-  useEffect(() => {
-    let disposed = false;
-    let unlisten: (() => void) | undefined;
-
-    void listen<SchedulerNotice>("scheduler://notice", (event) => {
-      const { kind, message } = event.payload;
-      if (kind === "started") {
-        toast("success", i18n.t("backup.schedule.started"));
-      } else if (kind === "noConfig") {
-        toast("error", i18n.t("backup.schedule.noConfig"));
-      } else {
-        toast("error", i18n.t("backup.schedule.failed", { error: message ?? "" }));
-      }
-    }).then((fn) => {
-      if (disposed) {
-        fn();
-      } else {
-        unlisten = fn;
-      }
-    });
-
-    return () => {
-      disposed = true;
-      unlisten?.();
-    };
-  }, [toast]);
+  useTauriEvent<DeployEvent>("deploy://event", handleDeployEvent);
+  useTauriEvent<BackupEvent>("backup://event", handleBackupEvent);
+  useTauriEvent<PagesEvent>("pages://event", handlePagesEvent);
+  useTauriEvent<SchedulerNotice>("scheduler://notice", (notice) => {
+    if (notice.kind === "started") {
+      toast("success", i18n.t("backup.schedule.started"));
+    } else if (notice.kind === "noConfig") {
+      toast("error", i18n.t("backup.schedule.noConfig"));
+    } else {
+      toast("error", i18n.t("backup.schedule.failed", { error: notice.message ?? "" }));
+    }
+  });
 
   return (
     <HashRouter>

@@ -18,6 +18,11 @@ pub enum CoreError {
     #[error("未找到: {0}")]
     NotFound(String),
 
+    /// 有互斥任务正在进行（部署 / 备份 / Pages 抢占失败）。
+    /// 调用方（如定时调度器）依赖该类型区分「稍后重试」与真实失败，不要只用字符串匹配。
+    #[error("任务冲突: {0}")]
+    Busy(String),
+
     #[error("部署失败: {0}")]
     Deploy(String),
 
@@ -49,6 +54,10 @@ impl CoreError {
 
     pub fn not_found(msg: impl Into<String>) -> Self {
         Self::NotFound(msg.into())
+    }
+
+    pub fn busy(msg: impl Into<String>) -> Self {
+        Self::Busy(msg.into())
     }
 
     pub fn deploy(msg: impl Into<String>) -> Self {

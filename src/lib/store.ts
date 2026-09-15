@@ -2,6 +2,7 @@ import { create } from "zustand";
 
 import { api } from "./api";
 import i18n from "./i18n";
+import { applyTaskEvent, reconcileLiveTask } from "./liveTask";
 import type {
   BackupConfig,
   BackupEvent,
@@ -52,7 +53,6 @@ export const defaultSettings: Settings = {
 };
 
 let toastSeq = 0;
-const MAX_LIVE_LINES = 6000;
 
 interface AppStore {
   ready: boolean;
@@ -168,59 +168,21 @@ export const useApp = create<AppStore>((set, get) => ({
     // 对账后台任务：重载后可能错过 finished/started 事件，用持久化记录收敛，避免 live 永久卡在 running。
     // history 等列表接口返回的是「新 -> 旧」，find 直接取最近一条即可。
     const { live: currentLive, liveBackup: currentBackup, livePages: currentPages } = get();
-    if (currentLive?.status === "running" && historyResult.status === "fulfilled") {
-      const record = currentLive.recordId
-        ? historyResult.value.find((item) => item.id === currentLive.recordId)
-        : historyResult.value.find((item) => item.status === "running");
-      if (record) {
-        set({
-          live: {
-            ...currentLive,
-            // 补回 recordId，否则「停止部署」按钮会一直禁用。
-            recordId: currentLive.recordId || record.id,
-            ...(record.status !== "running"
-              ? { status: record.status, record, progress: 100 }
-              : {}),
-          },
-        });
-      } else if (!currentLive.recordId) {
-        set({ live: null });
-      }
-    }
-    if (currentBackup?.status === "running" && backupsResult.status === "fulfilled") {
-      const record = currentBackup.recordId
-        ? backupsResult.value.find((item) => item.id === currentBackup.recordId)
-        : backupsResult.value.find((item) => item.status === "running");
-      if (record) {
-        set({
-          liveBackup: {
-            ...currentBackup,
-            recordId: currentBackup.recordId || record.id,
-            ...(record.status !== "running"
-              ? { status: record.status, record, progress: 100 }
-              : {}),
-          },
-        });
-      } else if (!currentBackup.recordId) {
-        set({ liveBackup: null });
-      }
-    }
-    if (currentPages?.status === "running" && pagesResult.status === "fulfilled") {
-      const record = currentPages.recordId
-        ? pagesResult.value.find((item) => item.id === currentPages.recordId)
-        : pagesResult.value.find((item) => item.status === "running");
-      if (record) {
-        set({
-          livePages: {
-            ...currentPages,
-            recordId: currentPages.recordId || record.id,
-            ...(record.status !== "running" ? { status: record.status, record } : {}),
-          },
-        });
-      } else if (!currentPages.recordId) {
-        set({ livePages: null });
-      }
-    }
+    const nextLive = reconcileLiveTask(
+      currentLive,
+      historyResult.status === "fulfilled" ? historyResult.value : null,
+    );
+    if (nextLive !== undefined) set({ live: nextLive });
+    const nextBackup = reconcileLiveTask(
+      currentBackup,
+      backupsResult.status === "fulfilled" ? backupsResult.value : null,
+    );
+    if (nextBackup !== undefined) set({ liveBackup: nextBackup });
+    const nextPages = reconcileLiveTask(
+      currentPages,
+      pagesResult.status === "fulfilled" ? pagesResult.value : null,
+    );
+    if (nextPages !== undefined) set({ livePages: nextPages });
   },
 
   refreshRepos: async () => {
@@ -374,94 +336,25 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   handleDeployEvent: (event) => {
-    const { live } = get();
-
-    const announce = (record: DeployRecord) => {
-      void get().refreshHistory();
-      if (record.status === "success") {
-        get().toast("success", i18n.t("deploy.toast.success", { name: record.repoName }));
-      } else {
-        get().toast(
-          "error",
-          i18n.t("deploy.toast.failed", {
-            name: record.repoName,
-            error: record.error ?? i18n.t("common.unknownError"),
-          }),
-        );
-      }
-    };
-
-    if (!live) {
-      // 刷新/重载后 live 为空，但后台部署仍在跑：按事件补建 live 状态，后续日志/进度才能继续接收。
-      if (event.type === "started") {
-        set({
-          live: {
-            recordId: event.recordId,
-            lines: [],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      if (event.type === "log") {
-        set({
-          live: {
-            recordId: get().history.find((item) => item.status === "running")?.id ?? "",
-            lines: [{ level: event.level, message: event.message }],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      if (event.type === "progress") {
-        set({
-          live: {
-            recordId: get().history.find((item) => item.status === "running")?.id ?? "",
-            lines: [],
-            progress: event.percent,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      announce(event.record);
-      return;
-    }
-
-    switch (event.type) {
-      case "started":
-        // 新一轮任务开始：清空上一轮的日志 / 进度与结果状态。
-        set({
-          live: {
-            ...live,
-            recordId: event.recordId,
-            lines: [],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        break;
-      case "log": {
-        const lines = [...live.lines, { level: event.level, message: event.message }];
-        if (lines.length > MAX_LIVE_LINES) lines.splice(0, lines.length - MAX_LIVE_LINES);
-        set({ live: { ...live, lines } });
-        break;
-      }
-      case "progress":
-        set({ live: { ...live, progress: event.percent } });
-        break;
-      case "finished": {
-        set({ live: { ...live, status: event.record.status, record: event.record, progress: 100 } });
-        announce(event.record);
-        break;
-      }
-    }
+    applyTaskEvent<DeployRecord>(event, {
+      getLive: () => get().live,
+      setLive: (live) => set({ live }),
+      findRunningId: () => get().history.find((item) => item.status === "running")?.id ?? "",
+      announce: (record) => {
+        void get().refreshHistory();
+        if (record.status === "success") {
+          get().toast("success", i18n.t("deploy.toast.success", { name: record.repoName }));
+        } else {
+          get().toast(
+            "error",
+            i18n.t("deploy.toast.failed", {
+              name: record.repoName,
+              error: record.error ?? i18n.t("common.unknownError"),
+            }),
+          );
+        }
+      },
+    });
   },
 
   clearLive: () => set({ live: null }),
@@ -489,99 +382,23 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   handleBackupEvent: (event) => {
-    const { liveBackup } = get();
-
-    const announce = (record: BackupRecord) => {
-      void get().refreshBackups();
-      const name = `${record.serverName} · ${record.database}`;
-      if (record.status === "success") {
-        get().toast("success", i18n.t("backup.toast.success", { name }));
-      } else {
-        get().toast(
-          "error",
-          i18n.t("backup.toast.failed", { name, error: record.error ?? i18n.t("common.unknownError") }),
-        );
-      }
-    };
-
-    if (!liveBackup) {
-      // 与部署事件一致：补建 live 状态，避免重载后丢失后续日志/进度。
-      if (event.type === "started") {
-        set({
-          liveBackup: {
-            recordId: event.recordId,
-            lines: [],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      if (event.type === "log") {
-        set({
-          liveBackup: {
-            recordId: get().backups.find((item) => item.status === "running")?.id ?? "",
-            lines: [{ level: event.level, message: event.message }],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      if (event.type === "progress") {
-        set({
-          liveBackup: {
-            recordId: get().backups.find((item) => item.status === "running")?.id ?? "",
-            lines: [],
-            progress: event.percent,
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      announce(event.record);
-      return;
-    }
-
-    switch (event.type) {
-      case "started":
-        // 新一轮任务开始：清空上一轮的日志 / 进度与结果状态。
-        set({
-          liveBackup: {
-            ...liveBackup,
-            recordId: event.recordId,
-            lines: [],
-            progress: 0,
-            status: "running",
-            record: null,
-          },
-        });
-        break;
-      case "log": {
-        const lines = [...liveBackup.lines, { level: event.level, message: event.message }];
-        if (lines.length > MAX_LIVE_LINES) lines.splice(0, lines.length - MAX_LIVE_LINES);
-        set({ liveBackup: { ...liveBackup, lines } });
-        break;
-      }
-      case "progress":
-        set({ liveBackup: { ...liveBackup, progress: event.percent } });
-        break;
-      case "finished": {
-        set({
-          liveBackup: {
-            ...liveBackup,
-            status: event.record.status,
-            record: event.record,
-            progress: 100,
-          },
-        });
-        announce(event.record);
-        break;
-      }
-    }
+    applyTaskEvent<BackupRecord>(event, {
+      getLive: () => get().liveBackup,
+      setLive: (live) => set({ liveBackup: live }),
+      findRunningId: () => get().backups.find((item) => item.status === "running")?.id ?? "",
+      announce: (record) => {
+        void get().refreshBackups();
+        const name = `${record.serverName} · ${record.database}`;
+        if (record.status === "success") {
+          get().toast("success", i18n.t("backup.toast.success", { name }));
+        } else {
+          get().toast(
+            "error",
+            i18n.t("backup.toast.failed", { name, error: record.error ?? i18n.t("common.unknownError") }),
+          );
+        }
+      },
+    });
   },
 
   clearLiveBackup: () => set({ liveBackup: null }),
@@ -593,7 +410,7 @@ export const useApp = create<AppStore>((set, get) => ({
       throw new Error(message);
     }
     set({
-      livePages: { recordId: "", lines: [], status: "running", record: null },
+      livePages: { recordId: "", lines: [], progress: 0, status: "running", record: null },
     });
     try {
       const recordId = await api.startPagesDeploy(request);
@@ -607,74 +424,28 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   handlePagesEvent: (event) => {
-    const { livePages } = get();
-
-    const announce = (record: PagesDeployRecord) => {
-      void get().refreshPagesRecords();
-      const name = `${record.repoName} -> ${record.projectName}`;
-      if (record.status === "success") {
-        get().toast(
-          "success",
-          record.url
-            ? i18n.t("pages.toast.successUrl", { name, url: record.url })
-            : i18n.t("pages.toast.success", { name }),
-        );
-      } else {
-        get().toast(
-          "error",
-          i18n.t("pages.toast.failed", { name, error: record.error ?? i18n.t("common.unknownError") }),
-        );
-      }
-    };
-
-    if (!livePages) {
-      // 重载/事件先到：把已开始的任务补进 live 状态，避免后续日志全部丢失。
-      if (event.type === "started") {
-        set({
-          livePages: { recordId: event.recordId, lines: [], status: "running", record: null },
-        });
-        return;
-      }
-      if (event.type === "log") {
-        set({
-          livePages: {
-            recordId: get().pagesRecords.find((item) => item.status === "running")?.id ?? "",
-            lines: [{ level: event.level, message: event.message }],
-            status: "running",
-            record: null,
-          },
-        });
-        return;
-      }
-      announce(event.record);
-      return;
-    }
-
-    switch (event.type) {
-      case "started":
-        // 新一轮任务开始：清空上一轮的日志与结果状态。
-        set({
-          livePages: {
-            ...livePages,
-            recordId: event.recordId,
-            lines: [],
-            status: "running",
-            record: null,
-          },
-        });
-        break;
-      case "log": {
-        const lines = [...livePages.lines, { level: event.level, message: event.message }];
-        if (lines.length > MAX_LIVE_LINES) lines.splice(0, lines.length - MAX_LIVE_LINES);
-        set({ livePages: { ...livePages, lines } });
-        break;
-      }
-      case "finished": {
-        set({ livePages: { ...livePages, status: event.record.status, record: event.record } });
-        announce(event.record);
-        break;
-      }
-    }
+    applyTaskEvent<PagesDeployRecord>(event, {
+      getLive: () => get().livePages,
+      setLive: (live) => set({ livePages: live }),
+      findRunningId: () => get().pagesRecords.find((item) => item.status === "running")?.id ?? "",
+      announce: (record) => {
+        void get().refreshPagesRecords();
+        const name = `${record.repoName} -> ${record.projectName}`;
+        if (record.status === "success") {
+          get().toast(
+            "success",
+            record.url
+              ? i18n.t("pages.toast.successUrl", { name, url: record.url })
+              : i18n.t("pages.toast.success", { name }),
+          );
+        } else {
+          get().toast(
+            "error",
+            i18n.t("pages.toast.failed", { name, error: record.error ?? i18n.t("common.unknownError") }),
+          );
+        }
+      },
+    });
   },
 
   clearLivePages: () => set({ livePages: null }),

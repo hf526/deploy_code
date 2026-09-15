@@ -232,13 +232,16 @@ export interface LogLine {
   message: string;
 }
 
-export interface LiveDeploy {
+/** 长任务（部署 / 备份 / Pages）的实时状态：字段一致，仅任务记录类型不同。 */
+export interface LiveTask<TRecord> {
   recordId: string;
   lines: LogLine[];
   progress: number;
   status: DeployStatus;
-  record: DeployRecord | null;
+  record: TRecord | null;
 }
+
+export type LiveDeploy = LiveTask<DeployRecord>;
 
 export interface BackupRecord {
   id: string;
@@ -273,13 +276,7 @@ export type BackupEvent =
   | { type: "progress"; percent: number; message: string }
   | { type: "finished"; record: BackupRecord };
 
-export interface LiveBackup {
-  recordId: string;
-  lines: LogLine[];
-  progress: number;
-  status: DeployStatus;
-  record: BackupRecord | null;
-}
+export type LiveBackup = LiveTask<BackupRecord>;
 
 export type PagesProvider = "cloudflare" | "github";
 
@@ -326,12 +323,7 @@ export type PagesEvent =
   | { type: "log"; level: LogLevel; message: string }
   | { type: "finished"; record: PagesDeployRecord };
 
-export interface LivePages {
-  recordId: string;
-  lines: LogLine[];
-  status: DeployStatus;
-  record: PagesDeployRecord | null;
-}
+export type LivePages = LiveTask<PagesDeployRecord>;
 
 export interface FailedLogin {
   user: string;

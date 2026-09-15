@@ -49,7 +49,7 @@ pub fn start_pages_deploy(
     // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Pages)? {
         Some(claim) => claim,
-        None => return Err(CoreError::config("已有 Pages 部署正在进行，请等待完成后再试")),
+        None => return Err(CoreError::busy("已有 Pages 部署正在进行，请等待完成后再试")),
     };
     let engine = PagesEngine::new(state.store.clone());
     let prepared = engine.prepare(&request)?;

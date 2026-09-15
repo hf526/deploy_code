@@ -64,7 +64,7 @@ pub fn start_deploy(
     // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
         Some(claim) => claim,
-        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+        None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
     let engine = state.engine();
     let record = engine.prepare(&request)?;
@@ -76,7 +76,7 @@ pub fn start_deploy(
 pub fn redeploy(app: AppHandle, state: State<AppState>, record_id: String) -> Result<String> {
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
         Some(claim) => claim,
-        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+        None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
     let engine = state.engine();
     let record = state.store.find_record(&record_id)?;
@@ -165,7 +165,7 @@ pub async fn list_releases(
     // 与部署互斥：避免读到正在解压、尚未完成的版本目录。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
         Some(claim) => claim,
-        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+        None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
     let config = state.store.load_config()?;
     let server = Store::find_server(&config, &server_id)?.clone();
@@ -187,7 +187,7 @@ pub async fn rollback_release(
     // 与部署互斥：避免切换版本与正在进行的部署相互踩踏。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
         Some(claim) => claim,
-        None => return Err(CoreError::deploy("已有部署正在进行，请等待完成后再试")),
+        None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
     let config = state.store.load_config()?;
     let server = Store::find_server(&config, &server_id)?.clone();
