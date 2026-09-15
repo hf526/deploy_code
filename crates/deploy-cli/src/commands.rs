@@ -507,7 +507,22 @@ async fn server_command(cli: &Cli, command: &ServerCommand) -> Result<()> {
                 let id = Store::find_server(config, server)?.id.clone();
                 config.servers.retain(|item| item.id != id);
                 // 服务器已删除，其备份配置不再可用（备份记录保留作历史）。
+                let removed: Vec<String> = config
+                    .backup_configs
+                    .iter()
+                    .filter(|saved| saved.server_id == id)
+                    .map(|saved| saved.id.clone())
+                    .collect();
                 config.backup_configs.retain(|saved| saved.server_id != id);
+                // 定时备份若引用被删配置，清空引用，避免每天到点报错。
+                if config
+                    .settings
+                    .scheduled_backup_config_id
+                    .as_ref()
+                    .is_some_and(|config_id| removed.contains(config_id))
+                {
+                    config.settings.scheduled_backup_config_id = None;
+                }
                 // 清理仓库上的悬空默认服务器引用。
                 for repo in &mut config.repos {
                     if repo.default_server_id.as_deref() == Some(id.as_str()) {
@@ -1044,12 +1059,24 @@ async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result<()> {
             }
             BackupConfigCommand::Remove { config: key } => {
                 store.mutate_config(|config| {
-                    let before = config.backup_configs.len();
-                    config
+                    let removed: Vec<String> = config
                         .backup_configs
-                        .retain(|item| item.id != *key && item.name != *key);
-                    if config.backup_configs.len() == before {
+                        .iter()
+                        .filter(|item| item.id == *key || item.name == *key)
+                        .map(|item| item.id.clone())
+                        .collect();
+                    if removed.is_empty() {
                         return Err(CoreError::not_found(format!("备份配置不存在: {key}")));
+                    }
+                    config.backup_configs.retain(|item| !removed.contains(&item.id));
+                    // 被删除的配置若正被定时备份使用，清空引用，避免每天到点报错。
+                    if config
+                        .settings
+                        .scheduled_backup_config_id
+                        .as_ref()
+                        .is_some_and(|id| removed.contains(id))
+                    {
+                        config.settings.scheduled_backup_config_id = None;
                     }
                     Ok(())
                 })?;

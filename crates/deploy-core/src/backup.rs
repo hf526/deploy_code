@@ -881,7 +881,19 @@ __RESET_SQL__
 DEPLOYCODE_SQL
 
 echo '###STAGE:4:正在导入到目标数据库 ...'
-gunzip -c "$OUT" | run_psql -v ON_ERROR_STOP=1 -q
+# pg_dump -n 在较新版本（PG15+，或 public 的属主/注释被改过）会输出 CREATE SCHEMA public;
+# 目标 schema 已由上面的重置步骤创建并授权，直接导入会因 "schema already exists" 中断（ON_ERROR_STOP）。
+# 这里只过滤「紧跟 Schema TOC 注释的那条 CREATE SCHEMA」，避免误删数据里同名的文本行；
+# COPY 数据段原样放行，避免数据里恰好出现形似 TOC 注释的行时被误删。
+gunzip -c "$OUT" | awk '
+  in_copy && /^\\\.$/ { in_copy = 0; print; next }
+  in_copy { print; next }
+  /^COPY .* FROM stdin;$/ { in_copy = 1; print; next }
+  /^-- Name: / { schema_toc = ($0 ~ /; Type: SCHEMA;/) }
+  schema_toc && /^CREATE SCHEMA / { schema_toc = 0; next }
+  schema_toc && /^[^-[:space:]]/ { schema_toc = 0 }
+  { print }
+' | run_psql -v ON_ERROR_STOP=1 -q
 
 echo '###DONE'
 "##;
@@ -1337,6 +1349,22 @@ mod tests {
         // schema 名含单引号时字面量转义，不破坏 SQL。
         let tricky = reset_schema_sql("it's");
         assert!(tricky.contains("EXECUTE 'GRANT USAGE ON SCHEMA \"it''s\" TO"));
+    }
+
+    #[test]
+    fn import_filters_dump_created_schema_statement() {
+        let script =
+            build_backup_script(&record(), &source(), "postgresql://u@h:5432/db", Some("secret"));
+        // 导入时必须过滤 pg_dump 自带的 CREATE SCHEMA，否则目标 schema 已存在会中断导入。
+        assert!(
+            script.contains("gunzip -c \"$OUT\" | awk"),
+            "import pipeline missing schema filter: {script}"
+        );
+        assert!(script.contains("schema_toc"));
+        // COPY 数据段必须原样放行，避免数据行恰好形似 TOC 注释时被误删。
+        assert!(script.contains("in_copy"));
+        // 过滤后仍以 ON_ERROR_STOP 严格导入。
+        assert!(script.contains("| run_psql -v ON_ERROR_STOP=1 -q"));
     }
 
     #[test]

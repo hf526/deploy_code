@@ -1,4 +1,5 @@
 mod commands;
+mod scheduler;
 mod state;
 mod tray;
 
@@ -31,6 +32,8 @@ pub fn run() {
                 .unwrap_or_default();
             app.manage(AppState::new(Arc::new(store)));
             tray::create(app.handle(), &language)?;
+            // 定时备份：应用运行期间（含隐藏到托盘）按设置的时间点自动执行。
+            scheduler::spawn(app.handle().clone());
             Ok(())
         })
         // 点窗口 X 只隐藏到托盘，程序继续运行；退出请使用托盘菜单。
@@ -45,6 +48,8 @@ pub fn run() {
             commands::app::get_settings,
             commands::app::save_settings,
             commands::app::reveal_path,
+            commands::app::get_autostart,
+            commands::app::set_autostart,
             commands::tray::set_tray_language,
             commands::repos::list_repos,
             commands::repos::repo_detail,

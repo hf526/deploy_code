@@ -172,10 +172,26 @@ pub fn save_backup_config(
 #[tauri::command(async)]
 pub fn delete_backup_config(state: State<AppState>, config_id: String) -> Result<bool> {
     state.store.mutate_config(|app| {
-        let before = app.backup_configs.len();
-        app.backup_configs
-            .retain(|item| item.id != config_id && item.name != config_id);
-        Ok(app.backup_configs.len() != before)
+        let removed: Vec<String> = app
+            .backup_configs
+            .iter()
+            .filter(|item| item.id == config_id || item.name == config_id)
+            .map(|item| item.id.clone())
+            .collect();
+        if removed.is_empty() {
+            return Ok(false);
+        }
+        app.backup_configs.retain(|item| !removed.contains(&item.id));
+        // 被删除的配置若正被定时备份使用，清空引用，避免每天到点报错。
+        if app
+            .settings
+            .scheduled_backup_config_id
+            .as_ref()
+            .is_some_and(|id| removed.contains(id))
+        {
+            app.settings.scheduled_backup_config_id = None;
+        }
+        Ok(true)
     })
 }
 

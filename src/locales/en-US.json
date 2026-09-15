@@ -427,6 +427,14 @@
       "theme": "Interface theme",
       "language": "Interface language"
     },
+    "automation": {
+      "title": "Startup & Automation",
+      "description": "Launch at sign-in; scheduled backups are configured on the Backups page",
+      "autostart": "Start DeployCode at sign-in",
+      "autostartHint": "Adds the app to the current user's startup entries (Windows registry Run); no admin rights needed. Closing the window keeps it in the tray; use the tray menu to quit.",
+      "autostartOn": "Autostart enabled",
+      "autostartOff": "Autostart disabled"
+    },
     "dataDir": {
       "title": "Data Directory",
       "description": "Where settings, deploy history and temporary files are stored",
@@ -508,10 +516,13 @@
     "sourceDescription": "PostgreSQL on the server",
     "configSection": "Backup Configs",
     "configDescription": "Save multiple configs and run one with a click",
-    "savedConfig": "Saved config",
-    "savedConfigHint": "Selecting a config fills the form below",
+    "savedConfig": "Saved configs",
+    "savedConfigHint": "Click a config to edit it, or Back up to run it directly",
     "noConfigs": "No saved configs; fill the form below and click Save",
     "newConfig": "New config",
+    "runConfig": "Back up",
+    "editConfig": "Edit config",
+    "unknownServer": "Unknown server",
     "deleteConfig": "Delete config",
     "configName": "Config name",
     "configNamePlaceholder": "e.g. Production DB",
@@ -519,7 +530,7 @@
     "serverRequired": "Select a server first",
     "configDeleted": "Backup config {{name}} deleted",
     "configDeleteTitle": "Delete Backup Config",
-    "configDeleteDescription": "This backup config will be deleted (existing backup records are not affected). This cannot be undone.",
+    "configDeleteDescription": "This deletes backup config \"{{name}}\" (existing backup records are not affected). This cannot be undone.",
     "server": "Server",
     "noServers": "No servers",
     "mode": "Dump from",
@@ -564,7 +575,21 @@
     "databaseRequired": "Enter the database name first",
     "cleared": "Backup records cleared",
     "customUrl": "Custom connection string",
-    "serverCustomUrl": "Server custom connection string"
+    "serverCustomUrl": "Server custom connection string",
+    "schedule": {
+      "title": "Scheduled Backup",
+      "description": "While the app is running (including minimized to the tray), run one backup daily at the selected time",
+      "enable": "Enable scheduled backup",
+      "time": "Backup time",
+      "config": "Backup config",
+      "noConfigOption": "Not selected (do not run)",
+      "saved": "Schedule settings saved",
+      "started": "Scheduled backup started",
+      "noConfig": "Scheduled backup skipped: no backup config selected",
+      "failed": "Scheduled backup failed to start: {{error}}",
+      "summary": "Enabled: backs up every day at {{time}} (keep the app running)",
+      "disabled": "Disabled. When enabled, a backup runs automatically at the selected time while the app is running."
+    }
   },
   "pages": {
     "toast": {

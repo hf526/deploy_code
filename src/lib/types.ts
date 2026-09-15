@@ -210,6 +210,15 @@ export interface Settings {
   language: string;
   atomicRelease: boolean;
   releaseKeep: number;
+  scheduledBackupEnabled: boolean;
+  scheduledBackupTime: string;
+  scheduledBackupConfigId: string | null;
+}
+
+/** 定时任务通知（如定时备份启动/失败）。 */
+export interface SchedulerNotice {
+  kind: "started" | "noConfig" | "failed";
+  message?: string;
 }
 
 export type DeployEvent =

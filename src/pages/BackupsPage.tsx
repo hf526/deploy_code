@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  CalendarClock,
   ChevronDown,
   ChevronRight,
   Database,
@@ -28,8 +29,8 @@ import {
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
-import type { BackupConfig, BackupRecord, BackupRequest, DbBackupSource } from "../lib/types";
-import { maskUrlPassword } from "../lib/utils";
+import type { BackupConfig, BackupRecord, BackupRequest, DbBackupSource, Settings } from "../lib/types";
+import { cn, maskUrlPassword } from "../lib/utils";
 
 function defaultSource(): DbBackupSource {
   return {
@@ -82,6 +83,7 @@ export default function BackupsPage() {
   const refreshBackups = useApp((state) => state.refreshBackups);
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const clearLiveBackup = useApp((state) => state.clearLiveBackup);
+  const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
 
   const [configId, setConfigId] = useState("");
@@ -97,7 +99,36 @@ export default function BackupsPage() {
   const [starting, setStarting] = useState(false);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
-  const [confirmDeleteConfig, setConfirmDeleteConfig] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
+  const [runningConfigId, setRunningConfigId] = useState("");
+  const [scheduleTime, setScheduleTime] = useState(settings.scheduledBackupTime);
+  // 设置保存串行化：连续修改时按顺序提交，避免在途请求用旧快照互相覆盖。
+  const scheduleQueue = useRef<Promise<void>>(Promise.resolve());
+
+  useEffect(() => {
+    setScheduleTime(settings.scheduledBackupTime);
+  }, [settings.scheduledBackupTime]);
+
+  // 备份结束后清空列表项的进行中标记，使「立即备份」按钮恢复可用。
+  useEffect(() => {
+    if (liveBackup?.status !== "running") setRunningConfigId("");
+  }, [liveBackup?.status]);
+
+  /** 定时备份设置即时保存（开关 / 时间 / 配置选择）。 */
+  async function handleSaveSchedule(patch: Partial<Settings>) {
+    const run = scheduleQueue.current.then(async () => {
+      const current = useApp.getState().settings;
+      const saved = await api.saveSettings({ ...current, ...patch });
+      setSettings(saved);
+      toast("success", t("backup.schedule.saved"));
+    });
+    scheduleQueue.current = run.catch(() => undefined);
+    try {
+      await run;
+    } catch (error) {
+      toast("error", String(error));
+    }
+  }
 
   const selectedConfig =
     backupConfigs.find((config) => config.id === configId) ?? null;
@@ -271,16 +302,33 @@ export default function BackupsPage() {
     }
   }
 
-  async function handleDeleteConfig() {
-    if (!selectedConfig) return;
+  /** 列表内的一键备份：直接用已保存配置执行，不经过表单。 */
+  async function handleRunConfig(config: BackupConfig) {
+    if (running || starting || testing) return;
+    setStarting(true);
+    setRunningConfigId(config.id);
     try {
-      await api.deleteBackupConfig(selectedConfig.id);
+      clearLiveBackup();
+      await startBackup({ serverId: config.serverId, backupConfigId: config.id });
+    } catch {
+      setRunningConfigId("");
+    } finally {
+      setStarting(false);
+    }
+  }
+
+  async function handleDeleteConfig() {
+    if (!deleteTarget) return;
+    try {
+      await api.deleteBackupConfig(deleteTarget.id);
       await refreshBackupConfigs();
-      toast("success", t("backup.configDeleted", { name: selectedConfig.name }));
+      // 后端会清掉指向该配置的定时备份引用，同步最新设置避免界面残留悬空选项。
+      setSettings(await api.getSettings());
+      toast("success", t("backup.configDeleted", { name: deleteTarget.name }));
     } catch (error) {
       toast("error", String(error));
     } finally {
-      setConfirmDeleteConfig(false);
+      setDeleteTarget(null);
     }
   }
 
@@ -334,45 +382,71 @@ export default function BackupsPage() {
                     {t("backup.savedConfigHint")}
                   </span>
                 </span>
-                <div className="flex items-center gap-2">
-                  <div className="min-w-0 flex-1">
-                    <Select
-                      value={configId}
-                      onChange={(event) => {
-                        const value = event.target.value;
-                        setConfigId(value);
-                        setCreating(value === "");
-                      }}
-                    >
-                      <option value="">{t("backup.newConfig")}</option>
-                      {backupConfigs.map((config) => (
-                        <option key={config.id} value={config.id}>
-                          {config.name} · {config.source.database}
-                        </option>
-                      ))}
-                    </Select>
-                  </div>
+                <div className="flex flex-col gap-2">
+                  {backupConfigs.length === 0 && (
+                    <p className="text-[11px] text-ink-faint">{t("backup.noConfigs")}</p>
+                  )}
+                  {backupConfigs.map((config) => {
+                    // creating 时表单尚未归属任何配置，列表统一显示为未选中。
+                    const active = !creating && config.id === configId;
+                    const server = servers.find((item) => item.id === config.serverId) ?? null;
+                    return (
+                      <div
+                        key={config.id}
+                        className={cn(
+                          "flex items-center gap-2 rounded-md border px-2.5 py-2 transition-colors",
+                          active ? "border-brand-line bg-brand-soft" : "border-line bg-field/40",
+                        )}
+                      >
+                        <button
+                          type="button"
+                          title={t("backup.editConfig")}
+                          className="min-w-0 flex-1 text-left"
+                          onClick={() => {
+                            setCreating(false);
+                            setConfigId(config.id);
+                          }}
+                        >
+                          <p className="truncate text-[13px] font-medium text-ink">
+                            {config.name}
+                          </p>
+                          <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+                            {server?.name ?? t("backup.unknownServer")} ·{" "}
+                            {config.source.database} · schema{" "}
+                            {config.source.schema || "public"}
+                          </p>
+                        </button>
+                        <Button
+                          size="sm"
+                          icon={<Play className="size-3.5" />}
+                          loading={runningConfigId === config.id && (running || starting)}
+                          disabled={running || starting || testing}
+                          onClick={() => void handleRunConfig(config)}
+                        >
+                          {t("backup.runConfig")}
+                        </Button>
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          title={t("backup.deleteConfig")}
+                          disabled={starting || testing}
+                          onClick={() => setDeleteTarget(config)}
+                        >
+                          <Trash2 className="size-3.5" />
+                        </Button>
+                      </div>
+                    );
+                  })}
                   <Button
                     variant="secondary"
                     size="sm"
-                    title={t("backup.newConfig")}
+                    className="self-start"
+                    icon={<Plus className="size-3.5" />}
                     onClick={handleNew}
                   >
-                    <Plus className="size-3.5" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    disabled={!selectedConfig}
-                    title={t("backup.deleteConfig")}
-                    onClick={() => setConfirmDeleteConfig(true)}
-                  >
-                    <Trash2 className="size-3.5" />
+                    {t("backup.newConfig")}
                   </Button>
                 </div>
-                {backupConfigs.length === 0 && (
-                  <p className="mt-2 text-[11px] text-ink-faint">{t("backup.noConfigs")}</p>
-                )}
               </div>
 
               <Field label={t("backup.configName")} required>
@@ -530,6 +604,70 @@ export default function BackupsPage() {
               </Button>
             </Card>
           </section>
+
+          <section>
+            <SectionTitle
+              title={t("backup.schedule.title")}
+              description={t("backup.schedule.description")}
+            />
+            <Card className="flex flex-col gap-4 p-5">
+              <label className="flex items-center gap-2.5 text-xs text-ink">
+                <input
+                  type="checkbox"
+                  checked={settings.scheduledBackupEnabled}
+                  onChange={(event) =>
+                    void handleSaveSchedule({ scheduledBackupEnabled: event.target.checked })
+                  }
+                  className="size-3.5 accent-primary"
+                />
+                {t("backup.schedule.enable")}
+              </label>
+              <div className="grid grid-cols-2 gap-4">
+                <Field label={t("backup.schedule.time")}>
+                  <Input
+                    type="time"
+                    value={scheduleTime}
+                    onChange={(event) => {
+                      setScheduleTime(event.target.value);
+                      // 时间选择完成即保存，避免改完直接关闭窗口导致修改丢失。
+                      if (/^\d{1,2}:\d{2}$/.test(event.target.value)) {
+                        void handleSaveSchedule({ scheduledBackupTime: event.target.value });
+                      }
+                    }}
+                    onBlur={() => {
+                      // 清空或非法值时回填已保存的时间，避免界面与摘要不一致。
+                      if (!/^\d{1,2}:\d{2}$/.test(scheduleTime)) {
+                        setScheduleTime(settings.scheduledBackupTime);
+                      }
+                    }}
+                  />
+                </Field>
+                <Field label={t("backup.schedule.config")}>
+                  <Select
+                    value={settings.scheduledBackupConfigId ?? ""}
+                    onChange={(event) =>
+                      void handleSaveSchedule({
+                        scheduledBackupConfigId: event.target.value || null,
+                      })
+                    }
+                  >
+                    <option value="">{t("backup.schedule.noConfigOption")}</option>
+                    {backupConfigs.map((config) => (
+                      <option key={config.id} value={config.id}>
+                        {config.name} · {config.source.database}
+                      </option>
+                    ))}
+                  </Select>
+                </Field>
+              </div>
+              <p className="flex items-center gap-1.5 text-[11px] leading-relaxed text-ink-faint">
+                <CalendarClock className="size-3.5 shrink-0" />
+                {settings.scheduledBackupEnabled
+                  ? t("backup.schedule.summary", { time: settings.scheduledBackupTime })
+                  : t("backup.schedule.disabled")}
+              </p>
+            </Card>
+          </section>
         </div>
 
         <div className="flex min-w-0 flex-col gap-6">
@@ -634,12 +772,12 @@ export default function BackupsPage() {
       />
 
       <ConfirmModal
-        open={confirmDeleteConfig}
+        open={deleteTarget !== null}
         danger
         title={t("backup.configDeleteTitle")}
         confirmText={t("common.delete")}
-        description={t("backup.configDeleteDescription")}
-        onCancel={() => setConfirmDeleteConfig(false)}
+        description={t("backup.configDeleteDescription", { name: deleteTarget?.name ?? "" })}
+        onCancel={() => setDeleteTarget(null)}
         onConfirm={() => void handleDeleteConfig()}
       />
     </Page>

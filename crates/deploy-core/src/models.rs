@@ -711,6 +711,19 @@ pub struct Settings {
     /// 原子发布保留的历史版本数（1-50，超出后清理最旧的，当前版本不删）。
     #[serde(default = "default_release_keep")]
     pub release_keep: usize,
+    /// 定时备份开关：应用运行期间（含托盘后台）到点自动执行一次备份。
+    #[serde(default)]
+    pub scheduled_backup_enabled: bool,
+    /// 定时备份时间（HH:MM，24 小时制，本机时区）。
+    #[serde(default = "default_scheduled_backup_time")]
+    pub scheduled_backup_time: String,
+    /// 定时备份使用的备份配置 id（为空表示未选择，跳过执行）。
+    #[serde(default)]
+    pub scheduled_backup_config_id: Option<String>,
+}
+
+fn default_scheduled_backup_time() -> String {
+    "03:00".to_string()
 }
 
 fn default_release_keep() -> usize {
@@ -749,6 +762,9 @@ impl Default for Settings {
             language: String::new(),
             atomic_release: false,
             release_keep: default_release_keep(),
+            scheduled_backup_enabled: false,
+            scheduled_backup_time: default_scheduled_backup_time(),
+            scheduled_backup_config_id: None,
         }
     }
 }

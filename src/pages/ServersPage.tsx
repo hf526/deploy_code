@@ -55,6 +55,7 @@ export default function ServersPage() {
   const servers = useApp((state) => state.servers);
   const refreshServers = useApp((state) => state.refreshServers);
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
+  const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
 
   const [formOpen, setFormOpen] = useState(false);
@@ -198,8 +199,12 @@ export default function ServersPage() {
       await api.deleteServer(removing.id);
       toast("success", t("servers.deleted", { name: removing.name }));
       setRemoving(null);
-      // 后端会一并删除该服务器的备份配置，同步刷新避免残留悬空配置。
+      // 后端会一并删除该服务器的备份配置并清理定时备份引用，同步刷新避免残留悬空配置 / 选择。
       await Promise.all([refreshServers(), refreshBackupConfigs()]);
+      void api
+        .getSettings()
+        .then(setSettings)
+        .catch(() => undefined);
     } catch (error) {
       toast("error", String(error));
     } finally {

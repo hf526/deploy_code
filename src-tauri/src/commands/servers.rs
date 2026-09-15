@@ -50,9 +50,22 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
     state.store.mutate_config(|config| {
         config.servers.retain(|server| server.id != server_id);
         // 服务器已删除，其备份配置不再可用（备份记录保留作历史）。
-        config
+        let removed: Vec<String> = config
             .backup_configs
-            .retain(|saved| saved.server_id != server_id);
+            .iter()
+            .filter(|saved| saved.server_id == server_id)
+            .map(|saved| saved.id.clone())
+            .collect();
+        config.backup_configs.retain(|saved| saved.server_id != server_id);
+        // 定时备份若引用被删配置，清空引用，避免每天到点报错。
+        if config
+            .settings
+            .scheduled_backup_config_id
+            .as_ref()
+            .is_some_and(|config_id| removed.contains(config_id))
+        {
+            config.settings.scheduled_backup_config_id = None;
+        }
         for repo in config.repos.iter_mut() {
             if repo.default_server_id.as_deref() == Some(server_id.as_str()) {
                 repo.default_server_id = None;

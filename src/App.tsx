@@ -8,9 +8,9 @@ import { Sidebar } from "./components/Sidebar";
 import { StatusBar } from "./components/StatusBar";
 import { TitleBar } from "./components/TitleBar";
 import { Toasts } from "./components/ui";
-import { applyLanguage } from "./lib/i18n";
+import i18n, { applyLanguage } from "./lib/i18n";
 import { useApp } from "./lib/store";
-import type { BackupEvent, DeployEvent, PagesEvent } from "./lib/types";
+import type { BackupEvent, DeployEvent, PagesEvent, SchedulerNotice } from "./lib/types";
 
 // 按页面分包：启动只加载首屏，其余页面首次访问时按需加载。
 const BackupsPage = lazy(() => import("./pages/BackupsPage"));
@@ -74,6 +74,7 @@ export default function App() {
   const handleDeployEvent = useApp((state) => state.handleDeployEvent);
   const handleBackupEvent = useApp((state) => state.handleBackupEvent);
   const handlePagesEvent = useApp((state) => state.handlePagesEvent);
+  const toast = useApp((state) => state.toast);
 
   useEffect(() => {
     void loadAll();
@@ -142,6 +143,33 @@ export default function App() {
       unlisten?.();
     };
   }, [handlePagesEvent]);
+
+  useEffect(() => {
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+
+    void listen<SchedulerNotice>("scheduler://notice", (event) => {
+      const { kind, message } = event.payload;
+      if (kind === "started") {
+        toast("success", i18n.t("backup.schedule.started"));
+      } else if (kind === "noConfig") {
+        toast("error", i18n.t("backup.schedule.noConfig"));
+      } else {
+        toast("error", i18n.t("backup.schedule.failed", { error: message ?? "" }));
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [toast]);
 
   return (
     <HashRouter>

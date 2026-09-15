@@ -25,6 +25,11 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<Settings>(settings);
   const [targetDraft, setTargetDraft] = useState<BackupTarget[]>(backupTargets);
   const [fromServerOpen, setFromServerOpen] = useState(false);
+  const [autostart, setAutostart] = useState(false);
+  const [autostartBusy, setAutostartBusy] = useState(false);
+  // 开机自启动当前仅 Windows 支持：其它平台不展示该开关。
+  const isWindows =
+    typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
 
   useEffect(() => {
     void api
@@ -32,6 +37,29 @@ export default function SettingsPage() {
       .then(setDataDir)
       .catch(() => undefined);
   }, []);
+
+  useEffect(() => {
+    void api
+      .getAutostart()
+      .then(setAutostart)
+      .catch(() => undefined);
+  }, []);
+
+  async function handleAutostart(enabled: boolean) {
+    setAutostartBusy(true);
+    try {
+      await api.setAutostart(enabled);
+      setAutostart(enabled);
+      toast(
+        "success",
+        enabled ? t("settings.automation.autostartOn") : t("settings.automation.autostartOff"),
+      );
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setAutostartBusy(false);
+    }
+  }
 
   const previousSettings = useRef(settings);
 
@@ -71,6 +99,10 @@ export default function SettingsPage() {
       pagesHistoryLimit: Math.max(10, Number(source.pagesHistoryLimit) || 200),
       language: normalizeLanguagePreference(source.language),
       releaseKeep: Math.min(50, Math.max(1, Number(source.releaseKeep) || 5)),
+      scheduledBackupTime: /^\d{1,2}:\d{2}$/.test(source.scheduledBackupTime.trim())
+        ? source.scheduledBackupTime.trim()
+        : "03:00",
+      scheduledBackupConfigId: source.scheduledBackupConfigId || null,
     };
   }
 
@@ -498,6 +530,30 @@ export default function SettingsPage() {
             </div>
           </Card>
         </section>
+
+        {isWindows && (
+          <section>
+            <SectionTitle
+              title={t("settings.automation.title")}
+              description={t("settings.automation.description")}
+            />
+            <Card className="flex flex-col p-4">
+              <label className="flex items-center gap-2.5 text-xs text-ink">
+                <input
+                  type="checkbox"
+                  checked={autostart}
+                  disabled={autostartBusy}
+                  onChange={(event) => void handleAutostart(event.target.checked)}
+                  className="size-3.5 accent-primary"
+                />
+                {t("settings.automation.autostart")}
+              </label>
+              <p className="mt-2 pl-6 text-[11px] leading-relaxed text-ink-faint">
+                {t("settings.automation.autostartHint")}
+              </p>
+            </Card>
+          </section>
+        )}
 
         <section>
           <SectionTitle

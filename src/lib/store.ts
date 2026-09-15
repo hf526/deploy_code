@@ -46,6 +46,9 @@ export const defaultSettings: Settings = {
   language: "",
   atomicRelease: false,
   releaseKeep: 5,
+  scheduledBackupEnabled: false,
+  scheduledBackupTime: "03:00",
+  scheduledBackupConfigId: null,
 };
 
 let toastSeq = 0;

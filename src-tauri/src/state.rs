@@ -247,6 +247,11 @@ impl AppState {
         self.release_claim(&self.backup_claim, &self.backup_lock);
     }
 
+    /// 是否有备份任务正在进行（定时调度器判断占用用）。
+    pub fn is_backup_active(&self) -> bool {
+        self.backup_claim.load(Ordering::SeqCst)
+    }
+
     /// 尝试占用 Pages 部署名额。
     pub fn try_claim_pages(&self) -> Result<bool> {
         self.try_claim(&self.pages_claim, &self.pages_lock, "pages")

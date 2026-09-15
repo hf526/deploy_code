@@ -35,6 +35,8 @@ export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  getAutostart: () => invoke<boolean>("get_autostart"),
+  setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
 
   // 仓库
   listRepos: () => invoke<RepoInfo[]>("list_repos"),
