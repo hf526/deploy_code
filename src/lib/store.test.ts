@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => ({
   api: {
+    startDeployConfig: vi.fn(async () => "d1"),
     startPagesDeploy: vi.fn(async () => "p1"),
     listHistory: vi.fn(async () => []),
     listBackups: vi.fn(async () => []),
@@ -107,6 +108,25 @@ describe("store 长任务接线", () => {
       status: "running",
       record: null,
     });
+  });
+
+  it("按配置启动服务器部署：参数取自配置 id，建立 running 状态", async () => {
+    const id = await useApp.getState().startDeployConfig("config-1");
+    expect(id).toBe("d1");
+    expect(api.startDeployConfig).toHaveBeenCalledWith("config-1");
+    expect(useApp.getState().live).toEqual({
+      recordId: "d1",
+      lines: [],
+      progress: 0,
+      status: "running",
+      record: null,
+    });
+  });
+
+  it("服务器部署进行中时拒绝再次启动", async () => {
+    useApp.setState({ live: { recordId: "d1", lines: [], progress: 0, status: "running", record: null } });
+    await expect(useApp.getState().startDeployConfig("config-1")).rejects.toThrow();
+    expect(api.startDeployConfig).not.toHaveBeenCalled();
   });
 
   it("已有任务运行时拒绝并发启动", async () => {

@@ -1,4 +1,4 @@
-import { Cloud, Database, FolderOpen, GitBranch, History, Rocket, Server, Settings } from "lucide-react";
+import { Database, FolderOpen, GitBranch, History, Rocket, Server, Settings } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink, useNavigate } from "react-router-dom";
 
@@ -11,7 +11,6 @@ import { ThemeToggle } from "./ThemeToggle";
 const NAV_ITEMS = [
   { to: "/repos", labelKey: "nav.repos", icon: GitBranch },
   { to: "/deploy", labelKey: "nav.deploy", icon: Rocket },
-  { to: "/pages", labelKey: "nav.pages", icon: Cloud },
   { to: "/servers", labelKey: "nav.servers", icon: Server },
   { to: "/backups", labelKey: "nav.backups", icon: Database },
   { to: "/history", labelKey: "nav.history", icon: History },
@@ -60,13 +59,10 @@ export function Sidebar() {
           >
             <item.icon className="size-4" />
             <span>{t(item.labelKey)}</span>
-            {item.to === "/deploy" && liveRunning && (
+            {item.to === "/deploy" && (liveRunning || pagesRunning) && (
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}
             {item.to === "/backups" && backupRunning && (
-              <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
-            )}
-            {item.to === "/pages" && pagesRunning && (
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}
           </NavLink>

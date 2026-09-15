@@ -14,23 +14,50 @@ use super::{
 pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
     let store = Arc::new(open_store(cli)?);
     let config = store.load_config()?;
-    let repo = Store::find_repo(&config, &args.repo)?.clone();
+
+    // 已保存的部署配置作为默认值来源；命令行显式参数优先，保证脚本化调用不被配置覆盖。
+    let saved = match args
+        .config
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        Some(key) => Some(Store::find_deploy_config(&config, key)?.clone()),
+        None => None,
+    };
+    let repo_key = args
+        .repo
+        .clone()
+        // 显式空串（脚本变量展开）按未提供处理，回退到配置里的仓库。
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| saved.as_ref().map(|item| item.repo_id.clone()))
+        .ok_or_else(|| CoreError::config("请指定仓库，或使用 --config 指定已保存的部署配置"))?;
+    let repo = Store::find_repo(&config, &repo_key)?.clone();
 
     let git = Git::open(&repo.path)?;
+    // 显式 --rev 优先；配置里的 rev 空值表示「当前工作区」，不能当成未提供而回退到当前分支。
     let rev = match &args.rev {
         Some(rev) => rev.clone(),
-        None => {
-            // 空仓库（没有任何提交）没有可部署的分支：与 GUI 一致，直接打包当前工作区。
-            if git.resolve("HEAD").is_err() {
-                String::new()
-            } else {
-                git.current_branch()?
+        None => match &saved {
+            Some(item) => item.rev.clone(),
+            None => {
+                // 空仓库（没有任何提交）没有可部署的分支：与 GUI 一致，直接打包当前工作区。
+                if git.resolve("HEAD").is_err() {
+                    String::new()
+                } else {
+                    git.current_branch()?
+                }
             }
-        }
+        },
     };
 
-    let server = if let Some(key) = &args.server {
+    let server = if let Some(key) = args
+        .server
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
         Store::find_server(&config, key)?.clone()
+    } else if let Some(key) = saved.as_ref().map(|item| item.server_id.clone()) {
+        Store::find_server(&config, &key)?.clone()
     } else if let Some(default_id) = &repo.default_server_id {
         Store::find_server(&config, default_id)
             .map(|server| server.clone())
@@ -43,6 +70,12 @@ pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
         .dir
         .clone()
         .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            saved
+                .as_ref()
+                .map(|item| item.target_dir.clone())
+                .filter(|value| !value.trim().is_empty())
+        })
         .or_else(|| Some(repo.default_target_dir.clone()).filter(|value| !value.trim().is_empty()))
         .or_else(|| {
             Some(server.default_target_dir.clone()).filter(|value| !value.trim().is_empty())
@@ -54,14 +87,37 @@ pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
         rev,
         server_id: server.id.clone(),
         target_dir,
-        // 显式 --script 表示用户明确要执行脚本，即使全局设置关闭了脚本执行。
-        run_scripts: !args.no_scripts && (config.settings.run_scripts || !args.script.is_empty()),
+        // 显式 --script 表示用户明确要执行脚本，即使全局设置或配置关闭了脚本执行。
+        run_scripts: if args.no_scripts {
+            false
+        } else {
+            !args.script.is_empty()
+                || saved
+                    .as_ref()
+                    .map(|item| item.run_scripts)
+                    .unwrap_or(config.settings.run_scripts)
+        },
         script_dir: args
             .script_dir
             .clone()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| {
+                saved
+                    .as_ref()
+                    .map(|item| item.script_dir.clone())
+                    .filter(|value| !value.trim().is_empty())
+            })
             .unwrap_or_else(|| config.settings.script_dir.clone()),
-        scripts: args.script.clone(),
-        upload_env: !args.no_env,
+        scripts: if args.script.is_empty() {
+            saved.as_ref().map(|item| item.scripts.clone()).unwrap_or_default()
+        } else {
+            args.script.clone()
+        },
+        upload_env: if args.no_env {
+            false
+        } else {
+            saved.as_ref().map(|item| item.upload_env).unwrap_or(true)
+        },
     };
 
     let record = run_deploy(&store, request, cli.json).await?;

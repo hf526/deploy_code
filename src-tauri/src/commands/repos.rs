@@ -273,6 +273,8 @@ pub fn save_repo_env_files(
 pub fn remove_repo(state: State<AppState>, repo_id: String) -> Result<()> {
     state.store.mutate_config(|config| {
         config.repos.retain(|repo| repo.id != repo_id);
+        // 仓库已移除，指向它的部署配置不可用（部署记录保留作历史，仍可重新部署）。
+        config.deploy_configs.retain(|saved| saved.repo_id != repo_id);
         Ok(())
     })?;
     // 仓库移除后停止文件监听，避免 watcher 继续占用资源。

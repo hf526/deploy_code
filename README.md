@@ -35,7 +35,8 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 `git archive` 打包 -> SFTP 上传 -> 远端解压 -> 执行脚本，全程实时日志：
 
 - 可选择分支 / 标签 / 提交进行部署；版本留空则打包当前工作区（含未提交改动，遵循 `.gitignore`）
-- 部署方式可选「服务器」或「Pages」：选 Pages 时在部署页直接编辑该仓库的 Cloudflare / GitHub Pages 配置并一键构建发布，状态与日志同步切换
+- 部署配置列表化：服务器部署与 Pages 部署统一在「部署」页管理，每套配置可一键部署 / 编辑 / 删除；服务器部署参数（仓库、服务器、目录、版本、脚本、环境文件）保存后可复用
+- Pages 配置同样在部署页新增 / 编辑 / 删除，一键构建发布 Cloudflare 或 GitHub Pages，状态与日志同步切换
 - 原子发布（可选，设置中开启）：部署到「部署目录/releases/<版本>」，脚本成功后原子切换 `current` 软链；失败不影响线上版本，可在记录页一键回滚到任意历史版本
 - 环境文件替换：按仓库配置「本地文件 → 部署目录相对路径」（如 `.env`、`docker/.env`），解压后、执行脚本前上传覆盖，部署页可临时关闭
 - 上传进度显示；上传后比对本地 / 服务器 SHA-256，防止半包上线（服务器缺少校验工具时自动跳过）
@@ -51,7 +52,7 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 把服务器上的 PostgreSQL schema 全量同步到远端 PostgreSQL，全程在服务器上完成，不经过本机：
 
 - 来源支持 Docker 容器（`docker exec pg_dump`）或服务器本机 `pg_dump`，可配置库名 / 用户 / 密码 / schema
-- 备份配置可保存多个（名称 + 服务器 + 来源 + 目标），备份页选择后一键执行；升级自旧版服务器单份配置时会自动迁移
+- 备份配置列表化管理（名称 + 服务器 + 来源 + 目标），可新增 / 编辑 / 删除 / 一键立即备份；升级自旧版服务器单份配置时会自动迁移
 - 备份目标（Supabase / Aiven / Neon 等）可配置多个，每次备份选择其中一个；支持全局默认目标，配置 / 服务器可绑定自己的默认目标
 - 全量覆盖：恢复前清空目标 schema 并恢复默认角色授权（Supabase 的 anon / authenticated / service_role 会自动恢复）
 - 实时日志与进度；支持环境检查（pg_dump 版本 + 目标连通性）
@@ -59,7 +60,7 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 
 ### Pages 部署（Cloudflare / GitHub）
 
-仓库本地构建（可选）后一键发布静态产物，按仓库选择平台：
+仓库本地构建（可选）后一键发布静态产物，配置在「部署」页与服务器部署统一列表管理，按仓库选择平台：
 
 Cloudflare Pages（`wrangler`）：
 
@@ -118,7 +119,7 @@ deploy_code/
 配置与部署历史保存在系统数据目录，**不会写入代码仓库**：
 
 - Windows：`%APPDATA%\deploycode\DeployCode\data`
-- 文件：`config.json`（服务器 / 仓库 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
+- 文件：`config.json`（服务器 / 仓库 / 部署配置 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
 
 > ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
 
@@ -177,6 +178,8 @@ deploy-code-cli repo add /path/to/myapp --name myapp --server prod --dir /opt/my
 # 查看分支 / 部署 main 分支 / 查看历史
 deploy-code-cli branch list myapp --all
 deploy-code-cli deploy myapp --rev main
+# 使用客户端保存的部署配置（仓库、服务器、目录、脚本等取自配置，命令行参数可覆盖）
+deploy-code-cli deploy --config 生产环境
 deploy-code-cli history list -n 10
 
 # 原子发布的历史版本（需在设置中开启「原子发布」）

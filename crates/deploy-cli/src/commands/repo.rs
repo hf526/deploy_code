@@ -78,6 +78,8 @@ pub(super) fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
             store.mutate_config(|config| {
                 let target = Store::find_repo(config, repo)?.id.clone();
                 config.repos.retain(|item| item.id != target);
+                // 与 GUI 一致：仓库已移除，指向它的部署配置不可用（部署记录保留作历史）。
+                config.deploy_configs.retain(|saved| saved.repo_id != target);
                 Ok(())
             })?;
             output::success(format!("已移除仓库 {repo}"));

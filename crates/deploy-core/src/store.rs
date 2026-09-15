@@ -6,8 +6,8 @@ use directories::ProjectDirs;
 
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployRecord, DeployStatus,
-    PagesDeployRecord, RepoConfig, ServerConfig,
+    now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployConfig, DeployRecord,
+    DeployStatus, PagesDeployRecord, RepoConfig, ServerConfig,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -399,6 +399,124 @@ impl Store {
             .ok_or_else(|| CoreError::not_found(format!("备份配置不存在: {key}")))
     }
 
+    /// 按 id / 名称查找部署配置；id 精确命中优先，避免与名称歧义。
+    pub fn find_deploy_config<'a>(config: &'a AppConfig, key: &str) -> Result<&'a DeployConfig> {
+        let key = key.trim();
+        if let Some(item) = config.deploy_configs.iter().find(|item| item.id == key) {
+            return Ok(item);
+        }
+        config
+            .deploy_configs
+            .iter()
+            .find(|item| item.name == key)
+            .ok_or_else(|| CoreError::not_found(format!("部署配置不存在: {key}")))
+    }
+
+    /// 新建或更新一条部署配置：规范化仓库 / 服务器引用并校验名称唯一。
+    /// GUI 与 CLI 共用，保证两端保存行为一致。
+    pub fn save_deploy_config(store: &Store, config: DeployConfig) -> Result<DeployConfig> {
+        let mut config = config;
+        config.name = config.name.trim().to_string();
+        if config.name.is_empty() {
+            return Err(CoreError::config("部署配置名称不能为空"));
+        }
+        config.target_dir = config.target_dir.trim().to_string();
+        if config.target_dir.is_empty() {
+            return Err(CoreError::config("部署目录不能为空"));
+        }
+        // 部署目标是 Linux 服务器上的绝对路径：相对路径 / ~ 会落到 SSH 登录目录，
+        // 且与原子发布的 release 目录约定（要求绝对路径）冲突。
+        if !config.target_dir.starts_with('/') {
+            return Err(CoreError::config(
+                "部署目录必须是服务器上的绝对路径（以 / 开头）",
+            ));
+        }
+        config.rev = config.rev.trim().to_string();
+        config.id = config.id.trim().to_string();
+        config.repo_id = config.repo_id.trim().to_string();
+        config.server_id = config.server_id.trim().to_string();
+        config.script_dir = config.script_dir.trim().to_string();
+        if config.script_dir.is_empty() {
+            config.script_dir = "docker".to_string();
+        }
+        config.scripts = config
+            .scripts
+            .iter()
+            .map(|name| name.trim().to_string())
+            .filter(|name| !name.is_empty())
+            .collect();
+
+        store.mutate_config(|app| {
+            // 仓库 / 服务器必须存在；名称与 host 也允许（兼容 CLI 习惯）。
+            let repo = Store::find_repo(app, &config.repo_id)?.clone();
+            config.repo_id = repo.id.clone();
+            let server = Store::find_server(app, &config.server_id)?.clone();
+            config.server_id = server.id.clone();
+
+            let by_id = app.deploy_configs.iter().find(|item| item.id == config.id);
+            if config.id.is_empty() {
+                config.id = new_id();
+            } else if by_id.is_none() {
+                // 明确携带 id 却不存在（配置已被其它窗口 / CLI 删除）：报错而不是静默新建，
+                // 避免「复活」已删除配置或用任意 id 注入条目。
+                return Err(CoreError::not_found(format!(
+                    "部署配置不存在（可能已被删除）: {}",
+                    config.id
+                )));
+            }
+            // 更新已有配置时以存储中的创建时间为准，避免调用方传入的旧快照覆盖。
+            match by_id {
+                Some(existing) if !existing.created_at.trim().is_empty() => {
+                    config.created_at = existing.created_at.clone();
+                }
+                _ => {
+                    if config.created_at.trim().is_empty() {
+                        config.created_at = now_string();
+                    }
+                }
+            }
+            if app
+                .deploy_configs
+                .iter()
+                .any(|item| item.id != config.id && item.name == config.name)
+            {
+                return Err(CoreError::config(format!(
+                    "部署配置名称已存在: {}",
+                    config.name
+                )));
+            }
+            match app.deploy_configs.iter_mut().find(|item| item.id == config.id) {
+                Some(existing) => *existing = config.clone(),
+                None => app.deploy_configs.push(config.clone()),
+            }
+            Ok(config.clone())
+        })
+    }
+
+    /// 删除一条部署配置（不影响已有部署记录，历史记录仍可重新部署）。
+    /// 优先按 id 精确删除，避免出现「某配置名称恰好等于另一条配置 id」时误删两条。
+    pub fn delete_deploy_config(store: &Store, key: &str) -> Result<bool> {
+        let key = key.trim();
+        store.mutate_config(|app| {
+            let removed: Vec<String> = if let Some(item) =
+                app.deploy_configs.iter().find(|item| item.id == key)
+            {
+                vec![item.id.clone()]
+            } else {
+                app.deploy_configs
+                    .iter()
+                    .filter(|item| item.name == key)
+                    .map(|item| item.id.clone())
+                    .collect()
+            };
+            if removed.is_empty() {
+                return Ok(false);
+            }
+            app.deploy_configs.retain(|item| !removed.contains(&item.id));
+            Ok(true)
+        })
+    }
+
     /// 按 id / 名称 / host 查找服务器。
     pub fn find_server<'a>(config: &'a AppConfig, key: &str) -> Result<&'a ServerConfig> {
         config
@@ -687,6 +805,102 @@ mod tests {
             "postgresql://u@h/db"
         );
         assert!(dir.join("locks").join("store.lock").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_and_delete_deploy_config_normalizes_and_validates() {
+        use crate::models::SshAuth;
+
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-store-deploycfg-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        let mut config = AppConfig::default();
+        let repo = RepoConfig::new("demo".to_string(), "/tmp/demo".to_string());
+        let repo_id = repo.id.clone();
+        config.repos.push(repo);
+        let server = ServerConfig::new(
+            "prod".to_string(),
+            "h1".to_string(),
+            "u".to_string(),
+            SshAuth::Password {
+                password: "x".to_string(),
+            },
+        );
+        let server_id = server.id.clone();
+        config.servers.push(server);
+        store.save_config(&config).unwrap();
+
+        // 仓库 / 服务器可以按名称传入，保存时规范化为 id；空字段回落到默认值。
+        let saved = Store::save_deploy_config(
+            &store,
+            DeployConfig {
+                id: String::new(),
+                name: " 生产部署 ".to_string(),
+                repo_id: "demo".to_string(),
+                server_id: "prod".to_string(),
+                target_dir: " /opt/app ".to_string(),
+                rev: " main ".to_string(),
+                run_scripts: true,
+                script_dir: "  ".to_string(),
+                scripts: vec![" deploy.sh ".to_string(), "".to_string()],
+                upload_env: true,
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.repo_id, repo_id);
+        assert_eq!(saved.server_id, server_id);
+        assert_eq!(saved.name, "生产部署");
+        assert_eq!(saved.target_dir, "/opt/app");
+        assert_eq!(saved.rev, "main");
+        assert_eq!(saved.script_dir, "docker");
+        assert_eq!(saved.scripts, vec!["deploy.sh".to_string()]);
+        assert!(!saved.created_at.is_empty());
+
+        // 不带 id 的新建配置重名时拒绝（GUI 的新增入口靠这条避免误覆盖已有配置）。
+        let mut duplicate = saved.clone();
+        duplicate.id = String::new();
+        assert!(Store::save_deploy_config(&store, duplicate).is_err());
+
+        // 引用不存在的服务器拒绝。
+        let mut missing = saved.clone();
+        missing.server_id = "nope".to_string();
+        assert!(Store::save_deploy_config(&store, missing).is_err());
+
+        // 更新同一条配置不会重复插入，且保留原创建时间。
+        let created_at = saved.created_at.clone();
+        let mut renamed = saved.clone();
+        renamed.name = "生产部署 2".to_string();
+        renamed.created_at = String::new();
+        let renamed = Store::save_deploy_config(&store, renamed).unwrap();
+        assert_eq!(renamed.created_at, created_at);
+        assert_eq!(store.load_config().unwrap().deploy_configs.len(), 1);
+
+        // id 前后空白会被规范掉。
+        let mut padded = saved.clone();
+        padded.id = format!("  {}  ", saved.id);
+        padded.target_dir = "/opt/app3".to_string();
+        let padded = Store::save_deploy_config(&store, padded).unwrap();
+        assert_eq!(padded.id, saved.id);
+        assert_eq!(padded.target_dir, "/opt/app3");
+
+        // 明确携带不存在的 id 拒绝（避免配置被删除后又被静默复活）。
+        let mut unknown = saved.clone();
+        unknown.id = "no-such-id".to_string();
+        assert!(Store::save_deploy_config(&store, unknown).is_err());
+
+        // 相对部署目录拒绝：会落到 SSH 登录目录，且与原子发布的绝对路径约定冲突。
+        let mut relative = saved.clone();
+        relative.id = String::new();
+        relative.name = "相对目录".to_string();
+        relative.target_dir = "opt/app".to_string();
+        assert!(Store::save_deploy_config(&store, relative).is_err());
+
+        assert!(Store::delete_deploy_config(&store, &saved.id).unwrap());
+        assert!(store.load_config().unwrap().deploy_configs.is_empty());
+        assert!(!Store::delete_deploy_config(&store, &saved.id).unwrap());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

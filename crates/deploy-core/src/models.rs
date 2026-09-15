@@ -123,6 +123,52 @@ impl BackupConfig {
     }
 }
 
+/// 保存的服务器部署配置（名称 + 仓库 + 服务器 + 目录 + 脚本）。
+/// 各字段都允许缺省：单条坏数据不应导致整份 config.json 解析失败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeployConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// 要部署的仓库 id。
+    #[serde(default)]
+    pub repo_id: String,
+    /// 目标服务器 id。
+    #[serde(default)]
+    pub server_id: String,
+    /// 服务器上的绝对部署目录。
+    #[serde(default)]
+    pub target_dir: String,
+    /// 部署版本（分支 / 标签 / 提交）；为空表示打包当前工作区。
+    #[serde(default)]
+    pub rev: String,
+    /// 是否执行项目脚本。
+    #[serde(default = "default_true")]
+    pub run_scripts: bool,
+    /// 脚本目录（相对项目根目录）。
+    #[serde(default = "default_script_dir")]
+    pub script_dir: String,
+    /// 指定执行的脚本列表（按顺序执行）；为空表示自动执行脚本目录下的全部 .sh。
+    #[serde(default)]
+    pub scripts: Vec<String>,
+    /// 是否上传并替换仓库配置的环境文件。
+    #[serde(default = "default_true")]
+    pub upload_env: bool,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+/// 列表展示用的 Pages 配置条目（Pages 配置按仓库保存，一仓库一份）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PagesConfigEntry {
+    pub repo_id: String,
+    pub repo_name: String,
+    pub config: PagesConfig,
+}
+
 /// 部署服务器配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -769,7 +815,7 @@ impl Default for Settings {
     }
 }
 
-/// 应用配置（服务器 + 仓库 + 备份目标 + 备份配置 + 设置）。
+/// 应用配置（服务器 + 仓库 + 部署配置 + 备份目标 + 备份配置 + 设置）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -779,6 +825,9 @@ pub struct AppConfig {
     pub repos: Vec<RepoConfig>,
     #[serde(default)]
     pub backup_targets: Vec<BackupTarget>,
+    /// 保存的服务器部署配置列表。
+    #[serde(default)]
+    pub deploy_configs: Vec<DeployConfig>,
     /// 保存的数据库备份配置列表。
     #[serde(default)]
     pub backup_configs: Vec<BackupConfig>,
@@ -876,6 +925,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(record.scripts, vec!["docker/deploy.sh".to_string()]);
+    }
+
+    #[test]
+    fn legacy_config_without_deploy_configs_deserializes() {
+        let config: AppConfig =
+            serde_json::from_str(r#"{"servers":[],"repos":[]}"#).unwrap();
+        assert!(config.deploy_configs.is_empty());
+
+        // 缺省字段要有可用默认值：旧配置升级后直接新增配置不会写出空目录 / 关闭脚本。
+        let saved: DeployConfig =
+            serde_json::from_str(r#"{"id":"c1","name":"prod","repoId":"r","serverId":"s","targetDir":"/opt/app"}"#)
+                .unwrap();
+        assert!(saved.run_scripts);
+        assert_eq!(saved.script_dir, "docker");
+        assert!(saved.upload_env);
+        assert!(saved.rev.is_empty());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use deploy_core::models::{BackupConfig, Settings};
+use deploy_core::models::{BackupConfig, BackupTarget, Settings};
 use deploy_core::{CoreError, Result};
 use tauri::State;
 
@@ -22,9 +22,13 @@ pub fn get_settings(state: State<AppState>) -> Result<Settings> {
     Ok(state.store.load_config()?.settings)
 }
 
-/// 定时备份配置被删除后，设置里残留的悬空引用一律清空，
-/// 避免旧快照（CLI 删除配置 / 多页面并发保存）把已删除的 id 写回，导致每天到点报错。
-fn sanitize_settings(settings: &mut Settings, configs: &[BackupConfig]) {
+/// 引用的备份配置 / 备份目标被删除后，设置里残留的悬空引用一律清空，
+/// 避免旧快照（CLI 删除目标 / 多页面并发保存）把已删除的 id 写回，导致备份解析失败。
+fn sanitize_settings(
+    settings: &mut Settings,
+    configs: &[BackupConfig],
+    targets: &[BackupTarget],
+) {
     if settings
         .scheduled_backup_config_id
         .as_ref()
@@ -32,12 +36,23 @@ fn sanitize_settings(settings: &mut Settings, configs: &[BackupConfig]) {
     {
         settings.scheduled_backup_config_id = None;
     }
+    if settings
+        .default_backup_target_id
+        .as_ref()
+        .is_some_and(|id| !targets.iter().any(|item| item.id == *id))
+    {
+        settings.default_backup_target_id = None;
+    }
 }
 
 #[tauri::command(async)]
 pub fn save_settings(state: State<AppState>, mut settings: Settings) -> Result<Settings> {
     state.store.mutate_config(|config| {
-        sanitize_settings(&mut settings, &config.backup_configs);
+        sanitize_settings(
+            &mut settings,
+            &config.backup_configs,
+            &config.backup_targets,
+        );
         config.settings = settings.clone();
         Ok(())
     })?;
@@ -246,7 +261,7 @@ mod tests {
     fn sanitize_settings_clears_dangling_scheduled_config() {
         let mut settings = Settings::default();
         settings.scheduled_backup_config_id = Some("gone".to_string());
-        sanitize_settings(&mut settings, &[]);
+        sanitize_settings(&mut settings, &[], &[]);
         assert_eq!(settings.scheduled_backup_config_id, None);
     }
 
@@ -254,7 +269,22 @@ mod tests {
     fn sanitize_settings_keeps_existing_scheduled_config() {
         let mut settings = Settings::default();
         settings.scheduled_backup_config_id = Some("keep".to_string());
-        sanitize_settings(&mut settings, &[backup_config("keep")]);
+        sanitize_settings(&mut settings, &[backup_config("keep")], &[]);
         assert_eq!(settings.scheduled_backup_config_id.as_deref(), Some("keep"));
+    }
+
+    #[test]
+    fn sanitize_settings_clears_dangling_default_target() {
+        let mut settings = Settings::default();
+        settings.default_backup_target_id = Some("gone".to_string());
+        sanitize_settings(&mut settings, &[], &[]);
+        assert_eq!(settings.default_backup_target_id, None);
+
+        let mut settings = Settings::default();
+        settings.default_backup_target_id = Some("t1".to_string());
+        let mut target = BackupTarget::new("t1".to_string(), "postgresql://u@h/db".to_string());
+        target.id = "t1".to_string();
+        sanitize_settings(&mut settings, &[], &[target]);
+        assert_eq!(settings.default_backup_target_id.as_deref(), Some("t1"));
     }
 }

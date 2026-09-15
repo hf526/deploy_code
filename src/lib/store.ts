@@ -9,12 +9,13 @@ import type {
   BackupRecord,
   BackupRequest,
   BackupTarget,
+  DeployConfig,
   DeployEvent,
   DeployRecord,
-  DeployRequest,
   LiveBackup,
   LiveDeploy,
   LivePages,
+  PagesConfigEntry,
   PagesDeployRecord,
   PagesEvent,
   PagesRequest,
@@ -64,7 +65,9 @@ interface AppStore {
   backups: BackupRecord[];
   backupTargets: BackupTarget[];
   backupConfigs: BackupConfig[];
+  deployConfigs: DeployConfig[];
   pagesRecords: PagesDeployRecord[];
+  pagesConfigs: PagesConfigEntry[];
   toasts: Toast[];
   live: LiveDeploy | null;
   liveBackup: LiveBackup | null;
@@ -80,25 +83,24 @@ interface AppStore {
   refreshBackups: (serverId?: string | null) => Promise<void>;
   refreshBackupTargets: () => Promise<void>;
   refreshBackupConfigs: () => Promise<void>;
+  refreshDeployConfigs: () => Promise<void>;
   refreshPagesRecords: (repoId?: string | null) => Promise<void>;
+  refreshPagesConfigs: () => Promise<void>;
   setSettings: (settings: Settings) => void;
 
   toast: (kind: Toast["kind"], message: string) => void;
   dismissToast: (id: number) => void;
 
-  startDeploy: (request: DeployRequest) => Promise<string>;
+  startDeployConfig: (configId: string) => Promise<string>;
   redeploy: (recordId: string) => Promise<string>;
   cancelDeploy: () => Promise<void>;
   handleDeployEvent: (event: DeployEvent) => void;
-  clearLive: () => void;
 
   startBackup: (request: BackupRequest) => Promise<string>;
   handleBackupEvent: (event: BackupEvent) => void;
-  clearLiveBackup: () => void;
 
   startPagesDeploy: (request: PagesRequest) => Promise<string>;
   handlePagesEvent: (event: PagesEvent) => void;
-  clearLivePages: () => void;
 }
 
 export const useApp = create<AppStore>((set, get) => ({
@@ -111,7 +113,9 @@ export const useApp = create<AppStore>((set, get) => ({
   backups: [],
   backupTargets: [],
   backupConfigs: [],
+  deployConfigs: [],
   pagesRecords: [],
+  pagesConfigs: [],
   toasts: [],
   live: null,
   liveBackup: null,
@@ -127,7 +131,9 @@ export const useApp = create<AppStore>((set, get) => ({
       backupsResult,
       targetsResult,
       configsResult,
+      deployConfigsResult,
       pagesResult,
+      pagesConfigsResult,
     ] = await Promise.allSettled([
       api.listRepos(),
       api.listServers(),
@@ -136,7 +142,9 @@ export const useApp = create<AppStore>((set, get) => ({
       api.listBackups(),
       api.listBackupTargets(),
       api.listBackupConfigs(),
+      api.listDeployConfigs(),
       api.listPagesRecords(),
+      api.listPagesConfigs(),
     ]);
     set({
       ready: true,
@@ -147,7 +155,13 @@ export const useApp = create<AppStore>((set, get) => ({
       ...(backupsResult.status === "fulfilled" ? { backups: backupsResult.value } : {}),
       ...(targetsResult.status === "fulfilled" ? { backupTargets: targetsResult.value } : {}),
       ...(configsResult.status === "fulfilled" ? { backupConfigs: configsResult.value } : {}),
+      ...(deployConfigsResult.status === "fulfilled"
+        ? { deployConfigs: deployConfigsResult.value }
+        : {}),
       ...(pagesResult.status === "fulfilled" ? { pagesRecords: pagesResult.value } : {}),
+      ...(pagesConfigsResult.status === "fulfilled"
+        ? { pagesConfigs: pagesConfigsResult.value }
+        : {}),
     });
     const failures = [
       reposResult,
@@ -157,7 +171,9 @@ export const useApp = create<AppStore>((set, get) => ({
       backupsResult,
       targetsResult,
       configsResult,
+      deployConfigsResult,
       pagesResult,
+      pagesConfigsResult,
     ].filter((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failures.length > 0) {
       // 汇总所有失败，避免只看到第一个出错接口而忽略后面的。
@@ -266,6 +282,22 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
+  refreshDeployConfigs: async () => {
+    try {
+      set({ deployConfigs: await api.listDeployConfigs() });
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
+
+  refreshPagesConfigs: async () => {
+    try {
+      set({ pagesConfigs: await api.listPagesConfigs() });
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
+
   setSettings: (settings) => set({ settings }),
 
   toast: (kind, message) => {
@@ -276,7 +308,8 @@ export const useApp = create<AppStore>((set, get) => ({
 
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
-  startDeploy: async (request) => {
+  /** 按保存的部署配置发起部署：参数由后端从配置读取，避免前端传参不一致。 */
+  startDeployConfig: async (configId) => {
     if (get().live?.status === "running") {
       const message = i18n.t("deploy.toast.running");
       get().toast("error", message);
@@ -286,7 +319,7 @@ export const useApp = create<AppStore>((set, get) => ({
       live: { recordId: "", lines: [], progress: 0, status: "running", record: null },
     });
     try {
-      const recordId = await api.startDeploy(request);
+      const recordId = await api.startDeployConfig(configId);
       set((state) => (state.live ? { live: { ...state.live, recordId } } : {}));
       return recordId;
     } catch (error) {
@@ -357,8 +390,6 @@ export const useApp = create<AppStore>((set, get) => ({
     });
   },
 
-  clearLive: () => set({ live: null }),
-
   startBackup: async (request) => {
     if (get().liveBackup?.status === "running") {
       const message = i18n.t("backup.toast.running");
@@ -400,8 +431,6 @@ export const useApp = create<AppStore>((set, get) => ({
       },
     });
   },
-
-  clearLiveBackup: () => set({ liveBackup: null }),
 
   startPagesDeploy: async (request) => {
     if (get().livePages?.status === "running") {
@@ -447,6 +476,4 @@ export const useApp = create<AppStore>((set, get) => ({
       },
     });
   },
-
-  clearLivePages: () => set({ livePages: null }),
 }));

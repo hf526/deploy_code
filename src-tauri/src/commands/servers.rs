@@ -57,6 +57,10 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
             .map(|saved| saved.id.clone())
             .collect();
         config.backup_configs.retain(|saved| saved.server_id != server_id);
+        // 服务器已删除，指向它的部署配置同样不可用（部署记录保留作历史）。
+        config
+            .deploy_configs
+            .retain(|saved| saved.server_id != server_id);
         // 定时备份若引用被删配置，清空引用，避免每天到点报错。
         if config
             .settings

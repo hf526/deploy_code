@@ -192,6 +192,22 @@ export interface DeployRequest {
   uploadEnv: boolean;
 }
 
+/** 保存的服务器部署配置（列表化管理，一键部署）。 */
+export interface DeployConfig {
+  id: string;
+  name: string;
+  repoId: string;
+  serverId: string;
+  targetDir: string;
+  /** 部署版本（分支 / 标签 / 提交）；为空表示打包当前工作区。 */
+  rev: string;
+  runScripts: boolean;
+  scriptDir: string;
+  scripts: string[];
+  uploadEnv: boolean;
+  createdAt: string;
+}
+
 export interface Settings {
   scriptDir: string;
   runScripts: boolean;
@@ -287,6 +303,13 @@ export interface PagesConfig {
   outputDir: string;
   branch: string;
   publishBranch: string;
+}
+
+/** 列表展示用的 Pages 配置条目（Pages 配置按仓库保存，一仓库一份）。 */
+export interface PagesConfigEntry {
+  repoId: string;
+  repoName: string;
+  config: PagesConfig;
 }
 
 export interface PagesDeployRecord {

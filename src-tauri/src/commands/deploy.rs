@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use deploy_core::models::{
-    elapsed_ms_since, now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus,
-    RemoteRelease,
+    elapsed_ms_since, now_string, DeployConfig, DeployEvent, DeployRecord, DeployRequest,
+    DeployStatus, RemoteRelease,
 };
 use deploy_core::{release, CoreError, DeployEngine, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -67,6 +67,55 @@ pub fn start_deploy(
         None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
     let engine = state.engine();
+    let record = engine.prepare(&request)?;
+    Ok(spawn_deploy(app, engine, record, request, claim))
+}
+
+/// 列出保存的部署配置。
+#[tauri::command(async)]
+pub fn list_deploy_configs(state: State<AppState>) -> Result<Vec<DeployConfig>> {
+    Ok(state.store.load_config()?.deploy_configs)
+}
+
+/// 新建或更新一条部署配置。
+#[tauri::command(async)]
+pub fn save_deploy_config(state: State<AppState>, config: DeployConfig) -> Result<DeployConfig> {
+    Store::save_deploy_config(&state.store, config)
+}
+
+/// 删除一条部署配置（不影响已有部署记录）。
+#[tauri::command(async)]
+pub fn delete_deploy_config(state: State<AppState>, config_id: String) -> Result<bool> {
+    Store::delete_deploy_config(&state.store, &config_id)
+}
+
+/// 按保存的部署配置发起部署：参数完全取自配置，避免前端传参与保存内容不一致。
+#[tauri::command(async)]
+pub fn start_deploy_config(
+    app: AppHandle,
+    state: State<AppState>,
+    config_id: String,
+) -> Result<String> {
+    // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
+    let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
+        Some(claim) => claim,
+        None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
+    };
+    let engine = state.engine();
+    let config = {
+        let app_config = state.store.load_config()?;
+        Store::find_deploy_config(&app_config, &config_id)?.clone()
+    };
+    let request = DeployRequest {
+        repo_id: config.repo_id,
+        rev: config.rev,
+        server_id: config.server_id,
+        target_dir: config.target_dir,
+        run_scripts: config.run_scripts,
+        script_dir: config.script_dir,
+        scripts: config.scripts,
+        upload_env: config.upload_env,
+    };
     let record = engine.prepare(&request)?;
     Ok(spawn_deploy(app, engine, record, request, claim))
 }

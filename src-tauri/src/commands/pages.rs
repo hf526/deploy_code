@@ -1,4 +1,6 @@
-use deploy_core::models::{PagesConfig, PagesDeployRecord, PagesEvent, PagesRequest};
+use deploy_core::models::{
+    PagesConfig, PagesConfigEntry, PagesDeployRecord, PagesEvent, PagesRequest,
+};
 use deploy_core::{CoreError, PagesEngine, PreparedPagesDeploy, Result, Store};
 use tauri::{AppHandle, Emitter, State};
 
@@ -82,6 +84,36 @@ pub fn delete_pages_record(state: State<AppState>, record_id: String) -> Result<
 #[tauri::command(async)]
 pub fn clear_pages_records(state: State<AppState>) -> Result<()> {
     state.store.clear_pages_records()
+}
+
+/// 列出所有已保存的 Pages 配置（按仓库一条，供部署页统一列表展示）。
+#[tauri::command(async)]
+pub fn list_pages_configs(state: State<AppState>) -> Result<Vec<PagesConfigEntry>> {
+    let config = state.store.load_config()?;
+    Ok(config
+        .repos
+        .iter()
+        .filter_map(|repo| {
+            repo.pages.clone().map(|pages| PagesConfigEntry {
+                repo_id: repo.id.clone(),
+                repo_name: repo.name.clone(),
+                config: pages,
+            })
+        })
+        .collect())
+}
+
+/// 删除某个仓库的 Pages 配置（已有的 Pages 部署记录保留）。
+#[tauri::command(async)]
+pub fn delete_pages_config(state: State<AppState>, repo_id: String) -> Result<bool> {
+    state.store.mutate_config(|app| {
+        let repo = app
+            .repos
+            .iter_mut()
+            .find(|repo| repo.id == repo_id)
+            .ok_or_else(|| CoreError::not_found(format!("仓库不存在: {repo_id}")))?;
+        Ok(repo.pages.take().is_some())
+    })
 }
 
 #[tauri::command(async)]

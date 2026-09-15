@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   CalendarClock,
   ChevronDown,
   ChevronRight,
   Database,
+  Pencil,
   Play,
   Plus,
   RefreshCw,
-  Save,
-  ShieldCheck,
   Trash2,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
@@ -29,29 +28,9 @@ import {
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
-import type { BackupConfig, BackupRecord, BackupRequest, DbBackupSource, Settings } from "../lib/types";
-import { cn, maskUrlPassword } from "../lib/utils";
-
-function defaultSource(): DbBackupSource {
-  return {
-    mode: "docker",
-    container: "postgres",
-    database: "",
-    username: "postgres",
-    password: "",
-    schema: "public",
-  };
-}
-
-function normalized(source: DbBackupSource): DbBackupSource {
-  return {
-    ...source,
-    container: source.container.trim(),
-    database: source.database.trim(),
-    username: source.username.trim(),
-    schema: source.schema.trim() || "public",
-  };
-}
+import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
+import { cn } from "../lib/utils";
+import { BackupConfigModal } from "./backup/BackupConfigModal";
 
 function statusBadge(record: BackupRecord) {
   if (record.status === "success") return <Badge kind="green">{i18n.t("status.success")}</Badge>;
@@ -82,28 +61,29 @@ export default function BackupsPage() {
   const startBackup = useApp((state) => state.startBackup);
   const refreshBackups = useApp((state) => state.refreshBackups);
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
-  const clearLiveBackup = useApp((state) => state.clearLiveBackup);
+  const refreshBackupTargets = useApp((state) => state.refreshBackupTargets);
   const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
 
-  const [configId, setConfigId] = useState("");
-  // configId 为空时区分「新建配置」与「尚未加载配置列表」，避免刷新列表时覆盖正在填写的表单。
-  const [creating, setCreating] = useState(false);
-  const [name, setName] = useState("");
-  const [serverId, setServerId] = useState("");
-  const [draft, setDraft] = useState<DbBackupSource>(defaultSource());
-  const [targetId, setTargetId] = useState("");
-  const [overrideUrl, setOverrideUrl] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [starting, setStarting] = useState(false);
+  const [editing, setEditing] = useState<{ config: BackupConfig | null } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
+  const [deleting, setDeleting] = useState(false);
   const [runningConfigId, setRunningConfigId] = useState("");
   const [scheduleTime, setScheduleTime] = useState(settings.scheduledBackupTime);
   // 设置保存串行化：连续修改时按顺序提交，避免在途请求用旧快照互相覆盖。
   const scheduleQueue = useRef<Promise<void>>(Promise.resolve());
+
+  // 配置 / 目标 / 设置可能被 CLI 改动，进入页面时拉取一次最新数据，避免展示与后端不一致。
+  useEffect(() => {
+    void refreshBackupConfigs();
+    void refreshBackupTargets();
+    void api
+      .getSettings()
+      .then((saved) => setSettings(saved))
+      .catch(() => undefined);
+  }, [refreshBackupConfigs, refreshBackupTargets, setSettings]);
 
   useEffect(() => {
     setScheduleTime(settings.scheduledBackupTime);
@@ -130,195 +110,49 @@ export default function BackupsPage() {
     }
   }
 
-  const selectedConfig =
-    backupConfigs.find((config) => config.id === configId) ?? null;
-
-  // 配置列表变化时保持选中项有效：首次加载自动选中第一条，选中的配置被删除时切换。
-  useEffect(() => {
-    if (creating) return;
-    if (configId && backupConfigs.some((config) => config.id === configId)) return;
-    if (backupConfigs.length > 0) {
-      setConfigId(backupConfigs[0].id);
-      return;
-    }
-    setConfigId("");
-    setName("");
-    setDraft(defaultSource());
-    setTargetId("");
-    setOverrideUrl("");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backupConfigs, creating]);
-
-  // 选中配置后把配置内容填充到表单。
-  useEffect(() => {
-    const config = backupConfigs.find((item) => item.id === configId);
-    if (!config) return;
-    setName(config.name);
-    setServerId(config.serverId);
-    setDraft(config.source);
-    setTargetId(config.targetId ?? "");
-    setOverrideUrl(config.supabaseUrl ?? "");
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [configId, backupConfigs]);
-
-  useEffect(() => {
-    if (!serverId && servers.length > 0) {
-      setServerId(servers[0].id);
-    }
-  }, [servers, serverId]);
-
   const running = liveBackup?.status === "running";
-  const selectedServer = servers.find((server) => server.id === serverId) ?? null;
 
-  const targetById = (id: string | null | undefined) =>
-    backupTargets.find((target) => target.id === id) ?? null;
-  // 服务器 / 配置可能绑定了已被删除的目标：悬空 id 一律按未绑定处理。
-  const validTargetId = backupTargets.some((target) => target.id === targetId)
-    ? targetId
-    : "";
-  // 与后端 resolve_target 的优先级保持一致：
-  // 表单连接串 > 表单目标 > 服务器绑定目标 > 服务器自定义连接串 > 全局默认 > 旧版连接串。
-  const effectiveTarget = useMemo(() => {
-    if (overrideUrl.trim()) {
-      return { name: t("backup.customUrl"), url: overrideUrl.trim() };
+  /** 列表展示用的目标（与后端 resolve_target 的优先级一致，仅用于展示）；未配置时为 null。 */
+  function resolveTarget(config: BackupConfig): { name: string; url: string } | null {
+    if (config.supabaseUrl?.trim()) {
+      return { name: t("backup.customUrl"), url: config.supabaseUrl.trim() };
     }
-    const bound = targetById(validTargetId);
-    if (bound) return { name: bound.name, url: bound.url };
-    const serverBound = targetById(selectedServer?.backupTargetId);
-    if (serverBound) return { name: serverBound.name, url: serverBound.url };
-    if (selectedServer?.supabaseUrl?.trim()) {
-      return { name: t("backup.serverCustomUrl"), url: selectedServer.supabaseUrl.trim() };
+    const bound = backupTargets.find((target) => target.id === config.targetId);
+    if (bound) return bound;
+    const server = servers.find((item) => item.id === config.serverId);
+    const serverBound = backupTargets.find((target) => target.id === server?.backupTargetId);
+    if (serverBound) return serverBound;
+    if (server?.supabaseUrl?.trim()) {
+      return { name: t("backup.serverCustomUrl"), url: server.supabaseUrl.trim() };
     }
-    const global = targetById(settings.defaultBackupTargetId);
-    if (global) return { name: global.name, url: global.url };
+    const global = backupTargets.find((target) => target.id === settings.defaultBackupTargetId);
+    if (global) return global;
     if (settings.supabaseUrl.trim()) {
       return { name: t("settings.backupTargets.legacyName"), url: settings.supabaseUrl.trim() };
     }
     return null;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overrideUrl, validTargetId, selectedServer, settings, backupTargets, t]);
-
-  /** 测试与实际备份使用同一份来源与目标。 */
-  function buildRequest(): BackupRequest {
-    return {
-      serverId,
-      backupConfigId: selectedConfig?.id ?? null,
-      source: normalized(draft),
-      targetId: validTargetId || null,
-      supabaseUrl: overrideUrl.trim() || null,
-    };
-  }
-
-  function handleNew() {
-    setCreating(true);
-    setConfigId("");
-    setName("");
-    setServerId(servers[0]?.id ?? "");
-    setDraft(defaultSource());
-    setTargetId("");
-    setOverrideUrl("");
-  }
-
-  /** 保存当前表单；通过时返回保存后的配置。 */
-  async function saveForm(): Promise<BackupConfig | null> {
-    if (!name.trim()) {
-      toast("error", t("backup.configNameRequired"));
-      return null;
-    }
-    if (!serverId) {
-      toast("error", t("backup.serverRequired"));
-      return null;
-    }
-    const saved = await api.saveBackupConfig({
-      id: selectedConfig?.id ?? "",
-      name: name.trim(),
-      serverId,
-      source: normalized(draft),
-      targetId: validTargetId || null,
-      supabaseUrl: overrideUrl.trim() || null,
-    });
-    await refreshBackupConfigs();
-    setCreating(false);
-    setConfigId(saved.id);
-    return saved;
-  }
-
-  async function handleSave() {
-    setSaving(true);
-    try {
-      const saved = await saveForm();
-      if (saved) toast("success", t("backup.configSaved", { name: saved.name }));
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  async function handleTest() {
-    if (testing || starting) return;
-    if (!serverId) {
-      toast("error", t("backup.serverRequired"));
-      return;
-    }
-    setTesting(true);
-    try {
-      // 已保存的配置：先保存当前表单再测试，否则后端会回退到配置里的旧目标（与 Start 不一致）。
-      if (selectedConfig) {
-        const saved = await saveForm();
-        if (!saved) return;
-      }
-      const message = await api.testBackup(buildRequest());
-      toast("success", message || t("backup.testPassed"));
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  async function handleStart() {
-    if (starting || testing) return;
-    if (!draft.database.trim()) {
-      toast("error", t("backup.databaseRequired"));
-      return;
-    }
-    setStarting(true);
-    try {
-      // 先保存当前配置，保证 CLI / 后续备份使用同一份参数。
-      const saved = await saveForm();
-      if (!saved) return;
-      clearLiveBackup();
-      await startBackup({
-        serverId,
-        backupConfigId: saved.id,
-        targetId: validTargetId || null,
-        supabaseUrl: overrideUrl.trim() || null,
-      });
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setStarting(false);
-    }
   }
 
   /** 列表内的一键备份：直接用已保存配置执行，不经过表单。 */
   async function handleRunConfig(config: BackupConfig) {
-    if (running || starting || testing) return;
-    setStarting(true);
+    if (running) return;
+    if (!resolveTarget(config)) {
+      toast("error", t("backup.noTarget"));
+      return;
+    }
+    // 不在这里清空 live：startBackup 会写入新的 running 状态，
+    // 提前清空会让列表项的 loading 标记立刻被 effect 重置，看不到进度。
     setRunningConfigId(config.id);
     try {
-      clearLiveBackup();
       await startBackup({ serverId: config.serverId, backupConfigId: config.id });
     } catch {
-      setRunningConfigId("");
-    } finally {
-      setStarting(false);
+      // store 已提示错误：liveBackup 会被置空，下方 effect 会清掉行内 loading 标记。
     }
   }
 
   async function handleDeleteConfig() {
-    if (!deleteTarget) return;
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
     try {
       await api.deleteBackupConfig(deleteTarget.id);
       await refreshBackupConfigs();
@@ -328,6 +162,7 @@ export default function BackupsPage() {
     } catch (error) {
       toast("error", String(error));
     } finally {
+      setDeleting(false);
       setDeleteTarget(null);
     }
   }
@@ -367,242 +202,89 @@ export default function BackupsPage() {
         </Button>
       }
     >
-      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[400px_minmax(0,1fr)]">
-        <div className="flex flex-col gap-6">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
+        <div className="flex min-w-0 flex-col gap-6">
           <section>
             <SectionTitle
               title={t("backup.configSection")}
               description={t("backup.configDescription")}
+              actions={
+                <Button
+                  size="sm"
+                  icon={<Plus className="size-3.5" />}
+                  onClick={() => setEditing({ config: null })}
+                >
+                  {t("backup.newConfig")}
+                </Button>
+              }
             />
-            <Card className="flex flex-col gap-4 p-5">
-              <div className="block">
-                <span className="mb-1 flex items-baseline gap-1 text-xs font-medium text-ink-dim">
-                  {t("backup.savedConfig")}
-                  <span className="ml-auto text-[11px] font-normal text-ink-faint">
-                    {t("backup.savedConfigHint")}
-                  </span>
-                </span>
-                <div className="flex flex-col gap-2">
-                  {backupConfigs.length === 0 && (
-                    <p className="text-[11px] text-ink-faint">{t("backup.noConfigs")}</p>
-                  )}
-                  {backupConfigs.map((config) => {
-                    // creating 时表单尚未归属任何配置，列表统一显示为未选中。
-                    const active = !creating && config.id === configId;
-                    const server = servers.find((item) => item.id === config.serverId) ?? null;
-                    return (
-                      <div
-                        key={config.id}
-                        className={cn(
-                          "flex items-center gap-2 rounded-md border px-2.5 py-2 transition-colors",
-                          active ? "border-brand-line bg-brand-soft" : "border-line bg-field/40",
-                        )}
-                      >
-                        <button
-                          type="button"
-                          title={t("backup.editConfig")}
-                          className="min-w-0 flex-1 text-left"
-                          onClick={() => {
-                            setCreating(false);
-                            setConfigId(config.id);
-                          }}
-                        >
-                          <p className="truncate text-[13px] font-medium text-ink">
-                            {config.name}
-                          </p>
-                          <p className="mt-0.5 truncate text-[11px] text-ink-faint">
-                            {server?.name ?? t("backup.unknownServer")} ·{" "}
-                            {config.source.database} · schema{" "}
-                            {config.source.schema || "public"}
-                          </p>
-                        </button>
-                        <Button
-                          size="sm"
-                          icon={<Play className="size-3.5" />}
-                          loading={runningConfigId === config.id && (running || starting)}
-                          disabled={running || starting || testing}
-                          onClick={() => void handleRunConfig(config)}
-                        >
-                          {t("backup.runConfig")}
-                        </Button>
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          title={t("backup.deleteConfig")}
-                          disabled={starting || testing}
-                          onClick={() => setDeleteTarget(config)}
-                        >
-                          <Trash2 className="size-3.5" />
-                        </Button>
-                      </div>
-                    );
-                  })}
+            {backupConfigs.length === 0 ? (
+              <EmptyState
+                icon={<Database className="size-4.5" />}
+                title={t("backup.noConfigs")}
+                description={t("backup.noConfigsDescription")}
+                action={
                   <Button
-                    variant="secondary"
-                    size="sm"
-                    className="self-start"
-                    icon={<Plus className="size-3.5" />}
-                    onClick={handleNew}
+                    icon={<Plus className="size-4" />}
+                    onClick={() => setEditing({ config: null })}
                   >
                     {t("backup.newConfig")}
                   </Button>
-                </div>
-              </div>
-
-              <Field label={t("backup.configName")} required>
-                <Input
-                  value={name}
-                  onChange={(event) => setName(event.target.value)}
-                  placeholder={t("backup.configNamePlaceholder")}
-                />
-              </Field>
-
-              <Field label={t("backup.server")} required>
-                <Select
-                  value={serverId}
-                  onChange={(event) => setServerId(event.target.value)}
-                  disabled={servers.length === 0}
-                >
-                  {servers.length === 0 && <option value="">{t("backup.noServers")}</option>}
-                  {servers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.username}@{server.host})
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <div className="grid grid-cols-2 gap-4">
-                <Field label={t("backup.mode")}>
-                  <Select
-                    value={draft.mode}
-                    onChange={(event) =>
-                      setDraft({ ...draft, mode: event.target.value as DbBackupSource["mode"] })
-                    }
-                  >
-                    <option value="docker">{t("backup.modeDocker")}</option>
-                    <option value="system">{t("backup.modeSystem")}</option>
-                  </Select>
-                </Field>
-                <Field label="Schema">
-                  <Input
-                    value={draft.schema}
-                    onChange={(event) => setDraft({ ...draft, schema: event.target.value })}
-                    placeholder="public"
-                  />
-                </Field>
-              </div>
-
-              {draft.mode === "docker" && (
-                <Field label={t("backup.container")} hint={t("backup.containerHint")} required>
-                  <Input
-                    value={draft.container}
-                    onChange={(event) => setDraft({ ...draft, container: event.target.value })}
-                    placeholder="postgres"
-                  />
-                </Field>
-              )}
-
-              <div className="grid grid-cols-2 gap-4">
-                <Field label={t("backup.database")} required>
-                  <Input
-                    value={draft.database}
-                    onChange={(event) => setDraft({ ...draft, database: event.target.value })}
-                    placeholder="app"
-                  />
-                </Field>
-                <Field label={t("backup.username")} required>
-                  <Input
-                    value={draft.username}
-                    onChange={(event) => setDraft({ ...draft, username: event.target.value })}
-                    placeholder="postgres"
-                  />
-                </Field>
-              </div>
-
-              <Field label={t("backup.password")} hint={t("backup.passwordHint")}>
-                <Input
-                  type="password"
-                  value={draft.password}
-                  onChange={(event) => setDraft({ ...draft, password: event.target.value })}
-                  placeholder={t("backup.passwordPlaceholder")}
-                />
-              </Field>
-
-              <div className="flex justify-end gap-2 border-t border-line pt-4">
-                <Button
-                  variant="secondary"
-                  loading={testing}
-                  disabled={!serverId || starting}
-                  onClick={() => void handleTest()}
-                >
-                  <ShieldCheck className="size-4" />
-                  {t("common.testEnvironment")}
-                </Button>
-                <Button
-                  variant="secondary"
-                  loading={saving}
-                  disabled={testing || starting}
-                  onClick={() => void handleSave()}
-                >
-                  <Save className="size-4" />
-                  {t("common.save")}
-                </Button>
-              </div>
-            </Card>
-          </section>
-
-          <section>
-            <SectionTitle title={t("backup.targetSection")} description={t("backup.targetDescription")} />
-            <Card className="flex flex-col gap-4 p-5">
-              <Field label={t("backup.useTarget")} hint={t("backup.useTargetHint")}>
-                <Select
-                  value={validTargetId}
-                  onChange={(event) => setTargetId(event.target.value)}
-                >
-                  <option value="">
-                    {t("backup.globalDefault")}
-                    {targetById(settings.defaultBackupTargetId)
-                      ? ` (${targetById(settings.defaultBackupTargetId)?.name})`
-                      : ""}
-                  </option>
-                  {backupTargets.map((target) => (
-                    <option key={target.id} value={target.id}>
-                      {target.name}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-              <Field label={t("backup.overrideUrl")} hint={t("backup.overrideUrlHint")}>
-                <Input
-                  value={overrideUrl}
-                  onChange={(event) => setOverrideUrl(event.target.value)}
-                  placeholder="postgresql://user:password@host:5432/postgres"
-                />
-              </Field>
-              <p className="text-[11px] leading-relaxed text-ink-faint">
-                {effectiveTarget ? (
-                  <>
-                    {t("backup.writingTo")}
-                    <span className="ml-1 font-medium text-ink-dim">{effectiveTarget.name}</span>
-                    <span className="ml-1 font-mono text-ink-faint">
-                      {maskUrlPassword(effectiveTarget.url)}
-                    </span>
-                  </>
-                ) : (
-                  <span className="text-warn">{t("backup.noTarget")}</span>
-                )}
-              </p>
-              <Button
-                size="lg"
-                loading={running || starting}
-                disabled={!serverId || !effectiveTarget || testing}
-                onClick={() => void handleStart()}
-              >
-                <Play className="size-4" />
-                {running ? t("backup.backupRunning") : t("backup.startBackup")}
-              </Button>
-            </Card>
+                }
+              />
+            ) : (
+              <Card className="divide-y divide-line overflow-hidden">
+                {backupConfigs.map((config) => {
+                  const server = servers.find((item) => item.id === config.serverId) ?? null;
+                  const target = resolveTarget(config);
+                  return (
+                    <div key={config.id} className="flex items-center gap-3 px-4 py-3">
+                      <span className="grid size-8 shrink-0 place-items-center rounded-md border border-brand-line bg-brand-soft text-brand">
+                        <Database className="size-4" />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <p className="truncate text-[13px] font-medium text-ink">{config.name}</p>
+                        <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+                          {server?.name ?? t("backup.unknownServer")} · {config.source.database} ·
+                          schema {config.source.schema || "public"} →{" "}
+                          <span className={cn(!target && "text-warn")}>
+                            {target?.name ?? t("backup.noTargetShort")}
+                          </span>
+                        </p>
+                      </div>
+                      <Button
+                        size="sm"
+                        icon={<Play className="size-3.5" />}
+                        loading={runningConfigId === config.id && running}
+                        disabled={running || !target}
+                        title={!target ? t("backup.noTarget") : undefined}
+                        onClick={() => void handleRunConfig(config)}
+                      >
+                        {t("backup.runConfig")}
+                      </Button>
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        title={t("backup.editConfig")}
+                        disabled={running}
+                        onClick={() => setEditing({ config })}
+                      >
+                        <Pencil className="size-3.5" />
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        title={t("backup.deleteConfig")}
+                        disabled={running}
+                        onClick={() => setDeleteTarget(config)}
+                      >
+                        <Trash2 className="size-3.5" />
+                      </Button>
+                    </div>
+                  );
+                })}
+              </Card>
+            )}
           </section>
 
           <section>
@@ -761,6 +443,19 @@ export default function BackupsPage() {
         </div>
       </div>
 
+      {editing && (
+        <BackupConfigModal
+          config={editing.config}
+          onClose={() => setEditing(null)}
+          onRefresh={() => void refreshBackupConfigs()}
+          onSaved={(saved) => {
+            setEditing(null);
+            void refreshBackupConfigs();
+            toast("success", t("backup.configSaved", { name: saved.name }));
+          }}
+        />
+      )}
+
       <ConfirmModal
         open={confirmClear}
         danger
@@ -774,6 +469,7 @@ export default function BackupsPage() {
       <ConfirmModal
         open={deleteTarget !== null}
         danger
+        loading={deleting}
         title={t("backup.configDeleteTitle")}
         confirmText={t("common.delete")}
         description={t("backup.configDeleteDescription", { name: deleteTarget?.name ?? "" })}

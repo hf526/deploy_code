@@ -7,6 +7,7 @@ import type {
   BackupTarget,
   Branch,
   Commit,
+  DeployConfig,
   DeployRecord,
   DeployRequest,
   EnvFileConfig,
@@ -14,6 +15,7 @@ import type {
   FileEntry,
   GraphCommit,
   PagesConfig,
+  PagesConfigEntry,
   PagesDeployRecord,
   PagesRequest,
   RepoDetail,
@@ -121,6 +123,13 @@ export const api = {
 
   // 部署
   startDeploy: (request: DeployRequest) => invoke<string>("start_deploy", { request }),
+  startDeployConfig: (configId: string) =>
+    invoke<string>("start_deploy_config", { configId }),
+  listDeployConfigs: () => invoke<DeployConfig[]>("list_deploy_configs"),
+  saveDeployConfig: (config: DeployConfig) =>
+    invoke<DeployConfig>("save_deploy_config", { config }),
+  deleteDeployConfig: (configId: string) =>
+    invoke<boolean>("delete_deploy_config", { configId }),
   redeploy: (recordId: string) => invoke<string>("redeploy", { recordId }),
   cancelDeploy: (recordId: string) => invoke<string>("cancel_deploy", { recordId }),
   listReleases: (serverId: string, targetDir: string) =>
@@ -162,6 +171,8 @@ export const api = {
   getPagesConfig: (repoId: string) => invoke<PagesConfig>("get_pages_config", { repoId }),
   savePagesConfig: (repoId: string, config: PagesConfig) =>
     invoke<PagesConfig>("save_pages_config", { repoId, config }),
+  listPagesConfigs: () => invoke<PagesConfigEntry[]>("list_pages_configs"),
+  deletePagesConfig: (repoId: string) => invoke<boolean>("delete_pages_config", { repoId }),
   testPages: (repoId: string, config?: PagesConfig) =>
     invoke<string>("test_pages", { repoId, config }),
 };

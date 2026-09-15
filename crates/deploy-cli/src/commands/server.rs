@@ -160,6 +160,8 @@ pub(super) async fn server_command(cli: &Cli, command: &ServerCommand) -> Result
                     .map(|saved| saved.id.clone())
                     .collect();
                 config.backup_configs.retain(|saved| saved.server_id != id);
+                // 与 GUI 一致：服务器已删除，指向它的部署配置同样不可用。
+                config.deploy_configs.retain(|saved| saved.server_id != id);
                 // 定时备份若引用被删配置，清空引用，避免每天到点报错。
                 if config
                     .settings

@@ -1,45 +1,68 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
-  AlertTriangle,
   CheckCircle2,
   ChevronDown,
-  ChevronUp,
-  CircleDot,
-  FileUp,
-  GitBranch,
+  ChevronRight,
+  Cloud,
   History,
+  Pencil,
   Plus,
   Rocket,
   Square,
   Terminal,
   Timer,
-  X,
+  Trash2,
   XCircle,
 } from "lucide-react";
-import { Trans, useTranslation } from "react-i18next";
+import { useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
-import { open } from "@tauri-apps/plugin-dialog";
 
+import { BindRemoteModal } from "../components/BindRemoteModal";
 import { LogConsole } from "../components/LogConsole";
-import { SearchSelect } from "../components/SearchSelect";
-import { Badge, Button, Card, Field, Input, Page, Select } from "../components/ui";
+import {
+  Badge,
+  Button,
+  Card,
+  Checkbox,
+  ConfirmModal,
+  EmptyState,
+  Modal,
+  Page,
+  SectionTitle,
+} from "../components/ui";
 import { api } from "../lib/api";
 import { useApp } from "../lib/store";
 import type {
-  Branch,
+  DeployConfig,
   DeployRecord,
-  EnvFileConfig,
+  PagesConfigEntry,
   PagesDeployRecord,
-  ResolvedRev,
+  RepoInfo,
 } from "../lib/types";
-import {
-  cn,
-  deployStatusClass,
-  deployStatusLabel,
-  formatDuration,
-  shortPath,
-} from "../lib/utils";
-import { PagesDeployPanel } from "./deploy/PagesDeployPanel";
+import { cn, deployStatusClass, deployStatusLabel, formatDuration } from "../lib/utils";
+import { DeployConfigModal, type DeployPrefill } from "./deploy/DeployConfigModal";
+import { PagesConfigModal } from "./deploy/PagesConfigModal";
+
+type EditingState =
+  | { kind: "server"; config: DeployConfig | null; prefill?: DeployPrefill }
+  | { kind: "pages"; entry: PagesConfigEntry | null; prefillRepoId?: string };
+
+type DeletingState =
+  | { kind: "server"; id: string; name: string }
+  | { kind: "pages"; repoId: string; name: string };
+
+/** 统一列表项：服务器部署配置与 Pages 配置（按仓库一份）合并展示。 */
+type ConfigRow =
+  | { kind: "server"; key: string; name: string; repoName: string; config: DeployConfig }
+  | { kind: "pages"; key: string; name: string; repoName: string; entry: PagesConfigEntry };
+
+/** Pages 配置的一行摘要（列表与部署确认弹窗共用）。 */
+function pagesSummary(entry: PagesConfigEntry, fallback: string): string {
+  const config = entry.config;
+  return config.provider === "github"
+    ? `GitHub Pages · ${config.publishBranch || "gh-pages"}`
+    : `Cloudflare Pages · ${config.projectName || fallback}`;
+}
 
 export default function DeployPage() {
   const { t } = useTranslation();
@@ -50,341 +73,206 @@ export default function DeployPage() {
   const repos = useApp((state) => state.repos);
   const servers = useApp((state) => state.servers);
   const history = useApp((state) => state.history);
-  const settings = useApp((state) => state.settings);
   const live = useApp((state) => state.live);
-  const startDeploy = useApp((state) => state.startDeploy);
+  const livePages = useApp((state) => state.livePages);
+  const deployConfigs = useApp((state) => state.deployConfigs);
+  const pagesConfigs = useApp((state) => state.pagesConfigs);
+  const pagesRecords = useApp((state) => state.pagesRecords);
+  const startDeployConfig = useApp((state) => state.startDeployConfig);
   const redeploy = useApp((state) => state.redeploy);
   const cancelDeploy = useApp((state) => state.cancelDeploy);
+  const startPagesDeploy = useApp((state) => state.startPagesDeploy);
+  const refreshDeployConfigs = useApp((state) => state.refreshDeployConfigs);
+  const refreshPagesConfigs = useApp((state) => state.refreshPagesConfigs);
+  const refreshPagesRecords = useApp((state) => state.refreshPagesRecords);
+  const refreshHistory = useApp((state) => state.refreshHistory);
   const refreshRepos = useApp((state) => state.refreshRepos);
-  const pagesRecords = useApp((state) => state.pagesRecords);
-  const livePages = useApp((state) => state.livePages);
 
-  const [deployTarget, setDeployTarget] = useState<"server" | "pages">(() =>
-    searchParams.get("target") === "pages" ? "pages" : "server",
-  );
-  const [repoId, setRepoId] = useState(() => searchParams.get("repo") ?? "");
-  const [rev, setRev] = useState(() => searchParams.get("rev") ?? "");
-  const [customRev, setCustomRev] = useState(() => !!searchParams.get("rev"));
-  const [serverId, setServerId] = useState("");
-  const [targetDir, setTargetDir] = useState("");
-  const [runScripts, setRunScripts] = useState(settings.runScripts);
-  const [scriptDir, setScriptDir] = useState(settings.scriptDir);
-  const [scripts, setScripts] = useState<string[]>([]);
-  const [scriptOptions, setScriptOptions] = useState<string[]>([]);
-  const [envFiles, setEnvFiles] = useState<EnvFileConfig[]>([]);
-  const [uploadEnv, setUploadEnv] = useState(true);
+  const [editing, setEditing] = useState<EditingState | null>(null);
+  const [deleting, setDeleting] = useState<DeletingState | null>(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const [pagesRun, setPagesRun] = useState<PagesConfigEntry | null>(null);
+  const [skipBuild, setSkipBuild] = useState(false);
+  const [recordsTab, setRecordsTab] = useState<"server" | "pages">("server");
+  const [expandedRecord, setExpandedRecord] = useState<string | null>(null);
+  const [confirmClearPages, setConfirmClearPages] = useState(false);
+  const [bindRepo, setBindRepo] = useState<RepoInfo | null>(null);
   const [cancelling, setCancelling] = useState(false);
+  const [viewKind, setViewKind] = useState<"server" | "pages">("server");
 
-  const [branches, setBranches] = useState<Branch[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
-  const [resolved, setResolved] = useState<ResolvedRev | null>(null);
-  const [resolveError, setResolveError] = useState<string | null>(null);
-  const [resolving, setResolving] = useState(false);
-  const [submitting, setSubmitting] = useState(false);
+  // 配置与记录可能被 CLI 或其它页面（删除服务器 / 仓库）改动，进入页面时拉取一次最新数据。
+  useEffect(() => {
+    void refreshDeployConfigs();
+    void refreshPagesConfigs();
+    void refreshHistory();
+    void refreshPagesRecords();
+  }, [refreshDeployConfigs, refreshPagesConfigs, refreshHistory, refreshPagesRecords]);
 
+  const serverRunning = live?.status === "running";
+  const pagesRunning = livePages?.status === "running";
+  // 任意一种部署进行中时都锁定操作，避免两种任务并发争用同一工作区。
+  const running = serverRunning || pagesRunning;
+
+  // 从其他页面（如仓库页）带参数进入时直接打开新增弹窗，并把参数从地址栏清掉。
+  // 清空后必须把记录重置，否则下一次同样的深链（如再次点「部署」）会因 key 相同而被忽略。
   const appliedQuery = useRef("");
-  const appliedRepo = useRef("");
-  const pendingRev = useRef<{ repoId: string | null; rev: string } | null>(null);
-  const repoIdRef = useRef(repoId);
-  repoIdRef.current = repoId;
-  const envSaveRef = useRef<Promise<void> | null>(null);
-  const envSaveSeq = useRef(0);
-
   useEffect(() => {
     const key = `${searchParams.get("repo") ?? ""}|${searchParams.get("rev") ?? ""}|${searchParams.get("target") ?? ""}`;
+    if (key === "||") {
+      appliedQuery.current = "";
+      return;
+    }
     if (key === appliedQuery.current) return;
     appliedQuery.current = key;
-    const queryRepo = searchParams.get("repo");
-    const queryRev = searchParams.get("rev");
-    const queryTarget = searchParams.get("target");
-    if (queryRepo) setRepoId(queryRepo);
-    if (queryRev) {
-      // 版本绑定到所属仓库，避免切换仓库时把旧仓库的版本套用过去；
-      // 未带 repo 时留 null，表示接受默认选中的仓库。
-      pendingRev.current = { repoId: queryRepo, rev: queryRev };
-      setRev(queryRev);
-      setCustomRev(true);
-    }
-    if (queryTarget === "pages" || queryTarget === "server") {
-      setDeployTarget(queryTarget);
-    }
-  }, [searchParams]);
-
-  useEffect(() => {
-    if (!repoId && repos.length > 0) setRepoId(repos[0].id);
-  }, [repos, repoId]);
-
-  useEffect(() => {
-    if (!repoId) {
-      setBranches([]);
-      setBranchesLoaded(false);
-      return;
-    }
-    let cancelled = false;
-    setBranches([]);
-    setBranchesLoaded(false);
-    void (async () => {
-      try {
-        const list = await api.listBranches(repoId, false);
-        if (!cancelled) {
-          setBranches(list);
-          setBranchesLoaded(true);
-        }
-      } catch (error) {
-        if (!cancelled) toast("error", String(error));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [repoId, toast]);
-
-  // 仓库没有任何分支（如尚未提交的空仓库）时默认部署当前工作区，避免版本解析失败后无法部署。
-  useEffect(() => {
-    if (!repoId || !branchesLoaded || customRev) return;
-    if (branches.length === 0 && rev) setRev("");
-  }, [repoId, branchesLoaded, branches.length, customRev, rev]);
-
-  useEffect(() => {
-    const dir = scriptDir.trim();
-    if (!repoId || !dir) {
-      setScriptOptions([]);
-      return;
-    }
-    let cancelled = false;
-    void api
-      .listDir(repoId, dir)
-      .then((entries) => {
-        if (!cancelled) {
-          setScriptOptions(
-            entries.filter((entry) => !entry.isDir && entry.name.endsWith(".sh")).map((entry) => entry.name),
-          );
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setScriptOptions([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [repoId, scriptDir]);
-
-  useEffect(() => {
-    if (!repoId || appliedRepo.current === repoId) return;
-    const repo = repos.find((item) => item.id === repoId);
-    // 仓库列表尚未加载完成时先不标记，等加载后再补默认值。
-    if (!repo) return;
-    appliedRepo.current = repoId;
-    const pending = pendingRev.current;
-    pendingRev.current = null;
-    if (pending && (pending.repoId === null || pending.repoId === repoId)) {
-      // 深链带入的版本优先于仓库默认分支，否则会被默认值重置覆盖。
-      setRev(pending.rev);
-      setCustomRev(true);
+    const repoId = searchParams.get("repo") ?? undefined;
+    const rev = searchParams.get("rev") ?? undefined;
+    if (searchParams.get("target") === "pages") {
+      setEditing({ kind: "pages", entry: null, prefillRepoId: repoId });
     } else {
-      setRev(repo.currentBranch ?? "");
-      setCustomRev(false);
+      setEditing({ kind: "server", config: null, prefill: { repoId, rev } });
     }
-    setTargetDir(repo.defaultTargetDir ?? "");
-    setServerId(repo.defaultServerId ?? "");
-    const files = repo.envFiles ?? [];
-    setEnvFiles(files);
-    setUploadEnv(files.length > 0);
-    // 脚本列表属于「单次部署选择」，切换仓库时清空，避免把上一个仓库的脚本带到新仓库。
-    setScripts([]);
-  }, [repoId, repos]);
+    navigate("/deploy", { replace: true });
+  }, [searchParams, navigate]);
 
+  // 任务运行时自动切到对应的视图，保证日志与状态卡一致。
   useEffect(() => {
-    setRunScripts(settings.runScripts);
-    setScriptDir(settings.scriptDir);
-  }, [settings]);
+    if (pagesRunning && !serverRunning) setViewKind("pages");
+    if (serverRunning && !pagesRunning) setViewKind("server");
+  }, [pagesRunning, serverRunning]);
 
-  useEffect(() => {
-    if (!repoId || !rev.trim()) {
-      setResolved(null);
-      setResolveError(null);
-      setResolving(false);
-      return;
-    }
-    let cancelled = false;
-    setResolving(true);
-    setResolveError(null);
-    setResolved(null);
-    const timer = window.setTimeout(() => {
-      void (async () => {
-        try {
-          const result = await api.resolveRev(repoId, rev.trim());
-          if (!cancelled) {
-            setResolved(result);
-            setResolveError(null);
-          }
-        } catch (error) {
-          if (!cancelled) {
-            setResolved(null);
-            setResolveError(String(error));
-          }
-        } finally {
-          if (!cancelled) setResolving(false);
-        }
-      })();
-    }, 300);
-    return () => {
-      cancelled = true;
-      window.clearTimeout(timer);
-    };
-  }, [repoId, rev]);
+  const rows = useMemo<ConfigRow[]>(() => {
+    const repoName = (repoId: string) =>
+      repos.find((repo) => repo.id === repoId)?.name ?? t("deploy.unknownRepo");
+    const serverRows: ConfigRow[] = deployConfigs
+      .map((config) => ({
+        kind: "server" as const,
+        key: config.id,
+        name: config.name,
+        repoName: repoName(config.repoId),
+        config,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    const pagesRows: ConfigRow[] = pagesConfigs
+      .map((entry) => ({
+        kind: "pages" as const,
+        key: entry.repoId,
+        name: entry.repoName,
+        repoName: repoName(entry.repoId),
+        entry,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return [...serverRows, ...pagesRows];
+  }, [deployConfigs, pagesConfigs, repos, t]);
 
-  const branchChoices = useMemo(
-    () =>
-      branches.map((branch) => ({
-        value: branch.name,
-        label: branch.name,
-        hint: branch.isCurrent ? t("deploy.current") : undefined,
-      })),
-    [branches, t],
-  );
+  const activeKind = viewKind;
+  const activeLive = activeKind === "pages" ? livePages : live;
+  const activeRunning = activeKind === "pages" ? pagesRunning : serverRunning;
+  const recentDeploys = history.slice(0, 8);
+  const recentPagesDeploys = pagesRecords.slice(0, 8);
 
-  // 服务端部署的版本选项：额外提供「当前工作区」，留空表示不走分支直接打包本地目录。
-  const versionChoices = useMemo(
-    () => [{ value: "", label: t("deploy.worktreeOption") }, ...branchChoices],
-    [branchChoices, t],
-  );
-
-  const selectedRepo = repos.find((item) => item.id === repoId);
-  const selectedServer = servers.find((item) => item.id === serverId);
-
-  const recentDeploys = useMemo(
-    () => history.filter((record) => record.repoId === repoId).slice(0, 6),
-    [history, repoId],
-  );
-
-  const recentPagesDeploys = useMemo(
-    () => pagesRecords.filter((record) => record.repoId === repoId).slice(0, 6),
-    [pagesRecords, repoId],
-  );
-
-  function addScript(name: string) {
-    const value = name.trim();
-    if (!value) return;
-    setScripts((current) => (current.includes(value) ? current : [...current, value]));
-  }
-
-  function moveScript(index: number, delta: number) {
-    setScripts((current) => {
-      const target = index + delta;
-      if (target < 0 || target >= current.length) return current;
-      const next = [...current];
-      [next[index], next[target]] = [next[target], next[index]];
-      return next;
-    });
-  }
-
-  function removeScript(name: string) {
-    setScripts((current) => current.filter((item) => item !== name));
-  }
-
-  function basename(path: string): string {
-    const parts = path.replace(/\\/g, "/").split("/");
-    return parts[parts.length - 1] ?? path;
-  }
-
-  /** 保存环境文件列表到仓库配置（串行，失败时回退到已保存的配置）。 */
-  function persistEnvFiles(next: EnvFileConfig[]): Promise<void> {
-    setEnvFiles(next);
-    if (!repoId) return Promise.resolve();
-    const seq = ++envSaveSeq.current;
-    const task = (envSaveRef.current ?? Promise.resolve()).then(async () => {
-      try {
-        await api.saveRepoEnvFiles(repoId, next);
-        await refreshRepos();
-      } catch (error) {
-        toast("error", String(error));
-        // 仅当没有更新的保存排队时才回退，避免覆盖后续编辑。
-        if (seq === envSaveSeq.current) {
-          const repo = repos.find((item) => item.id === repoIdRef.current);
-          setEnvFiles(repo?.envFiles ?? []);
-        }
-      }
-    });
-    envSaveRef.current = task;
-    return task;
-  }
-
-  async function pickEnvFile(index?: number) {
+  async function handleDeployServer(config: DeployConfig) {
+    if (running) return;
+    setViewKind("server");
+    setRecordsTab("server");
     try {
-      const selected = await open({ multiple: false, title: t("deploy.pickEnvFile") });
-      if (typeof selected !== "string") return;
-      if (index === undefined) {
-        await persistEnvFiles([...envFiles, { localPath: selected, remotePath: basename(selected) }]);
-        return;
+      await startDeployConfig(config.id);
+    } catch {
+      // store 已提示错误
+    }
+  }
+
+  function openPagesRun(entry: PagesConfigEntry) {
+    if (running) return;
+    setSkipBuild(false);
+    setPagesRun(entry);
+  }
+
+  async function handleDeployPages() {
+    if (!pagesRun || running) return;
+    const entry = pagesRun;
+    setViewKind("pages");
+    setRecordsTab("pages");
+    setPagesRun(null);
+    // 不在这里清空 livePages：startPagesDeploy 会写入新的 running 状态并替换旧记录。
+    try {
+      await startPagesDeploy({ repoId: entry.repoId, skipBuild });
+    } catch {
+      // store 已提示错误
+    }
+  }
+
+  async function handleDelete() {
+    if (!deleting || deleteBusy) return;
+    setDeleteBusy(true);
+    try {
+      const removed =
+        deleting.kind === "server"
+          ? await api.deleteDeployConfig(deleting.id)
+          : await api.deletePagesConfig(deleting.repoId);
+      if (deleting.kind === "server") {
+        await refreshDeployConfigs();
+      } else {
+        await refreshPagesConfigs();
       }
-      const next = envFiles.map((file, itemIndex) =>
-        itemIndex === index
-          ? {
-              localPath: selected,
-              remotePath: file.remotePath.trim() ? file.remotePath : basename(selected),
-            }
-          : file,
-      );
-      await persistEnvFiles(next);
+      if (removed) {
+        toast("success", t("deploy.configDeleted", { name: deleting.name }));
+      } else {
+        // 配置可能已被 CLI / 其它页面删除：只刷新列表，不误报成功。
+        toast("info", t("deploy.configMissing"));
+      }
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setDeleteBusy(false);
+      setDeleting(null);
+    }
+  }
+
+  async function handleDeletePagesRecord(recordId: string) {
+    try {
+      await api.deletePagesRecord(recordId);
+      await refreshPagesRecords();
     } catch (error) {
       toast("error", String(error));
     }
   }
 
-  async function removeEnvFile(index: number) {
-    await persistEnvFiles(envFiles.filter((_, itemIndex) => itemIndex !== index));
-  }
-
-  function updateEnvRemote(index: number, value: string) {
-    setEnvFiles((current) =>
-      current.map((file, itemIndex) => (itemIndex === index ? { ...file, remotePath: value } : file)),
-    );
-  }
-
-  async function handleDeploy() {
-    if (!repoId) return toast("error", t("deploy.errorRepo"));
-    if (!serverId) return toast("error", t("deploy.errorServer"));
-    if (!targetDir.trim()) return toast("error", t("deploy.errorTargetDir"));
-    if (resolveError) return toast("error", t("deploy.errorResolve"));
-
-    setSubmitting(true);
+  async function handleClearPagesRecords() {
     try {
-      // 等待未完成的环境文件保存，避免部署读到旧的远端路径。
-      await envSaveRef.current;
-      await startDeploy({
-        repoId,
-        rev: rev.trim(),
-        serverId,
-        targetDir: targetDir.trim(),
-        runScripts,
-        scriptDir: scriptDir.trim() || settings.scriptDir,
-        scripts,
-        uploadEnv,
-      });
-    } catch {
-      // store 已提示错误
+      await api.clearPagesRecords();
+      await refreshPagesRecords();
+      toast("success", t("pages.cleared"));
+    } catch (error) {
+      toast("error", String(error));
     } finally {
-      setSubmitting(false);
+      setConfirmClearPages(false);
     }
   }
 
-  const serverRunning = live?.status === "running";
-  const pagesRunning = livePages?.status === "running";
-  // 任意一种部署进行中时都锁定表单，避免两种任务并发。
-  const running = serverRunning || pagesRunning;
-  const activeLive = deployTarget === "pages" ? livePages : live;
-  const activeRunning = deployTarget === "pages" ? pagesRunning : serverRunning;
+  async function copyUrl(url: string) {
+    try {
+      await navigator.clipboard.writeText(url);
+      toast("success", t("pages.urlCopied"));
+    } catch {
+      toast("info", url);
+    }
+  }
 
-  // 从其他页面（如 Pages 部署页）发起后回到本页时，自动切到对应的部署方式查看日志。
-  useEffect(() => {
-    if (pagesRunning && !serverRunning) setDeployTarget("pages");
-  }, [pagesRunning, serverRunning]);
+  function configSummary(row: ConfigRow): string {
+    if (row.kind === "server") {
+      const server = servers.find((item) => item.id === row.config.serverId);
+      const rev = row.config.rev.trim() || t("deploy.worktree");
+      return `${server?.name ?? t("deploy.unknownServer")} → ${
+        row.config.targetDir || t("deploy.targetDirEmpty")
+      } · ${rev}`;
+    }
+    return pagesSummary(row.entry, t("pages.projectNameEmpty"));
+  }
 
   return (
     <Page
       title={t("nav.deploy")}
-      subtitle={deployTarget === "pages" ? t("pages.subtitle") : t("deploy.subtitle")}
+      subtitle={t("deploy.subtitle")}
       actions={
         <Button
           variant="secondary"
@@ -395,418 +283,220 @@ export default function DeployPage() {
         </Button>
       }
     >
-      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[400px_minmax(0,1fr)]">
-        <div className="flex flex-col gap-5">
-          <Card className="p-5">
-            <h2 className="mb-4 flex items-center gap-2.5 text-sm font-semibold tracking-tight text-ink">
-              <span className="grid size-7 place-items-center rounded-md border border-brand-line bg-brand-soft">
-                <Rocket className="size-3.5 text-brand" />
-              </span>
-              {t("deploy.config")}
-            </h2>
-
-            <div className="flex flex-col gap-4">
-              <Field label={t("deploy.repo")} required>
-                <Select
-                  value={repoId}
-                  onChange={(event) => setRepoId(event.target.value)}
-                  disabled={running || submitting}
-                >
-                  <option value="">{t("deploy.repoPlaceholder")}</option>
-                  {repos.map((repo) => (
-                    <option key={repo.id} value={repo.id}>
-                      {repo.name}
-                    </option>
-                  ))}
-                </Select>
-              </Field>
-
-              <Field label={t("deploy.deployTarget")} required>
-                <Select
-                  value={deployTarget}
-                  onChange={(event) =>
-                    setDeployTarget(event.target.value as "server" | "pages")
-                  }
-                  disabled={running}
-                >
-                  <option value="server">{t("deploy.deployTargetServer")}</option>
-                  <option value="pages">{t("deploy.deployTargetPages")}</option>
-                </Select>
-              </Field>
-
-              <div
-                className={
-                  deployTarget === "pages" ? "hidden" : "flex flex-col gap-4"
-                }
-              >
-              <Field
-                label={t("deploy.revision")}
-                hint={resolving ? t("deploy.resolving") : resolved?.short}
-              >
-                {customRev ? (
-                  <div className="flex gap-2">
-                    <div className="min-w-0 flex-1">
-                      <SearchSelect
-                        value={rev}
-                        onChange={setRev}
-                        options={versionChoices}
-                        allowCustom
-                        placeholder={t("deploy.branchOrCommit")}
-                        disabled={running}
-                      />
-                    </div>
+      <div className="grid grid-cols-1 gap-5 xl:grid-cols-[minmax(0,1fr)_400px]">
+        <div className="flex min-w-0 flex-col gap-5">
+          <section>
+            <SectionTitle
+              title={t("deploy.configSection")}
+              description={t("deploy.configSectionDescription")}
+              actions={
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    icon={<Cloud className="size-3.5" />}
+                    onClick={() => setEditing({ kind: "pages", entry: null })}
+                  >
+                    {t("pages.newConfig")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    icon={<Plus className="size-3.5" />}
+                    onClick={() => setEditing({ kind: "server", config: null })}
+                  >
+                    {t("deploy.newConfig")}
+                  </Button>
+                </div>
+              }
+            />
+            {rows.length === 0 ? (
+              <EmptyState
+                icon={<Rocket className="size-4.5" />}
+                title={t("deploy.noConfigs")}
+                description={t("deploy.noConfigsDescription")}
+                action={
+                  <div className="flex items-center gap-2">
                     <Button
                       variant="secondary"
-                      onClick={() => {
-                        setCustomRev(false);
-                        setRev(selectedRepo?.currentBranch ?? "");
-                      }}
+                      icon={<Cloud className="size-4" />}
+                      onClick={() => setEditing({ kind: "pages", entry: null })}
                     >
-                      {t("deploy.selectBranch")}
+                      {t("pages.newConfig")}
+                    </Button>
+                    <Button
+                      icon={<Plus className="size-4" />}
+                      onClick={() => setEditing({ kind: "server", config: null })}
+                    >
+                      {t("deploy.newConfig")}
                     </Button>
                   </div>
-                ) : (
-                  <div className="flex gap-2">
-                    <div className="min-w-0 flex-1">
-                      <SearchSelect
-                        value={rev}
-                        onChange={setRev}
-                        options={versionChoices}
-                        placeholder={t("deploy.branchPlaceholder")}
-                        disabled={running}
-                      />
-                    </div>
-                    <Button variant="secondary" onClick={() => setCustomRev(true)}>
-                      {t("deploy.specifyCommit")}
-                    </Button>
-                  </div>
-                )}
-                {!rev.trim() && !resolveError && (
-                  <p className="mt-2 flex items-start gap-1.5 text-[11px] text-ink-dim">
-                    <CircleDot className="mt-0.5 size-3 shrink-0 text-brand" />
-                    <span className="min-w-0">{t("deploy.worktreeNote")}</span>
-                  </p>
-                )}
-                {resolved && !resolveError && (
-                  <p className="mt-2 flex items-start gap-1.5 text-[11px] text-ink-dim">
-                    <CircleDot className="mt-0.5 size-3 shrink-0 text-pos" />
-                    <span className="min-w-0">
-                      <span className="text-ink-dim">{resolved.short}</span> {resolved.subject}
-                      <span className="text-ink-faint">
-                        {" "}
-                        · {resolved.author} · {resolved.date}
-                      </span>
+                }
+              />
+            ) : (
+              <Card className="divide-y divide-line overflow-hidden">
+                {rows.map((row) => (
+                  <div key={`${row.kind}-${row.key}`} className="flex items-center gap-3 px-4 py-3">
+                    <span
+                      className={cn(
+                        "grid size-8 shrink-0 place-items-center rounded-md border",
+                        row.kind === "server"
+                          ? "border-brand-line bg-brand-soft text-brand"
+                          : "border-line bg-field text-ink-dim",
+                      )}
+                    >
+                      {row.kind === "server" ? (
+                        <Rocket className="size-4" />
+                      ) : (
+                        <Cloud className="size-4" />
+                      )}
                     </span>
-                  </p>
-                )}
-                {resolveError && (
-                  <p className="mt-2 flex items-start gap-1.5 text-[11px] text-neg">
-                    <AlertTriangle className="mt-0.5 size-3 shrink-0" />
-                    {resolveError}
-                  </p>
-                )}
-              </Field>
-
-              <Field label={t("deploy.server")} required>
-                <Select
-                  value={serverId}
-                  onChange={(event) => {
-                    const next = event.target.value;
-                    setServerId(next);
-                    const server = servers.find((item) => item.id === next);
-                    if (server && !targetDir.trim()) setTargetDir(server.defaultTargetDir);
-                  }}
-                  disabled={running}
-                >
-                  <option value="">{t("deploy.serverPlaceholder")}</option>
-                  {servers.map((server) => (
-                    <option key={server.id} value={server.id}>
-                      {server.name} ({server.username}@{server.host})
-                    </option>
-                  ))}
-                </Select>
-                {servers.length === 0 && (
-                  <p className="mt-2 text-[11px] text-ink-faint">
-                    <Trans
-                      i18nKey="deploy.noServers"
-                      components={{
-                        link: (
-                          <button
-                            type="button"
-                            className="mx-0.5 text-brand hover:underline"
-                            onClick={() => navigate("/servers")}
-                          />
-                        ),
-                      }}
-                    />
-                  </p>
-                )}
-              </Field>
-
-              <Field label={t("deploy.targetDir")} required hint={t("deploy.targetDirHint")}>
-                <Input
-                  value={targetDir}
-                  onChange={(event) => setTargetDir(event.target.value)}
-                  placeholder="/opt/apps/my-app"
-                  disabled={running}
-                />
-              </Field>
-
-              <div className="rounded-md border border-line bg-field p-3.5">
-                <label className="flex cursor-pointer items-center gap-2.5 text-xs text-ink">
-                  <input
-                    type="checkbox"
-                    checked={runScripts}
-                    onChange={(event) => setRunScripts(event.target.checked)}
-                    disabled={running}
-                    className="size-3.5 accent-primary"
-                  />
-                  {t("deploy.runScripts")}
-                </label>
-                {runScripts && (
-                  <div className="mt-3 flex flex-col gap-3">
-                    <div className="grid grid-cols-2 gap-3">
-                      <Field label={t("deploy.scriptDir")}>
-                        <Input
-                          value={scriptDir}
-                          onChange={(event) => setScriptDir(event.target.value)}
-                          placeholder="docker"
-                          disabled={running}
-                        />
-                      </Field>
-                      <Field label={t("deploy.script")} hint={t("deploy.scriptHint")}>
-                        <SearchSelect
-                          value=""
-                          onChange={addScript}
-                          options={scriptOptions.map((name) => ({ value: name, label: name }))}
-                          allowCustom
-                          placeholder={t("deploy.scriptPlaceholder")}
-                          disabled={running}
-                        />
-                      </Field>
-                    </div>
-                    {scripts.length > 0 && (
-                      <div className="flex flex-col gap-1">
-                        <span className="text-[11px] text-ink-faint">
-                          {t("deploy.scriptOrderHint")}
+                    <div className="min-w-0 flex-1">
+                      <p className="flex items-center gap-2 truncate text-[13px] font-medium text-ink">
+                        {row.name}
+                        <span className="shrink-0 rounded bg-hover px-1.5 py-0.5 text-[10px] font-normal text-ink-dim">
+                          {row.kind === "server"
+                            ? t("deploy.kindServer")
+                            : t("deploy.kindPages")}
                         </span>
-                        {scripts.map((name, index) => (
-                          <div
-                            key={name}
-                            className="flex items-center gap-1.5 rounded-md border border-line bg-panel px-2 py-1"
-                          >
-                            <span className="w-5 shrink-0 text-right font-mono text-[10px] text-ink-faint">
-                              {index + 1}
-                            </span>
-                            <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink">
-                              {name}
-                            </span>
-                            <button
-                              type="button"
-                              disabled={running || index === 0}
-                              title={t("common.moveUp")}
-                              onClick={() => moveScript(index, -1)}
-                              className="rounded p-0.5 text-ink-dim hover:bg-hover hover:text-ink disabled:opacity-30"
-                            >
-                              <ChevronUp className="size-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              disabled={running || index === scripts.length - 1}
-                              title={t("common.moveDown")}
-                              onClick={() => moveScript(index, 1)}
-                              className="rounded p-0.5 text-ink-dim hover:bg-hover hover:text-ink disabled:opacity-30"
-                            >
-                              <ChevronDown className="size-3.5" />
-                            </button>
-                            <button
-                              type="button"
-                              disabled={running}
-                              title={t("common.delete")}
-                              onClick={() => removeScript(name)}
-                              className="rounded p-0.5 text-ink-dim hover:bg-hover hover:text-neg disabled:opacity-30"
-                            >
-                              <X className="size-3.5" />
-                            </button>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-
-              <div className="rounded-md border border-line bg-field p-3.5">
-                <label className="flex cursor-pointer items-center gap-2.5 text-xs text-ink">
-                  <input
-                    type="checkbox"
-                    checked={uploadEnv}
-                    onChange={(event) => setUploadEnv(event.target.checked)}
-                    disabled={running}
-                    className="size-3.5 accent-primary"
-                  />
-                  {t("deploy.uploadEnv")}
-                </label>
-                {uploadEnv && (
-                  <div className="mt-3 flex flex-col gap-2">
-                    <p className="text-[11px] leading-relaxed text-ink-faint">
-                      {t("deploy.envFilesHint")}
-                    </p>
-                    {envFiles.length === 0 && (
-                      <p className="text-[11px] text-ink-faint">{t("deploy.envFilesEmpty")}</p>
-                    )}
-                    {envFiles.map((file, index) => (
-                      <div
-                        key={`${file.localPath}-${index}`}
-                        className="rounded-md border border-line bg-panel px-2 py-1.5"
-                      >
-                        <div className="flex items-center gap-1.5">
-                          <FileUp className="size-3.5 shrink-0 text-ink-dim" />
-                          <button
-                            type="button"
-                            disabled={running}
-                            onClick={() => void pickEnvFile(index)}
-                            title={file.localPath || t("deploy.pickEnvFile")}
-                            className={cn(
-                              "min-w-0 flex-1 truncate text-left font-mono text-[11px] hover:underline disabled:opacity-60",
-                              file.localPath ? "text-ink" : "text-ink-faint",
-                            )}
-                          >
-                            {file.localPath ? basename(file.localPath) : t("deploy.pickEnvFile")}
-                          </button>
-                          <button
-                            type="button"
-                            disabled={running}
-                            title={t("common.delete")}
-                            onClick={() => void removeEnvFile(index)}
-                            className="rounded p-0.5 text-ink-dim hover:bg-hover hover:text-neg disabled:opacity-30"
-                          >
-                            <X className="size-3.5" />
-                          </button>
-                        </div>
-                        <div className="mt-1.5 flex items-center gap-1.5">
-                          <span className="shrink-0 text-[10px] text-ink-faint">
-                            {t("deploy.envRemotePath")}
-                          </span>
-                          <Input
-                            value={file.remotePath}
-                            placeholder=".env 或 docker/.env"
-                            disabled={running}
-                            onChange={(event) => updateEnvRemote(index, event.target.value)}
-                            onBlur={() => void persistEnvFiles(envFiles)}
-                            onKeyDown={(event) => {
-                              if (event.key === "Enter") event.currentTarget.blur();
-                            }}
-                            className="h-7! min-w-0 flex-1 text-[11px]!"
-                          />
-                        </div>
-                      </div>
-                    ))}
+                      </p>
+                      <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+                        {row.repoName} · {configSummary(row)}
+                      </p>
+                    </div>
                     <Button
                       size="sm"
-                      variant="secondary"
                       disabled={running}
-                      icon={<Plus className="size-3.5" />}
-                      onClick={() => void pickEnvFile()}
+                      icon={<Rocket className="size-3.5" />}
+                      onClick={() =>
+                        row.kind === "server"
+                          ? void handleDeployServer(row.config)
+                          : openPagesRun(row.entry)
+                      }
                     >
-                      {t("deploy.addEnvFile")}
+                      {t("deploy.deployNow")}
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      title={t("deploy.editConfig")}
+                      disabled={running}
+                      onClick={() =>
+                        setEditing(
+                          row.kind === "server"
+                            ? { kind: "server", config: row.config }
+                            : { kind: "pages", entry: row.entry },
+                        )
+                      }
+                    >
+                      <Pencil className="size-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      title={t("deploy.deleteConfig")}
+                      disabled={running}
+                      onClick={() =>
+                        setDeleting(
+                          row.kind === "server"
+                            ? { kind: "server", id: row.config.id, name: row.config.name }
+                            : { kind: "pages", repoId: row.entry.repoId, name: row.name },
+                        )
+                      }
+                    >
+                      <Trash2 className="size-3.5" />
                     </Button>
                   </div>
-                )}
-              </div>
+                ))}
+              </Card>
+            )}
+          </section>
 
-              <div className="flex items-stretch gap-2">
-                <Button
-                  className="flex-1"
-                  size="lg"
-                  loading={submitting || serverRunning}
-                  disabled={!!resolveError}
-                  icon={<Rocket className="size-4" />}
-                  onClick={() => void handleDeploy()}
-                >
-                  {serverRunning ? t("deploy.deploying") : t("deploy.startDeploy")}
-                </Button>
-                {serverRunning && (
-                  <Button
-                    variant="secondary"
-                    size="lg"
-                    loading={cancelling}
-                    disabled={!live?.recordId}
-                    icon={<Square className="size-3.5" />}
-                    onClick={() => {
-                      setCancelling(true);
-                      void cancelDeploy().finally(() => setCancelling(false));
-                    }}
-                  >
-                    {t("deploy.cancel")}
-                  </Button>
-                )}
-              </div>
-
-              {settings.atomicRelease && (
-                <p className="text-center text-[11px] leading-relaxed text-ink-faint">
-                  {t("deploy.atomicHint")}
-                </p>
-              )}
-
-              {selectedRepo && (
-                <p className="truncate text-center text-[11px] text-ink-faint" title={selectedRepo.path}>
-                  {selectedServer ? `${selectedServer.name} → ` : ""}
-                  {targetDir || t("deploy.targetDirEmpty")}
-                </p>
-              )}
-              </div>
-
-              <PagesDeployPanel
-                visible={deployTarget === "pages"}
-                repoId={repoId}
-                selectedRepo={selectedRepo}
-                branchChoices={branchChoices}
-                serverRunning={serverRunning}
-                submitting={submitting}
-                setSubmitting={setSubmitting}
+          <section>
+            <SectionTitle
+              title={t("deploy.records")}
+              description={
+                recordsTab === "server"
+                  ? t("deploy.recordsServerHint")
+                  : t("deploy.recordsPagesHint")
+              }
+              actions={
+                <div className="flex items-center gap-1">
+                  <div className="flex rounded-md border border-line p-0.5">
+                    {(["server", "pages"] as const).map((tab) => (
+                      <button
+                        key={tab}
+                        type="button"
+                        onClick={() => setRecordsTab(tab)}
+                        className={cn(
+                          "rounded px-2.5 py-1 text-[11px] font-medium transition-colors",
+                          recordsTab === tab
+                            ? "bg-brand-soft text-brand"
+                            : "text-ink-dim hover:bg-hover hover:text-ink",
+                        )}
+                      >
+                        {tab === "server" ? t("deploy.recordsServer") : t("deploy.recordsPages")}
+                      </button>
+                    ))}
+                  </div>
+                  {recordsTab === "pages" && pagesRecords.length > 0 && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => setConfirmClearPages(true)}
+                    >
+                      {t("backup.clearRecords")}
+                    </Button>
+                  )}
+                </div>
+              }
+            />
+            {recordsTab === "server" ? (
+              recentDeploys.length === 0 ? (
+                <EmptyState
+                  icon={<History className="size-4.5" />}
+                  title={t("deploy.noRecords")}
+                  description={t("deploy.noRecordsDescription")}
+                />
+              ) : (
+                <Card className="divide-y divide-line overflow-hidden">
+                  {recentDeploys.map((record) => (
+                    <RecentDeployRow
+                      key={record.id}
+                      record={record}
+                      disabled={running}
+                      onRedeploy={() => {
+                        setViewKind("server");
+                        void redeploy(record.id).catch(() => {
+                          // store 已提示错误
+                        });
+                      }}
+                    />
+                  ))}
+                </Card>
+              )
+            ) : recentPagesDeploys.length === 0 ? (
+              <EmptyState
+                icon={<Cloud className="size-4.5" />}
+                title={t("deploy.noPagesRecords")}
+                description={t("deploy.noPagesRecordsDescription")}
               />
-            </div>
-          </Card>
-
-          {deployTarget === "server" && recentDeploys.length > 0 && (
-            <Card className="overflow-hidden">
-              <div className="border-b border-line px-5 py-3">
-                <h2 className="text-xs font-semibold text-ink">{t("deploy.recent")}</h2>
-              </div>
-              <ul className="divide-y divide-line">
-                {recentDeploys.map((record) => (
-                  <RecentDeployRow
-                    key={record.id}
-                    record={record}
-                    disabled={running}
-                    onRedeploy={() => {
-                      void redeploy(record.id).catch(() => {
-                        // store 已提示错误
-                      });
-                    }}
-                  />
-                ))}
-              </ul>
-            </Card>
-          )}
-
-          {deployTarget === "pages" && recentPagesDeploys.length > 0 && (
-            <Card className="overflow-hidden">
-              <div className="border-b border-line px-5 py-3">
-                <h2 className="text-xs font-semibold text-ink">{t("deploy.recent")}</h2>
-              </div>
-              <ul className="divide-y divide-line">
+            ) : (
+              <Card className="divide-y divide-line overflow-hidden">
                 {recentPagesDeploys.map((record) => (
-                  <RecentPagesDeployRow
+                  <PagesRecordRow
                     key={record.id}
                     record={record}
-                    onView={() => navigate("/pages")}
+                    expanded={expandedRecord === record.id}
+                    onToggle={() =>
+                      setExpandedRecord(expandedRecord === record.id ? null : record.id)
+                    }
+                    onCopy={() => void copyUrl(record.url ?? "")}
+                    onDelete={() => void handleDeletePagesRecord(record.id)}
                   />
                 ))}
-              </ul>
-            </Card>
-          )}
+              </Card>
+            )}
+          </section>
         </div>
 
         <div className="flex min-h-0 flex-col gap-5">
@@ -829,17 +519,34 @@ export default function DeployPage() {
                     : t("deploy.statusIdle")}
                 </p>
               </div>
-              {activeLive && (
-                <Badge className={cn("shrink-0 border", deployStatusClass(activeLive.status))}>
-                  {activeRunning && (
-                    <span className="size-1.5 animate-pulse rounded-full bg-current" />
-                  )}
-                  {deployStatusLabel(activeLive.status)}
-                </Badge>
-              )}
+              <div className="flex shrink-0 items-center gap-2">
+                {activeLive && (
+                  <Badge className={cn("border", deployStatusClass(activeLive.status))}>
+                    {activeRunning && (
+                      <span className="size-1.5 animate-pulse rounded-full bg-current" />
+                    )}
+                    {deployStatusLabel(activeLive.status)}
+                  </Badge>
+                )}
+                {activeRunning && activeKind === "server" && (
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    loading={cancelling}
+                    disabled={!live?.recordId}
+                    icon={<Square className="size-3" />}
+                    onClick={() => {
+                      setCancelling(true);
+                      void cancelDeploy().finally(() => setCancelling(false));
+                    }}
+                  >
+                    {t("deploy.cancel")}
+                  </Button>
+                )}
+              </div>
             </div>
 
-            {activeRunning && deployTarget === "server" && (
+            {activeRunning && activeKind === "server" && (
               <div className="mt-4">
                 <div className="h-1.5 overflow-hidden rounded-full bg-hover">
                   <div
@@ -851,75 +558,154 @@ export default function DeployPage() {
               </div>
             )}
 
-            {deployTarget === "server" && live?.record && (
+            {activeLive?.record && (
               <div
                 className={cn(
                   "mt-4 flex flex-wrap items-center gap-3 rounded-md border px-4 py-3 text-xs",
-                  live.record.status === "success"
+                  activeLive.record.status === "success"
                     ? "border-pos/30 bg-pos-soft text-pos"
                     : "border-neg/30 bg-neg-soft text-neg",
                 )}
               >
-                {live.record.status === "success" ? (
+                {activeLive.record.status === "success" ? (
                   <CheckCircle2 className="size-4 shrink-0" />
                 ) : (
                   <XCircle className="size-4 shrink-0" />
                 )}
                 <span className="min-w-0 flex-1 truncate">
-                  {live.record.repoName} ·{" "}
-                  {live.record.worktree ? t("deploy.worktree") : live.record.commitShort} ·{" "}
-                  {live.record.serverName} · {formatDuration(live.record.durationMs)}
+                  {activeKind === "server" && live?.record
+                    ? `${live.record.repoName} · ${
+                        live.record.worktree ? t("deploy.worktree") : live.record.commitShort
+                      } · ${live.record.serverName} · ${formatDuration(live.record.durationMs)}`
+                    : livePages?.record
+                      ? `${livePages.record.repoName} · ${livePages.record.commitShort} · ${
+                          livePages.record.projectName
+                        } · ${formatDuration(livePages.record.durationMs)}`
+                      : ""}
                 </span>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => navigate(`/history?record=${live.record?.id ?? ""}`)}
-                >
-                  {t("deploy.viewRecord")}
-                </Button>
-              </div>
-            )}
-
-            {deployTarget === "pages" && livePages?.record && (
-              <div
-                className={cn(
-                  "mt-4 flex flex-wrap items-center gap-3 rounded-md border px-4 py-3 text-xs",
-                  livePages.record.status === "success"
-                    ? "border-pos/30 bg-pos-soft text-pos"
-                    : "border-neg/30 bg-neg-soft text-neg",
+                {activeKind === "server" && live?.record && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => navigate(`/history?record=${live.record?.id ?? ""}`)}
+                  >
+                    {t("deploy.viewRecord")}
+                  </Button>
                 )}
-              >
-                {livePages.record.status === "success" ? (
-                  <CheckCircle2 className="size-4 shrink-0" />
-                ) : (
-                  <XCircle className="size-4 shrink-0" />
+                {activeKind === "pages" && livePages?.record?.url && (
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={() => void copyUrl(livePages.record?.url ?? "")}
+                  >
+                    {t("pages.copyUrl")}
+                  </Button>
                 )}
-                <span className="min-w-0 flex-1 truncate">
-                  {livePages.record.repoName} · {livePages.record.commitShort} ·{" "}
-                  {livePages.record.projectName} ·{" "}
-                  {formatDuration(livePages.record.durationMs)}
-                </span>
-                <Button size="sm" variant="secondary" onClick={() => navigate("/pages")}>
-                  {t("deploy.viewRecord")}
-                </Button>
               </div>
-            )}
-
-            {selectedRepo?.remote && (
-              <p className="mt-4 flex items-center gap-1.5 text-[11px] text-ink-faint">
-                <GitBranch className="size-3" />
-                {shortPath(selectedRepo.remote, 72)}
-              </p>
             )}
           </Card>
 
           <LogConsole
             lines={activeLive?.lines ?? []}
-            className="h-[460px] xl:h-[520px]"
-            emptyText={deployTarget === "pages" ? t("pages.logEmpty") : t("deploy.logEmpty")}
+            className="h-[420px] xl:h-[520px]"
+            emptyText={
+              activeKind === "pages" ? t("pages.logEmpty") : t("deploy.logEmpty")
+            }
           />
         </div>
       </div>
+
+      {editing?.kind === "server" && (
+        <DeployConfigModal
+          initial={editing.config}
+          prefill={editing.prefill ?? null}
+          onClose={() => setEditing(null)}
+          onRefresh={() => void refreshDeployConfigs()}
+          onSaved={(config) => {
+            setEditing(null);
+            void refreshDeployConfigs();
+            toast("success", t("deploy.configSaved", { name: config.name }));
+          }}
+        />
+      )}
+
+      {editing?.kind === "pages" && (
+        <PagesConfigModal
+          entry={editing.entry}
+          prefillRepoId={editing.prefillRepoId}
+          onClose={() => setEditing(null)}
+          onSaved={(repoId) => {
+            setEditing(null);
+            void refreshPagesConfigs();
+            const name = repos.find((repo) => repo.id === repoId)?.name ?? "";
+            toast("success", t("pages.configSaved", { name }));
+          }}
+          onRequestBindRemote={(repo) => setBindRepo(repo)}
+        />
+      )}
+
+      <Modal
+        open={pagesRun !== null}
+        onClose={() => setPagesRun(null)}
+        title={t("deploy.pagesDeployTitle")}
+        subtitle={pagesRun ? `${pagesRun.repoName} · ${pagesSummary(pagesRun, t("pages.projectNameEmpty"))}` : undefined}        width="max-w-md"
+        footer={
+          <>
+            <Button variant="secondary" onClick={() => setPagesRun(null)}>
+              {t("common.cancel")}
+            </Button>
+            <Button
+              icon={<Rocket className="size-4" />}
+              disabled={running}
+              onClick={() => void handleDeployPages()}
+            >
+              {t("deploy.startDeploy")}
+            </Button>
+          </>
+        }
+      >
+        <div className="flex flex-col gap-3">
+          <Checkbox checked={skipBuild} onChange={setSkipBuild}>
+            {t("pages.skipBuild")}
+          </Checkbox>
+          <p className="text-[11px] leading-relaxed text-ink-faint">
+            {pagesRun?.config.provider === "github"
+              ? t("pages.deployDescriptionGithub")
+              : t("pages.deployDescriptionCloudflare")}
+          </p>
+        </div>
+      </Modal>
+
+      <ConfirmModal
+        open={deleting !== null}
+        danger
+        loading={deleteBusy}
+        title={t("deploy.configDeleteTitle")}
+        confirmText={t("common.delete")}
+        description={
+          deleting?.kind === "pages"
+            ? t("pages.deleteDescription", { name: deleting.name })
+            : t("deploy.configDeleteDescription", { name: deleting?.name ?? "" })
+        }
+        onCancel={() => setDeleting(null)}
+        onConfirm={() => void handleDelete()}
+      />
+
+      <ConfirmModal
+        open={confirmClearPages}
+        danger
+        title={t("pages.clearTitle")}
+        confirmText={t("common.clear")}
+        description={t("pages.clearDescription")}
+        onCancel={() => setConfirmClearPages(false)}
+        onConfirm={() => void handleClearPagesRecords()}
+      />
+
+      <BindRemoteModal
+        repo={bindRepo}
+        onClose={() => setBindRepo(null)}
+        onSaved={() => void refreshRepos()}
+      />
     </Page>
   );
 }
@@ -935,7 +721,7 @@ function RecentDeployRow({
 }) {
   const { t } = useTranslation();
   return (
-    <li className="flex items-center gap-3 px-4 py-2.5">
+    <div className="flex items-center gap-3 px-4 py-2.5">
       <span
         className={cn(
           "size-1.5 shrink-0 rounded-full",
@@ -948,7 +734,8 @@ function RecentDeployRow({
       />
       <div className="min-w-0 flex-1">
         <p className="truncate text-[11px] text-ink">
-          {record.branch} · {record.worktree ? t("deploy.worktree") : record.commitShort}
+          {record.repoName} · {record.branch} ·{" "}
+          {record.worktree ? t("deploy.worktree") : record.commitShort}
         </p>
         <p className="mt-0.5 flex items-center gap-1 text-[10px] text-ink-faint">
           <Timer className="size-2.5" />
@@ -963,42 +750,75 @@ function RecentDeployRow({
       >
         {t("history.redeploy")}
       </Button>
-    </li>
+    </div>
   );
 }
 
-function RecentPagesDeployRow({
+function PagesRecordRow({
   record,
-  onView,
+  expanded,
+  onToggle,
+  onCopy,
+  onDelete,
 }: {
   record: PagesDeployRecord;
-  onView: () => void;
+  expanded: boolean;
+  onToggle: () => void;
+  onCopy: () => void;
+  onDelete: () => void;
 }) {
   const { t } = useTranslation();
   return (
-    <li className="flex items-center gap-3 px-4 py-2.5">
-      <span
-        className={cn(
-          "size-1.5 shrink-0 rounded-full",
-          record.status === "success"
-            ? "bg-pos"
-            : record.status === "failed"
-              ? "bg-neg"
-              : "bg-warn",
+    <div>
+      <div className="flex items-center gap-3 px-4 py-3">
+        <button
+          className="flex min-w-0 flex-1 items-center gap-3 text-left"
+          onClick={onToggle}
+        >
+          {expanded ? (
+            <ChevronDown className="size-3.5 shrink-0 text-ink-faint" />
+          ) : (
+            <ChevronRight className="size-3.5 shrink-0 text-ink-faint" />
+          )}
+          <div className="min-w-0 flex-1">
+            <p className="truncate text-[13px] font-medium text-ink">
+              {record.repoName} → {record.projectName}
+              <span className="ml-2 rounded bg-hover px-1.5 py-0.5 text-[10px] font-normal text-ink-dim">
+                {record.provider === "github" ? "GitHub" : "Cloudflare"}
+              </span>
+              <span className="ml-2 text-[11px] font-normal text-ink-faint">
+                {record.branch}
+                {record.commitShort ? ` · ${record.commitShort}` : ""}
+              </span>
+            </p>
+            <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+              {record.startedAt}
+              {record.url ? ` · ${record.url}` : ""}
+            </p>
+          </div>
+          <Badge
+            kind={
+              record.status === "success" ? "green" : record.status === "failed" ? "red" : "amber"
+            }
+          >
+            {deployStatusLabel(record.status)}
+          </Badge>
+        </button>
+        {record.url && (
+          <Button variant="ghost" size="sm" onClick={onCopy}>
+            {t("pages.copyUrl")}
+          </Button>
         )}
-      />
-      <div className="min-w-0 flex-1">
-        <p className="truncate text-[11px] text-ink">
-          {record.projectName} · {record.commitShort}
-        </p>
-        <p className="mt-0.5 flex items-center gap-1 text-[10px] text-ink-faint">
-          <Timer className="size-2.5" />
-          {record.startedAt} · {record.provider === "github" ? "GitHub" : "Cloudflare"}
-        </p>
+        <Button variant="ghost" size="sm" title={t("backup.deleteRecord")} onClick={onDelete}>
+          <Trash2 className="size-3.5" />
+        </Button>
       </div>
-      <Button size="sm" variant="ghost" onClick={onView}>
-        {t("deploy.viewRecord")}
-      </Button>
-    </li>
+      {expanded && (
+        <pre className="max-h-80 overflow-auto border-t border-line bg-sunken px-4 py-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-ink-dim">
+          {record.error ? `${t("backup.errorPrefix", { error: record.error })}\n\n` : ""}
+          {record.log || t("backup.noLog")}
+        </pre>
+      )}
+    </div>
   );
 }

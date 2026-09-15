@@ -16,7 +16,6 @@ import type { BackupEvent, DeployEvent, PagesEvent, SchedulerNotice } from "./li
 const BackupsPage = lazy(() => import("./pages/BackupsPage"));
 const DeployPage = lazy(() => import("./pages/DeployPage"));
 const HistoryPage = lazy(() => import("./pages/HistoryPage"));
-const PagesPage = lazy(() => import("./pages/PagesPage"));
 const RepoDetailPage = lazy(() => import("./pages/RepoDetailPage"));
 const ReposPage = lazy(() => import("./pages/ReposPage"));
 const ServersPage = lazy(() => import("./pages/ServersPage"));
@@ -57,7 +56,6 @@ function TabsAndRoutes() {
             <Route path="/deploy" element={<DeployPage />} />
             <Route path="/servers" element={<ServersPage />} />
             <Route path="/backups" element={<BackupsPage />} />
-            <Route path="/pages" element={<PagesPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/repos" replace />} />

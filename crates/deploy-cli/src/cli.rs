@@ -240,9 +240,12 @@ pub struct ServerAddArgs {
 
 #[derive(Args, Debug)]
 pub struct DeployArgs {
-    /// 仓库 id / 名称 / 路径
-    pub repo: String,
-    /// 要部署的版本（分支 / 标签 / 提交），默认当前分支
+    /// 仓库 id / 名称 / 路径（使用 --config 时可省略）
+    pub repo: Option<String>,
+    /// 已保存的部署配置 id / 名称（仓库、服务器、目录、版本与脚本取自配置，命令行参数优先）
+    #[arg(short, long)]
+    pub config: Option<String>,
+    /// 要部署的版本（分支 / 标签 / 提交），默认当前分支；显式留空表示打包当前工作区
     #[arg(short, long)]
     pub rev: Option<String>,
     /// 目标服务器（id / 名称 / host），默认使用仓库配置
