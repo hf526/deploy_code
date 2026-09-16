@@ -12,12 +12,15 @@ import { Trans, useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
+import { ConfigModalFooter } from "../../components/ConfigModalFooter";
 import { SearchSelect } from "../../components/SearchSelect";
-import { Button, Field, Input, Modal, Select } from "../../components/ui";
+import { ServerSelect } from "../../components/ServerSelect";
+import { Button, Checkbox, Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
-import type { Branch, DeployConfig, EnvFileConfig, ResolvedRev } from "../../lib/types";
-import { cn } from "../../lib/utils";
+import type { DeployConfig, EnvFileConfig, ResolvedRev } from "../../lib/types";
+import { cn, inferEnvRemotePath } from "../../lib/utils";
+import { useRepoBranches } from "./useRepoBranches";
 
 export interface DeployPrefill {
   repoId?: string;
@@ -52,12 +55,15 @@ function basename(path: string): string {
 export function DeployConfigModal({
   initial,
   prefill,
+  duplicate = false,
   onClose,
   onSaved,
   onRefresh,
 }: {
   initial: DeployConfig | null;
   prefill: DeployPrefill | null;
+  /** 复制已有配置：保留全部参数，仅 id 为空，保存时新建一条（名称由调用方预填副本名）。 */
+  duplicate?: boolean;
   onClose: () => void;
   onSaved: (config: DeployConfig) => void;
   /** 配置已写盘但环境文件保存失败时通知父组件刷新列表（弹窗保持打开）。 */
@@ -92,13 +98,25 @@ export function DeployConfigModal({
   // 只有从仓库配置读到过环境文件才允许写回：否则空草稿会把仓库里已保存的文件清掉。
   const [envFilesHydrated, setEnvFilesHydrated] = useState(() => initialRepo !== undefined);
   const [customRev, setCustomRev] = useState(() => !!(initial?.rev || prefill?.rev));
-  const [branches, setBranches] = useState<Branch[]>([]);
-  const [branchesLoaded, setBranchesLoaded] = useState(false);
   const [scriptOptions, setScriptOptions] = useState<string[]>([]);
   const [resolved, setResolved] = useState<ResolvedRev | null>(null);
   const [resolveError, setResolveError] = useState<string | null>(null);
   const [resolving, setResolving] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const { branches, branchChoices, loaded: branchesLoaded } = useRepoBranches(
+    draft.repoId,
+    (error) => toast("error", String(error)),
+  );
+
+  // 空仓库（还没有任何提交）没有可解析的版本：默认打包当前工作区，
+  // 否则仓库默认分支名会解析失败并卡住保存（与旧版部署页的兜底一致）。
+  useEffect(() => {
+    if (!branchesLoaded || customRev) return;
+    if (branches.length === 0 && draft.rev.trim()) {
+      setDraft((current) => ({ ...current, rev: "" }));
+    }
+  }, [branchesLoaded, branches.length, customRev, draft.rev]);
 
   // 深链带入且仓库已解析时 rev 已在初始化中应用；否则暂存 {仓库, 版本}，
   // 等仓库水合时只在同一个仓库上套用，避免残留值被套到之后切换的仓库。
@@ -164,40 +182,6 @@ export function DeployConfigModal({
   }
 
   useEffect(() => {
-    if (!draft.repoId) {
-      setBranches([]);
-      setBranchesLoaded(false);
-      return;
-    }
-    let cancelled = false;
-    setBranches([]);
-    setBranchesLoaded(false);
-    void (async () => {
-      try {
-        const list = await api.listBranches(draft.repoId, false);
-        if (!cancelled) {
-          setBranches(list);
-          setBranchesLoaded(true);
-        }
-      } catch (error) {
-        if (!cancelled) toast("error", String(error));
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [draft.repoId, toast]);
-
-  // 空仓库（还没有任何提交）没有可解析的版本：默认打包当前工作区，
-  // 否则仓库默认分支名会解析失败并卡住保存（与旧版部署页的兜底一致）。
-  useEffect(() => {
-    if (!branchesLoaded || customRev) return;
-    if (branches.length === 0 && draft.rev.trim()) {
-      setDraft((current) => ({ ...current, rev: "" }));
-    }
-  }, [branchesLoaded, branches.length, customRev, draft.rev]);
-
-  useEffect(() => {
     const dir = draft.scriptDir.trim();
     if (!draft.repoId || !dir) {
       setScriptOptions([]);
@@ -259,16 +243,6 @@ export function DeployConfigModal({
     };
   }, [draft.repoId, draft.rev]);
 
-  const branchChoices = useMemo(
-    () =>
-      branches.map((branch) => ({
-        value: branch.name,
-        label: branch.name,
-        hint: branch.isCurrent ? t("deploy.current") : undefined,
-      })),
-    [branches, t],
-  );
-
   const versionChoices = useMemo(
     () => [{ value: "", label: t("deploy.worktreeOption") }, ...branchChoices],
     [branchChoices, t],
@@ -312,11 +286,12 @@ export function DeployConfigModal({
     try {
       const selected = await openDialog({ multiple: false, title: t("deploy.pickEnvFile") });
       if (typeof selected !== "string") return;
+      // 自动套用仓库内相对路径（如 <repo>/backend/.env → backend/.env），
+      // 免去每次手填目标目录；已手填的远端路径保持不动。
+      const repoPath = repos.find((repo) => repo.id === draft.repoId)?.path ?? null;
+      const remotePath = inferEnvRemotePath(selected, repoPath);
       if (index === undefined) {
-        updateEnvFiles((current) => [
-          ...current,
-          { localPath: selected, remotePath: basename(selected) },
-        ]);
+        updateEnvFiles((current) => [...current, { localPath: selected, remotePath }]);
         return;
       }
       updateEnvFiles((current) =>
@@ -324,7 +299,7 @@ export function DeployConfigModal({
           itemIndex === index
             ? {
                 localPath: selected,
-                remotePath: file.remotePath.trim() ? file.remotePath : basename(selected),
+                remotePath: file.remotePath.trim() ? file.remotePath : remotePath,
               }
             : file,
         ),
@@ -377,18 +352,23 @@ export function DeployConfigModal({
     <Modal
       open
       onClose={saving ? () => undefined : onClose}
-      title={initial ? t("deploy.editConfig") : t("deploy.newConfig")}
+      title={
+        duplicate
+          ? t("deploy.copyConfig")
+          : initial
+            ? t("deploy.editConfig")
+            : t("deploy.newConfig")
+      }
       subtitle={t("deploy.configModalSubtitle")}
       width="max-w-2xl"
       footer={
-        <>
-          <Button variant="secondary" disabled={saving} onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button loading={saving} onClick={() => void handleSave()}>
-            {t("common.save")}
-          </Button>
-        </>
+        <ConfigModalFooter
+          onClose={onClose}
+          onSave={() => void handleSave()}
+          saving={saving}
+          testing={false}
+          saveIcon={false}
+        />
       }
     >
       <div className="flex flex-col gap-4">
@@ -418,10 +398,9 @@ export function DeployConfigModal({
           </Field>
 
           <Field label={t("deploy.server")} required>
-            <Select
+            <ServerSelect
               value={draft.serverId}
-              onChange={(event) => {
-                const next = event.target.value;
+              onChange={(next) => {
                 const server = servers.find((item) => item.id === next);
                 update({
                   serverId: next,
@@ -430,15 +409,10 @@ export function DeployConfigModal({
                     : {}),
                 });
               }}
+              servers={servers}
               disabled={saving}
-            >
-              <option value="">{t("deploy.serverPlaceholder")}</option>
-              {servers.map((server) => (
-                <option key={server.id} value={server.id}>
-                  {server.name} ({server.username}@{server.host})
-                </option>
-              ))}
-            </Select>
+              placeholder={t("deploy.serverPlaceholder")}
+            />
             {servers.length === 0 && (
               <p className="mt-2 text-[11px] text-ink-faint">
                 <Trans
@@ -536,16 +510,13 @@ export function DeployConfigModal({
         </Field>
 
         <div className="rounded-md border border-line bg-field p-3.5">
-          <label className="flex cursor-pointer items-center gap-2.5 text-xs text-ink">
-            <input
-              type="checkbox"
-              checked={draft.runScripts}
-              onChange={(event) => update({ runScripts: event.target.checked })}
-              disabled={saving}
-              className="size-3.5 accent-primary"
-            />
+          <Checkbox
+            checked={draft.runScripts}
+            onChange={(checked) => update({ runScripts: checked })}
+            disabled={saving}
+          >
             {t("deploy.runScripts")}
-          </label>
+          </Checkbox>
           {draft.runScripts && (
             <div className="mt-3 flex flex-col gap-3">
               <div className="grid grid-cols-2 gap-3">
@@ -620,16 +591,13 @@ export function DeployConfigModal({
         </div>
 
         <div className="rounded-md border border-line bg-field p-3.5">
-          <label className="flex cursor-pointer items-center gap-2.5 text-xs text-ink">
-            <input
-              type="checkbox"
-              checked={draft.uploadEnv}
-              onChange={(event) => update({ uploadEnv: event.target.checked })}
-              disabled={saving}
-              className="size-3.5 accent-primary"
-            />
+          <Checkbox
+            checked={draft.uploadEnv}
+            onChange={(checked) => update({ uploadEnv: checked })}
+            disabled={saving}
+          >
             {t("deploy.uploadEnv")}
-          </label>
+          </Checkbox>
           {draft.uploadEnv && (
             <div className="mt-3 flex flex-col gap-2">
               <p className="text-[11px] leading-relaxed text-ink-faint">

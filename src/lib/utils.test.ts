@@ -7,10 +7,11 @@ import {
   cn,
   deployStatusClass,
   formatDuration,
-  formatSize,
   githubTarget,
+  inferEnvRemotePath,
   maskUrlPassword,
   shortPath,
+  statusBadgeKind,
 } from "./utils";
 
 describe("formatDuration", () => {
@@ -27,12 +28,31 @@ describe("formatDuration", () => {
   });
 });
 
-describe("formatSize", () => {
-  it("按 B / KB / MB / GB 分级", () => {
-    expect(formatSize(512)).toBe("512 B");
-    expect(formatSize(2048)).toBe("2.0 KB");
-    expect(formatSize(5 * 1024 * 1024)).toBe("5.00 MB");
-    expect(formatSize(3 * 1024 * 1024 * 1024)).toBe("3.00 GB");
+describe("inferEnvRemotePath", () => {
+  it("仓库内文件保留相对子目录", () => {
+    expect(inferEnvRemotePath("E:/proj/lf_resume/backend/.env", "E:\\proj\\lf_resume")).toBe(
+      "backend/.env",
+    );
+    expect(inferEnvRemotePath("/home/dev/app/docker/app.env", "/home/dev/app")).toBe(
+      "docker/app.env",
+    );
+  });
+
+  it("仓库根目录下的文件只取文件名", () => {
+    expect(inferEnvRemotePath("E:/proj/app/.env", "E:/proj/app")).toBe(".env");
+  });
+
+  it("仓库外文件退回文件名", () => {
+    expect(inferEnvRemotePath("D:/secrets/prod.env", "E:/proj/app")).toBe("prod.env");
+    expect(inferEnvRemotePath("D:/secrets/prod.env", null)).toBe("prod.env");
+  });
+
+  it("盘符与目录大小写不敏感", () => {
+    expect(inferEnvRemotePath("e:/Proj/App/backend/.env", "E:/proj/app")).toBe("backend/.env");
+  });
+
+  it("同名前缀目录不误判（app2 不命中 app）", () => {
+    expect(inferEnvRemotePath("E:/proj/app2/.env", "E:/proj/app")).toBe(".env");
   });
 });
 
@@ -111,5 +131,11 @@ describe("工具函数", () => {
     expect(deployStatusClass("success")).toContain("text-pos");
     expect(deployStatusClass("failed")).toContain("text-neg");
     expect(deployStatusClass("running")).toContain("text-warn");
+  });
+
+  it("statusBadgeKind 覆盖三种状态", () => {
+    expect(statusBadgeKind("success")).toBe("green");
+    expect(statusBadgeKind("failed")).toBe("red");
+    expect(statusBadgeKind("running")).toBe("amber");
   });
 });

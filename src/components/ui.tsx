@@ -123,7 +123,7 @@ export function Checkbox({
   return (
     <label
       className={cn(
-        "flex cursor-pointer items-center gap-2 text-[13px] text-ink select-none",
+        "flex cursor-pointer items-center gap-2.5 text-xs text-ink select-none",
         disabled && "pointer-events-none opacity-50",
         className,
       )}

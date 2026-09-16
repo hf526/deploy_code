@@ -156,159 +156,93 @@ impl Store {
     }
 
     pub fn load_history(&self) -> Result<Vec<DeployRecord>> {
-        load_history(&self.history_path())
+        load_records(&self.history_path(), HISTORY_LABEL)
     }
 
     pub fn save_history(&self, records: &[DeployRecord]) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_history(&self.history_path(), records)
+        write_records(&self.history_path(), records)
     }
 
     /// 新增或更新一条部署记录（按 id 匹配），并自动裁剪历史长度。
     pub fn upsert_history(&self, record: &DeployRecord, limit: usize) -> Result<()> {
         let _guard = self.write_guard()?;
-        let mut records = load_history(&self.history_path())?;
-        match records.iter_mut().find(|r| r.id == record.id) {
-            Some(existing) => *existing = record.clone(),
-            None => records.push(record.clone()),
-        }
-        if limit > 0 && records.len() > limit {
-            let overflow = records.len() - limit;
-            records.drain(0..overflow);
-        }
-        write_history(&self.history_path(), &records)
+        upsert_record(&self.history_path(), record, limit, HISTORY_LABEL)
     }
 
     pub fn remove_history(&self, id: &str) -> Result<bool> {
         let _guard = self.write_guard()?;
-        let mut records = load_history(&self.history_path())?;
-        let before = records.len();
-        records.retain(|r| r.id != id);
-        let removed = records.len() != before;
-        if removed {
-            write_history(&self.history_path(), &records)?;
-        }
-        Ok(removed)
+        remove_record::<DeployRecord>(&self.history_path(), id, HISTORY_LABEL)
     }
 
     pub fn clear_history(&self) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_history(&self.history_path(), &[])
+        write_records::<DeployRecord>(&self.history_path(), &[])
     }
 
     pub fn find_record(&self, id: &str) -> Result<DeployRecord> {
-        self.load_history()?
+        load_records::<DeployRecord>(&self.history_path(), HISTORY_LABEL)?
             .into_iter()
             .find(|r| r.id == id)
             .ok_or_else(|| CoreError::not_found(format!("部署记录不存在: {id}")))
     }
 
     pub fn load_backups(&self) -> Result<Vec<BackupRecord>> {
-        load_backups(&self.backups_path())
+        load_records(&self.backups_path(), BACKUP_LABEL)
     }
 
     pub fn save_backups(&self, records: &[BackupRecord]) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_backups(&self.backups_path(), records)
+        write_records(&self.backups_path(), records)
     }
 
     /// 新增或更新一条备份记录（按 id 匹配），并自动裁剪历史长度。
     pub fn upsert_backup(&self, record: &BackupRecord, limit: usize) -> Result<()> {
         let _guard = self.write_guard()?;
-        let mut records = load_backups(&self.backups_path())?;
-        match records.iter_mut().find(|r| r.id == record.id) {
-            Some(existing) => *existing = record.clone(),
-            None => records.push(record.clone()),
-        }
-        if limit > 0 && records.len() > limit {
-            let overflow = records.len() - limit;
-            records.drain(0..overflow);
-        }
-        write_backups(&self.backups_path(), &records)
+        upsert_record(&self.backups_path(), record, limit, BACKUP_LABEL)
     }
 
     pub fn find_backup(&self, id: &str) -> Result<BackupRecord> {
-        let records = self.load_backups()?;
-        if let Some(record) = records.iter().find(|r| r.id == id) {
-            return Ok(record.clone());
-        }
-        let matches: Vec<_> = records.iter().filter(|r| r.id.starts_with(id)).collect();
-        match matches.len() {
-            0 => Err(CoreError::not_found(format!("备份记录不存在: {id}"))),
-            1 => Ok(matches[0].clone()),
-            _ => Err(CoreError::config("记录 ID 不唯一，请输入完整 ID")),
-        }
+        find_record_by_prefix(&self.backups_path(), id, BACKUP_LABEL, BACKUP_LABEL)
     }
 
     pub fn remove_backup(&self, id: &str) -> Result<bool> {
         let _guard = self.write_guard()?;
-        let mut records = load_backups(&self.backups_path())?;
-        let before = records.len();
-        records.retain(|r| r.id != id);
-        let removed = records.len() != before;
-        if removed {
-            write_backups(&self.backups_path(), &records)?;
-        }
-        Ok(removed)
+        remove_record::<BackupRecord>(&self.backups_path(), id, BACKUP_LABEL)
     }
 
     pub fn clear_backups(&self) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_backups(&self.backups_path(), &[])
+        write_records::<BackupRecord>(&self.backups_path(), &[])
     }
 
     pub fn load_pages_records(&self) -> Result<Vec<PagesDeployRecord>> {
-        load_pages_records(&self.pages_path())
+        load_records(&self.pages_path(), PAGES_LABEL)
     }
 
     pub fn save_pages_records(&self, records: &[PagesDeployRecord]) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_pages_records(&self.pages_path(), records)
+        write_records(&self.pages_path(), records)
     }
 
     /// 新增或更新一条 Pages 部署记录（按 id 匹配），并自动裁剪历史长度。
     pub fn upsert_pages_record(&self, record: &PagesDeployRecord, limit: usize) -> Result<()> {
         let _guard = self.write_guard()?;
-        let mut records = load_pages_records(&self.pages_path())?;
-        match records.iter_mut().find(|r| r.id == record.id) {
-            Some(existing) => *existing = record.clone(),
-            None => records.push(record.clone()),
-        }
-        if limit > 0 && records.len() > limit {
-            let overflow = records.len() - limit;
-            records.drain(0..overflow);
-        }
-        write_pages_records(&self.pages_path(), &records)
+        upsert_record(&self.pages_path(), record, limit, PAGES_LABEL)
     }
 
     pub fn find_pages_record(&self, id: &str) -> Result<PagesDeployRecord> {
-        let records = self.load_pages_records()?;
-        if let Some(record) = records.iter().find(|r| r.id == id) {
-            return Ok(record.clone());
-        }
-        let matches: Vec<_> = records.iter().filter(|r| r.id.starts_with(id)).collect();
-        match matches.len() {
-            0 => Err(CoreError::not_found(format!("Pages 部署记录不存在: {id}"))),
-            1 => Ok(matches[0].clone()),
-            _ => Err(CoreError::config("记录 ID 不唯一，请输入完整 ID")),
-        }
+        find_record_by_prefix(&self.pages_path(), id, PAGES_LABEL, PAGES_MISSING_LABEL)
     }
 
     pub fn remove_pages_record(&self, id: &str) -> Result<bool> {
         let _guard = self.write_guard()?;
-        let mut records = load_pages_records(&self.pages_path())?;
-        let before = records.len();
-        records.retain(|r| r.id != id);
-        let removed = records.len() != before;
-        if removed {
-            write_pages_records(&self.pages_path(), &records)?;
-        }
-        Ok(removed)
+        remove_record::<PagesDeployRecord>(&self.pages_path(), id, PAGES_LABEL)
     }
 
     pub fn clear_pages_records(&self) -> Result<()> {
         let _guard = self.write_guard()?;
-        write_pages_records(&self.pages_path(), &[])
+        write_records::<PagesDeployRecord>(&self.pages_path(), &[])
     }
 
     /// 启动时把上次异常退出（崩溃/强杀）遗留的 Running 记录收敛为失败，
@@ -317,55 +251,21 @@ impl Store {
     pub fn mark_interrupted(&self) -> Result<usize> {
         let _guard = self.write_guard()?;
         let message = "任务被中断（应用退出或崩溃）";
-        let mut converted = 0usize;
-
-        let mut history = load_history(&self.history_path())?;
-        let mut touched = false;
-        for record in history.iter_mut() {
-            if record.status == DeployStatus::Running {
-                record.status = DeployStatus::Failed;
-                record.error = Some(message.to_string());
-                record.finished_at = Some(now_string());
-                // 崩溃后无法得知真实结束时间，duration_ms 保持 0（界面显示为未知），
-                // 不能用「下次启动时刻」计算，否则会把停机时间也算进耗时。
-                converted += 1;
-                touched = true;
-            }
-        }
-        if touched {
-            write_history(&self.history_path(), &history)?;
-        }
-
-        let mut backups = load_backups(&self.backups_path())?;
-        let mut touched = false;
-        for record in backups.iter_mut() {
-            if record.status == DeployStatus::Running {
-                record.status = DeployStatus::Failed;
-                record.error = Some(message.to_string());
-                record.finished_at = Some(now_string());
-                converted += 1;
-                touched = true;
-            }
-        }
-        if touched {
-            write_backups(&self.backups_path(), &backups)?;
-        }
-
-        let mut pages = load_pages_records(&self.pages_path())?;
-        let mut touched = false;
-        for record in pages.iter_mut() {
-            if record.status == DeployStatus::Running {
-                record.status = DeployStatus::Failed;
-                record.error = Some(message.to_string());
-                record.finished_at = Some(now_string());
-                converted += 1;
-                touched = true;
-            }
-        }
-        if touched {
-            write_pages_records(&self.pages_path(), &pages)?;
-        }
-
+        let mut converted = mark_running_as_interrupted::<DeployRecord>(
+            &self.history_path(),
+            HISTORY_LABEL,
+            message,
+        )?;
+        converted += mark_running_as_interrupted::<BackupRecord>(
+            &self.backups_path(),
+            BACKUP_LABEL,
+            message,
+        )?;
+        converted += mark_running_as_interrupted::<PagesDeployRecord>(
+            &self.pages_path(),
+            PAGES_LABEL,
+            message,
+        )?;
         Ok(converted)
     }
 
@@ -622,29 +522,79 @@ fn paths_equal(a: &str, b: &str) -> bool {
     normalize(a) == normalize(b)
 }
 
-fn load_history(path: &Path) -> Result<Vec<DeployRecord>> {
-    if !path.exists() {
-        return Ok(Vec::new());
-    }
-    let text = std::fs::read_to_string(path).map_err(|e| CoreError::io_path(path, e))?;
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-    serde_json::from_str(&text)
-        .map_err(|e| CoreError::config(format!("部署记录解析失败 {}: {e}", path.display())))
+/// 三类任务记录共有的字段访问，供通用列表 CRUD 复用。
+trait TaskRecord: Clone {
+    fn id(&self) -> &str;
+    fn status_mut(&mut self) -> &mut DeployStatus;
+    fn error_mut(&mut self) -> &mut Option<String>;
+    fn finished_at_mut(&mut self) -> &mut Option<String>;
 }
+
+impl TaskRecord for DeployRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn status_mut(&mut self) -> &mut DeployStatus {
+        &mut self.status
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn finished_at_mut(&mut self) -> &mut Option<String> {
+        &mut self.finished_at
+    }
+}
+
+impl TaskRecord for BackupRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn status_mut(&mut self) -> &mut DeployStatus {
+        &mut self.status
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn finished_at_mut(&mut self) -> &mut Option<String> {
+        &mut self.finished_at
+    }
+}
+
+impl TaskRecord for PagesDeployRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn status_mut(&mut self) -> &mut DeployStatus {
+        &mut self.status
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn finished_at_mut(&mut self) -> &mut Option<String> {
+        &mut self.finished_at
+    }
+}
+
+const HISTORY_LABEL: &str = "部署记录";
+const BACKUP_LABEL: &str = "备份记录";
+const PAGES_LABEL: &str = "Pages 记录";
+const PAGES_MISSING_LABEL: &str = "Pages 部署记录";
 
 fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
     let text = serde_json::to_string_pretty(config)?;
     atomic_write(path, &text)
 }
 
-fn write_history(path: &Path, records: &[DeployRecord]) -> Result<()> {
-    let text = serde_json::to_string_pretty(records)?;
-    atomic_write(path, &text)
-}
-
-fn load_backups(path: &Path) -> Result<Vec<BackupRecord>> {
+fn load_records<T: serde::de::DeserializeOwned>(path: &Path, label: &str) -> Result<Vec<T>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -653,29 +603,89 @@ fn load_backups(path: &Path) -> Result<Vec<BackupRecord>> {
         return Ok(Vec::new());
     }
     serde_json::from_str(&text)
-        .map_err(|e| CoreError::config(format!("备份记录解析失败 {}: {e}", path.display())))
+        .map_err(|e| CoreError::config(format!("{label}解析失败 {}: {e}", path.display())))
 }
 
-fn write_backups(path: &Path, records: &[BackupRecord]) -> Result<()> {
+fn write_records<T: serde::Serialize>(path: &Path, records: &[T]) -> Result<()> {
     let text = serde_json::to_string_pretty(records)?;
     atomic_write(path, &text)
 }
 
-fn load_pages_records(path: &Path) -> Result<Vec<PagesDeployRecord>> {
-    if !path.exists() {
-        return Ok(Vec::new());
+/// 新增或更新一条记录（按 id 匹配），并按 `limit` 裁剪最早的多余记录。
+fn upsert_record<T>(path: &Path, record: &T, limit: usize, label: &str) -> Result<()>
+where
+    T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut records = load_records::<T>(path, label)?;
+    match records.iter_mut().find(|r| r.id() == record.id()) {
+        Some(existing) => *existing = record.clone(),
+        None => records.push(record.clone()),
     }
-    let text = std::fs::read_to_string(path).map_err(|e| CoreError::io_path(path, e))?;
-    if text.trim().is_empty() {
-        return Ok(Vec::new());
+    if limit > 0 && records.len() > limit {
+        let overflow = records.len() - limit;
+        records.drain(0..overflow);
     }
-    serde_json::from_str(&text)
-        .map_err(|e| CoreError::config(format!("Pages 记录解析失败 {}: {e}", path.display())))
+    write_records(path, &records)
 }
 
-fn write_pages_records(path: &Path, records: &[PagesDeployRecord]) -> Result<()> {
-    let text = serde_json::to_string_pretty(records)?;
-    atomic_write(path, &text)
+/// 按 id 查找记录：精确命中优先，其次允许唯一前缀匹配。
+fn find_record_by_prefix<T>(
+    path: &Path,
+    id: &str,
+    parse_label: &str,
+    missing_label: &str,
+) -> Result<T>
+where
+    T: TaskRecord + serde::de::DeserializeOwned,
+{
+    let records = load_records::<T>(path, parse_label)?;
+    if let Some(record) = records.iter().find(|r| r.id() == id) {
+        return Ok(record.clone());
+    }
+    let matches: Vec<_> = records.iter().filter(|r| r.id().starts_with(id)).collect();
+    match matches.len() {
+        0 => Err(CoreError::not_found(format!("{missing_label}不存在: {id}"))),
+        1 => Ok(matches[0].clone()),
+        _ => Err(CoreError::config("记录 ID 不唯一，请输入完整 ID")),
+    }
+}
+
+fn remove_record<T>(path: &Path, id: &str, label: &str) -> Result<bool>
+where
+    T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut records = load_records::<T>(path, label)?;
+    let before = records.len();
+    records.retain(|r| r.id() != id);
+    let removed = records.len() != before;
+    if removed {
+        write_records(path, &records)?;
+    }
+    Ok(removed)
+}
+
+/// 把列表中遗留的 Running 记录收敛为失败；返回转换数量。
+///
+/// 崩溃后无法得知真实结束时间，`duration_ms` 保持 0（界面显示为未知），
+/// 不能用「下次启动时刻」计算，否则会把停机时间也算进耗时。
+fn mark_running_as_interrupted<T>(path: &Path, label: &str, message: &str) -> Result<usize>
+where
+    T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut records = load_records::<T>(path, label)?;
+    let mut converted = 0usize;
+    for record in records.iter_mut() {
+        if *record.status_mut() == DeployStatus::Running {
+            *record.status_mut() = DeployStatus::Failed;
+            *record.error_mut() = Some(message.to_string());
+            *record.finished_at_mut() = Some(now_string());
+            converted += 1;
+        }
+    }
+    if converted > 0 {
+        write_records(path, &records)?;
+    }
+    Ok(converted)
 }
 
 /// 锁文件路径（`<base_dir>/locks/<name>.lock`），并确保目录存在。
@@ -966,6 +976,172 @@ mod tests {
         store.save_config(&pruned).unwrap();
         assert_eq!(store.migrate_backup_configs().unwrap(), 0);
         assert_eq!(store.load_config().unwrap().backup_configs.len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn history_record(id: &str, status: DeployStatus) -> DeployRecord {
+        let status = serde_json::to_string(&status).unwrap();
+        serde_json::from_str(&format!(
+            r#"{{"id":"{id}","repoId":"repo","repoName":"demo","rev":"main","branch":"main",
+            "commit":"abc","commitShort":"abc","commitSubject":"init","serverId":"srv",
+            "serverName":"prod","targetDir":"/srv/app","scriptDir":"docker","scripts":[],
+            "runScripts":false,"envFiles":[],"status":{status},"error":null,"log":"",
+            "startedAt":"2026-01-01 00:00:00","finishedAt":null,"durationMs":0}}"#
+        ))
+        .unwrap()
+    }
+
+    fn backup_record(id: &str, status: DeployStatus) -> BackupRecord {
+        BackupRecord {
+            id: id.to_string(),
+            server_id: "srv".to_string(),
+            server_name: "prod".to_string(),
+            database: "app".to_string(),
+            schema: "public".to_string(),
+            target_name: String::new(),
+            target: "postgresql://u@h/db".to_string(),
+            status,
+            error: None,
+            log: String::new(),
+            dump_size: 0,
+            started_at: "2026-01-01 00:00:00".to_string(),
+            finished_at: None,
+            duration_ms: 0,
+        }
+    }
+
+    fn pages_record(id: &str, status: DeployStatus) -> PagesDeployRecord {
+        PagesDeployRecord {
+            id: id.to_string(),
+            provider: "cloudflare".to_string(),
+            repo_id: "repo".to_string(),
+            repo_name: "demo".to_string(),
+            project_name: "demo".to_string(),
+            branch: "main".to_string(),
+            commit: "abc".to_string(),
+            commit_short: "abc".to_string(),
+            status,
+            error: None,
+            log: String::new(),
+            url: None,
+            started_at: "2026-01-01 00:00:00".to_string(),
+            finished_at: None,
+            duration_ms: 0,
+        }
+    }
+
+    #[test]
+    fn record_crud_keeps_upsert_limit_and_prefix_semantics() {
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-store-records-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+
+        // upsert 按 id 更新而不是追加，limit 只裁剪最早的多余记录。
+        store
+            .upsert_history(&history_record("h1", DeployStatus::Success), 2)
+            .unwrap();
+        store
+            .upsert_history(&history_record("h2", DeployStatus::Success), 2)
+            .unwrap();
+        store
+            .upsert_history(&history_record("h1", DeployStatus::Failed), 2)
+            .unwrap();
+        let history = store.load_history().unwrap();
+        assert_eq!(history.len(), 2);
+        // 更新是原位替换，不改变记录顺序。
+        assert_eq!(history[0].id, "h1");
+        assert_eq!(history[1].id, "h2");
+        assert_eq!(history[0].status, DeployStatus::Failed);
+        store
+            .upsert_history(&history_record("h3", DeployStatus::Success), 2)
+            .unwrap();
+        let ids: Vec<String> = store
+            .load_history()
+            .unwrap()
+            .iter()
+            .map(|record| record.id.clone())
+            .collect();
+        assert_eq!(ids, vec!["h2".to_string(), "h3".to_string()]);
+
+        // limit 为 0 表示不裁剪（CLI / 迁移场景）。
+        store
+            .upsert_history(&history_record("h4", DeployStatus::Success), 0)
+            .unwrap();
+        assert_eq!(store.load_history().unwrap().len(), 3);
+
+        assert!(store.remove_history("h2").unwrap());
+        assert!(!store.remove_history("h2").unwrap());
+        store.clear_history().unwrap();
+        assert!(store.load_history().unwrap().is_empty());
+
+        // 查找：精确命中优先，唯一前缀可命中，多义前缀报错。
+        store
+            .upsert_backup(&backup_record("aaaa-1111", DeployStatus::Success), 0)
+            .unwrap();
+        store
+            .upsert_backup(&backup_record("bbbb-2222", DeployStatus::Success), 0)
+            .unwrap();
+        assert_eq!(store.find_backup("aaaa-1111").unwrap().id, "aaaa-1111");
+        assert_eq!(store.find_backup("aaaa").unwrap().id, "aaaa-1111");
+        assert!(matches!(
+            store.find_backup("nope"),
+            Err(CoreError::NotFound(_))
+        ));
+        store
+            .upsert_backup(&backup_record("aaaa-3333", DeployStatus::Success), 0)
+            .unwrap();
+        assert!(matches!(
+            store.find_backup("aaaa"),
+            Err(CoreError::Config(_))
+        ));
+        assert_eq!(store.find_backup("aaaa-3333").unwrap().id, "aaaa-3333");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_interrupted_converts_running_records_across_kinds() {
+        let dir = std::env::temp_dir()
+            .join(format!("deploycode-store-interrupted-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        store
+            .upsert_history(&history_record("h1", DeployStatus::Running), 0)
+            .unwrap();
+        store
+            .upsert_history(&history_record("h2", DeployStatus::Success), 0)
+            .unwrap();
+        store
+            .upsert_backup(&backup_record("b1", DeployStatus::Running), 0)
+            .unwrap();
+        store
+            .upsert_pages_record(&pages_record("p1", DeployStatus::Running), 0)
+            .unwrap();
+
+        assert_eq!(store.mark_interrupted().unwrap(), 3);
+        let converted = store.find_record("h1").unwrap();
+        assert_eq!(converted.status, DeployStatus::Failed);
+        assert_eq!(
+            converted.error.as_deref(),
+            Some("任务被中断（应用退出或崩溃）")
+        );
+        assert!(converted.finished_at.is_some());
+        // 崩溃后无法得知真实结束时间，耗时保持 0（界面显示为未知）。
+        assert_eq!(converted.duration_ms, 0);
+        assert_eq!(
+            store.find_record("h2").unwrap().status,
+            DeployStatus::Success
+        );
+        assert_eq!(
+            store.find_backup("b1").unwrap().status,
+            DeployStatus::Failed
+        );
+        assert_eq!(
+            store.find_pages_record("p1").unwrap().status,
+            DeployStatus::Failed
+        );
+        // 收敛过之后再次调用不应产生变更。
+        assert_eq!(store.mark_interrupted().unwrap(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

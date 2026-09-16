@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,16 +10,15 @@ use crate::error::{CoreError, Result};
 use crate::git::Git;
 use crate::models::{
     elapsed_ms_since, now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus,
-    EnvFileConfig, LogLevel, RepoConfig, RepoInfo, ServerConfig, Settings,
+    EnvFileConfig, RepoConfig, RepoInfo, ServerConfig, Settings,
 };
 use crate::process::{sha256_file, shell_quote};
 use crate::release;
 use crate::security::SecurityReport;
 use crate::ssh::{OutputKind, SshClient};
 use crate::store::Store;
-
-/// 单条部署记录最多保留的日志行数（超出后丢弃最早的日志）。
-const MAX_LOG_LINES: usize = 8000;
+use crate::tasklog::TaskLogger;
+use crate::util::{format_duration, human_size};
 
 /// 部署结束后自动删除本地临时归档（成功或失败都会触发）。
 ///
@@ -162,9 +161,13 @@ impl DeployEngine {
         events: Option<EventSender>,
     ) -> DeployRecord {
         let started = Instant::now();
-        let mut logger = Logger::new(events.clone());
+        let mut logger = TaskLogger::new(
+            events,
+            |level, message| DeployEvent::Log { level, message },
+            Some(|percent, message| DeployEvent::Progress { percent, message }),
+        );
 
-        let _ = logger.send(DeployEvent::Started {
+        logger.send(DeployEvent::Started {
             record_id: record.id.clone(),
         });
         logger.info(format!(
@@ -205,7 +208,7 @@ impl DeployEngine {
             }
         }
 
-        record.log = join_log_lines(&logger);
+        record.log = logger.joined();
         record.finished_at = Some(now_string());
         record.duration_ms = started.elapsed().as_millis() as u64;
 
@@ -217,15 +220,15 @@ impl DeployEngine {
         if let Err(first_err) = self.store.upsert_history(&record, limit) {
             // 写入失败不能让最终状态静默丢失：记录错误事件（CLI/GUI 均可见）后重试一次。
             logger.error(format!("保存部署记录失败: {first_err}"));
-            record.log = join_log_lines(&logger);
+            record.log = logger.joined();
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             if let Err(second_err) = self.store.upsert_history(&record, limit) {
                 logger.error(format!("重试保存部署记录仍失败: {second_err}"));
-                record.log = join_log_lines(&logger);
+                record.log = logger.joined();
             }
         }
 
-        if let Some(sender) = events {
+        if let Some(sender) = logger.take_events() {
             let _ = sender.send(DeployEvent::Finished {
                 record: record.clone(),
             });
@@ -238,7 +241,7 @@ impl DeployEngine {
         record: &DeployRecord,
         req: &DeployRequest,
         release: Option<&str>,
-        logger: &mut Logger,
+        logger: &mut TaskLogger<DeployEvent>,
     ) -> Result<()> {
         let config = self.store.load_config()?;
         let settings = config.settings.clone();
@@ -492,7 +495,7 @@ impl DeployEngine {
                     saved.release_dir = Some(name.to_string());
                     saved.finished_at = Some(now_string());
                     saved.duration_ms = elapsed_ms_since(&saved.started_at);
-                    saved.log = join_log_lines(logger);
+                    saved.log = logger.joined();
                     let limit = self
                         .store
                         .load_config()
@@ -537,7 +540,7 @@ impl DeployEngine {
         deploy_dir: &str,
         release: Option<&str>,
         client: &SshClient,
-        logger: &mut Logger,
+        logger: &mut TaskLogger<DeployEvent>,
         settings: &Settings,
     ) -> Result<()> {
         // 脚本在解压出的目录内执行；pidfile 始终放在部署根目录的 .deploy_code 下，
@@ -772,74 +775,6 @@ pub fn repo_info(repo: &RepoConfig) -> RepoInfo {
     }
 }
 
-/// 收集日志并按需推送给事件通道。
-struct Logger {
-    lines: VecDeque<String>,
-    events: Option<EventSender>,
-}
-
-impl Logger {
-    fn new(events: Option<EventSender>) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            events,
-        }
-    }
-
-    fn send(&self, event: DeployEvent) -> Option<()> {
-        self.events.as_ref().map(|sender| {
-            let _ = sender.send(event);
-        })
-    }
-
-    fn line(&mut self, level: LogLevel, message: impl Into<String>) {
-        let text = format!(
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            message.into()
-        );
-        if self.lines.len() >= MAX_LOG_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(text.clone());
-        self.send(DeployEvent::Log {
-            level,
-            message: text,
-        });
-    }
-
-    fn info(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Info, message);
-    }
-
-    fn command(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Command, message);
-    }
-
-    fn success(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Success, message);
-    }
-
-    fn warn(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Warn, message);
-    }
-
-    fn error(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Error, message);
-    }
-
-    fn progress(&self, percent: u8, message: &str) {
-        self.send(DeployEvent::Progress {
-            percent,
-            message: message.to_string(),
-        });
-    }
-}
-
-fn join_log_lines(logger: &Logger) -> String {
-    logger.lines.iter().cloned().collect::<Vec<_>>().join("\n")
-}
-
 /// 校验并规范化环境文件配置：跳过空条目，统一远端路径分隔符。
 pub fn normalize_env_files(files: &[EnvFileConfig]) -> Result<Vec<EnvFileConfig>> {
     let mut normalized = Vec::with_capacity(files.len());
@@ -1006,32 +941,6 @@ fn sanitize_component(value: &str) -> String {
 
 fn short_hash(hash: &str) -> String {
     hash.chars().take(8).collect()
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let value = bytes as f64;
-    if value >= GB {
-        format!("{:.2} GB", value / GB)
-    } else if value >= MB {
-        format!("{:.2} MB", value / MB)
-    } else if value >= KB {
-        format!("{:.1} KB", value / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
-    }
 }
 
 #[cfg(test)]

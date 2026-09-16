@@ -3,7 +3,9 @@ use std::sync::Arc;
 use deploy_core::models::{
     BackupConfig, BackupTarget, DeployEvent, DeployRecord, DeployRequest, ServerConfig, SshAuth,
 };
-use deploy_core::{backup::mask_database_url, CoreError, DeployEngine, Result, Store};
+use deploy_core::{
+    backup::mask_database_url, format_duration, human_size, CoreError, DeployEngine, Result, Store,
+};
 use tokio::sync::mpsc;
 
 use crate::cli::*;
@@ -171,33 +173,7 @@ fn truncate(value: &str, width: usize) -> String {
     }
 }
 
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
-    }
-}
-
 /// 取记录 ID 前 8 个字符用于列表展示（按字符而非字节，避免多字节 panic）。
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let value = bytes as f64;
-    if value >= GB {
-        format!("{:.2} GB", value / GB)
-    } else if value >= MB {
-        format!("{:.2} MB", value / MB)
-    } else if value >= KB {
-        format!("{:.1} KB", value / KB)
-    } else {
-        format!("{bytes} B")
-    }
 }

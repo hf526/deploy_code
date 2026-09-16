@@ -1,8 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   CalendarClock,
-  ChevronDown,
-  ChevronRight,
+  Copy,
   Database,
   Pencil,
   Play,
@@ -13,10 +12,12 @@ import {
 import { useTranslation } from "react-i18next";
 
 import { LogConsole } from "../components/LogConsole";
+import { ExpandableRecordRow, RecordLog } from "../components/RecordRows";
 import {
   Badge,
   Button,
   Card,
+  Checkbox,
   ConfirmModal,
   EmptyState,
   Field,
@@ -26,16 +27,13 @@ import {
   Select,
 } from "../components/ui";
 import { api } from "../lib/api";
-import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
-import { cn } from "../lib/utils";
+import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
 import { BackupConfigModal } from "./backup/BackupConfigModal";
 
 function statusBadge(record: BackupRecord) {
-  if (record.status === "success") return <Badge kind="green">{i18n.t("status.success")}</Badge>;
-  if (record.status === "failed") return <Badge kind="red">{i18n.t("status.failed")}</Badge>;
-  return <Badge kind="amber">{i18n.t("status.running")}</Badge>;
+  return <Badge kind={statusBadgeKind(record.status)}>{deployStatusLabel(record.status)}</Badge>;
 }
 
 function humanSize(bytes: number): string {
@@ -65,7 +63,11 @@ export default function BackupsPage() {
   const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
 
-  const [editing, setEditing] = useState<{ config: BackupConfig | null } | null>(null);
+  const [editing, setEditing] = useState<{
+    config: BackupConfig | null;
+    /** 复制已有配置：仅预填参数，保存时新建（见 BackupConfigModal）。 */
+    duplicate?: boolean;
+  } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
@@ -272,6 +274,26 @@ export default function BackupsPage() {
                         <Pencil className="size-3.5" />
                       </Button>
                       <Button
+                        variant="secondary"
+                        size="sm"
+                        title={t("backup.copyConfig")}
+                        disabled={running}
+                        onClick={() =>
+                          setEditing({
+                            // 清空 id：保存时新建一条；source 单独拷贝，避免与原配置共享对象。
+                            config: {
+                              ...config,
+                              id: "",
+                              name: t("backup.copyName", { name: config.name }),
+                              source: { ...config.source },
+                            },
+                            duplicate: true,
+                          })
+                        }
+                      >
+                        <Copy className="size-3.5" />
+                      </Button>
+                      <Button
                         variant="ghost"
                         size="sm"
                         title={t("backup.deleteConfig")}
@@ -293,17 +315,14 @@ export default function BackupsPage() {
               description={t("backup.schedule.description")}
             />
             <Card className="flex flex-col gap-4 p-5">
-              <label className="flex items-center gap-2.5 text-xs text-ink">
-                <input
-                  type="checkbox"
-                  checked={settings.scheduledBackupEnabled}
-                  onChange={(event) =>
-                    void handleSaveSchedule({ scheduledBackupEnabled: event.target.checked })
-                  }
-                  className="size-3.5 accent-primary"
-                />
+              <Checkbox
+                checked={settings.scheduledBackupEnabled}
+                onChange={(checked) =>
+                  void handleSaveSchedule({ scheduledBackupEnabled: checked })
+                }
+              >
                 {t("backup.schedule.enable")}
-              </label>
+              </Checkbox>
               <div className="grid grid-cols-2 gap-4">
                 <Field label={t("backup.schedule.time")}>
                   <Input
@@ -395,47 +414,36 @@ export default function BackupsPage() {
             ) : (
               <Card className="divide-y divide-line overflow-hidden">
                 {backups.map((record) => (
-                  <div key={record.id}>
-                    <div className="flex items-center gap-3 px-4 py-3">
-                      <button
-                        className="flex min-w-0 flex-1 items-center gap-3 text-left"
-                        onClick={() => setExpanded(expanded === record.id ? null : record.id)}
-                      >
-                        {expanded === record.id ? (
-                          <ChevronDown className="size-3.5 shrink-0 text-ink-faint" />
-                        ) : (
-                          <ChevronRight className="size-3.5 shrink-0 text-ink-faint" />
-                        )}
-                        <div className="min-w-0 flex-1">
-                          <p className="truncate text-[13px] font-medium text-ink">
-                            {record.serverName} · {record.database}
-                            <span className="ml-2 text-[11px] font-normal text-ink-faint">
-                              schema {record.schema}
-                            </span>
-                          </p>
-                          <p className="mt-0.5 truncate text-[11px] text-ink-faint">
-                            {record.startedAt} · {humanSize(record.dumpSize)} ·{" "}
-                            {record.targetName || t("backup.targetFallback")} · {record.target}
-                          </p>
-                        </div>
-                        {statusBadge(record)}
-                      </button>
-                      <Button
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => void handleDelete(record.id)}
-                        title={t("backup.deleteRecord")}
-                      >
-                        <Trash2 className="size-3.5" />
-                      </Button>
-                    </div>
-                    {expanded === record.id && (
-                      <pre className="max-h-80 overflow-auto border-t border-line bg-sunken px-4 py-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-ink-dim">
-                        {record.error ? `${t("backup.errorPrefix", { error: record.error })}\n\n` : ""}
-                        {record.log || t("backup.noLog")}
-                      </pre>
-                    )}
-                  </div>
+                  <ExpandableRecordRow
+                    key={record.id}
+                    expanded={expanded === record.id}
+                    onToggle={() => setExpanded(expanded === record.id ? null : record.id)}
+                    badge={statusBadge(record)}
+                    deleteTitle={t("backup.deleteRecord")}
+                    onDelete={() => void handleDelete(record.id)}
+                    title={
+                      <>
+                        {record.serverName} · {record.database}
+                        <span className="ml-2 text-[11px] font-normal text-ink-faint">
+                          schema {record.schema}
+                        </span>
+                      </>
+                    }
+                    subtitle={
+                      <>
+                        {record.startedAt} · {humanSize(record.dumpSize)} ·{" "}
+                        {record.targetName || t("backup.targetFallback")} · {record.target}
+                      </>
+                    }
+                    log={
+                      <RecordLog
+                        error={record.error}
+                        errorPrefix={(error) => t("backup.errorPrefix", { error })}
+                        log={record.log}
+                        emptyText={t("backup.noLog")}
+                      />
+                    }
+                  />
                 ))}
               </Card>
             )}
@@ -446,6 +454,7 @@ export default function BackupsPage() {
       {editing && (
         <BackupConfigModal
           config={editing.config}
+          duplicate={editing.duplicate ?? false}
           onClose={() => setEditing(null)}
           onRefresh={() => void refreshBackupConfigs()}
           onSaved={(saved) => {

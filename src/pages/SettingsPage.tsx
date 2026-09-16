@@ -2,7 +2,16 @@ import { useEffect, useRef, useState } from "react";
 import { FolderOpen, Plus, Save, Server, Settings2, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { Button, Card, Field, Input, Page, SectionTitle, Select } from "../components/ui";
+import {
+  Button,
+  Card,
+  Checkbox,
+  Field,
+  Input,
+  Page,
+  SectionTitle,
+  Select,
+} from "../components/ui";
 import { BackupTargetFromServerModal } from "../components/BackupTargetFromServerModal";
 import { ThemeToggle } from "../components/ThemeToggle";
 import { api } from "../lib/api";
@@ -207,37 +216,24 @@ export default function SettingsPage() {
             </div>
 
             <div className="mt-5 flex flex-col gap-3 border-t border-line pt-5">
-              <label className="flex items-center gap-2.5 text-xs text-ink">
-                <input
-                  type="checkbox"
-                  checked={draft.runScripts}
-                  onChange={(event) => setDraft({ ...draft, runScripts: event.target.checked })}
-                  className="size-3.5 accent-primary"
-                />
+              <Checkbox
+                checked={draft.runScripts}
+                onChange={(checked) => setDraft({ ...draft, runScripts: checked })}
+              >
                 {t("settings.deploy.runScripts")}
-              </label>
-              <label className="flex items-center gap-2.5 text-xs text-ink">
-                <input
-                  type="checkbox"
-                  checked={draft.keepRemoteArchive}
-                  onChange={(event) =>
-                    setDraft({ ...draft, keepRemoteArchive: event.target.checked })
-                  }
-                  className="size-3.5 accent-primary"
-                />
+              </Checkbox>
+              <Checkbox
+                checked={draft.keepRemoteArchive}
+                onChange={(checked) => setDraft({ ...draft, keepRemoteArchive: checked })}
+              >
                 {t("settings.deploy.keepRemoteArchive")}
-              </label>
-              <label className="flex items-center gap-2.5 text-xs text-ink">
-                <input
-                  type="checkbox"
-                  checked={draft.atomicRelease}
-                  onChange={(event) =>
-                    setDraft({ ...draft, atomicRelease: event.target.checked })
-                  }
-                  className="size-3.5 accent-primary"
-                />
+              </Checkbox>
+              <Checkbox
+                checked={draft.atomicRelease}
+                onChange={(checked) => setDraft({ ...draft, atomicRelease: checked })}
+              >
                 {t("settings.deploy.atomicRelease")}
-              </label>
+              </Checkbox>
               {draft.atomicRelease && (
                 <div className="flex items-center gap-3 pl-6">
                   <span className="text-[11px] text-ink-faint">
@@ -538,16 +534,13 @@ export default function SettingsPage() {
               description={t("settings.automation.description")}
             />
             <Card className="flex flex-col p-4">
-              <label className="flex items-center gap-2.5 text-xs text-ink">
-                <input
-                  type="checkbox"
-                  checked={autostart}
-                  disabled={autostartBusy}
-                  onChange={(event) => void handleAutostart(event.target.checked)}
-                  className="size-3.5 accent-primary"
-                />
+              <Checkbox
+                checked={autostart}
+                disabled={autostartBusy}
+                onChange={(checked) => void handleAutostart(checked)}
+              >
                 {t("settings.automation.autostart")}
-              </label>
+              </Checkbox>
               <p className="mt-2 pl-6 text-[11px] leading-relaxed text-ink-faint">
                 {t("settings.automation.autostartHint")}
               </p>

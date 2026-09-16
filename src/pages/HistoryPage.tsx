@@ -3,6 +3,7 @@ import { Eraser, History, Layers, RefreshCw, RotateCcw, ScrollText, Trash2 } fro
 import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
+import { RecordLog } from "../components/RecordRows";
 import {
   Badge,
   Button,
@@ -404,9 +405,11 @@ export default function HistoryPage() {
                 {viewing.error}
               </div>
             )}
-            <pre className="max-h-[46vh] overflow-y-auto rounded-md border border-line bg-sunken px-4 py-2.5 font-mono text-[11.5px] leading-[1.7] text-ink-dim">
-              {viewing.log || t("history.noLog")}
-            </pre>
+            <RecordLog
+              log={viewing.log}
+              emptyText={t("history.noLog")}
+              className="max-h-[46vh] overflow-y-auto rounded-md border border-line bg-sunken px-4 py-2.5 font-mono text-[11.5px] leading-[1.7] text-ink-dim"
+            />
           </div>
         )}
       </Modal>

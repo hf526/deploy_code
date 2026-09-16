@@ -15,13 +15,6 @@ export function formatDuration(ms: number): string {
   return `${Math.floor(totalSeconds / 60)}m${totalSeconds % 60}s`;
 }
 
-export function formatSize(bytes: number): string {
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
-  return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`;
-}
-
 export function deployStatusLabel(status: DeployStatus): string {
   switch (status) {
     case "success":
@@ -44,6 +37,13 @@ export function deployStatusClass(status: DeployStatus): string {
   }
 }
 
+/** 状态徽章颜色（Badge kind），列表与记录页共用。 */
+export function statusBadgeKind(status: DeployStatus): "green" | "red" | "amber" {
+  if (status === "success") return "green";
+  if (status === "failed") return "red";
+  return "amber";
+}
+
 export function authLabel(auth: SshAuth): string {
   return auth.type === "password" ? i18n.t("auth.password") : i18n.t("auth.privateKey");
 }
@@ -57,6 +57,25 @@ export function authSummary(server: ServerConfig): string {
 export function shortPath(path: string, max = 48): string {
   if (path.length <= max) return path;
   return `…${path.slice(path.length - max + 1)}`;
+}
+
+/**
+ * 由本地环境文件路径推导部署目录内的相对路径。
+ * 命中仓库根目录时保留子目录（`<repo>/backend/.env` → `backend/.env`），
+ * 否则退回文件名：用户也可能选仓库外的密钥文件，此时默认放到部署目录根。
+ */
+export function inferEnvRemotePath(localPath: string, repoPath?: string | null): string {
+  const normalize = (value: string) => value.replace(/\\/g, "/").replace(/\/+$/, "");
+  const local = normalize(localPath);
+  const segments = local.split("/").filter(Boolean);
+  const fallback = segments[segments.length - 1] ?? "";
+  const repo = repoPath ? normalize(repoPath) : "";
+  if (!local || !repo) return fallback;
+  // Windows 盘符 / 目录大小写不敏感：比较时统一小写，返回时保留原始大小写。
+  const prefix = `${repo.toLowerCase()}/`;
+  if (!local.toLowerCase().startsWith(prefix)) return fallback;
+  const relative = local.slice(prefix.length).replace(/^\/+/, "");
+  return relative || fallback;
 }
 
 /** 遮蔽查询串中的 password 参数（与后端 mask_database_url 行为一致）。 */

@@ -1,13 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link2, Save, ShieldCheck } from "lucide-react";
+import { Link2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
+import { ConfigModalFooter } from "../../components/ConfigModalFooter";
 import { SearchSelect } from "../../components/SearchSelect";
 import { Button, Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
-import type { Branch, PagesConfig, PagesConfigEntry, RepoInfo } from "../../lib/types";
+import type { PagesConfig, PagesConfigEntry, RepoInfo } from "../../lib/types";
 import { githubTarget } from "../../lib/utils";
+import { useRepoBranches } from "./useRepoBranches";
 
 const EMPTY_CONFIG: PagesConfig = {
   provider: "cloudflare",
@@ -47,9 +49,10 @@ export function PagesConfigModal({
   const [loaded, setLoaded] = useState(() => entry !== null);
   const [loadError, setLoadError] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  const [branches, setBranches] = useState<Branch[]>([]);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
+
+  const { branchChoices } = useRepoBranches(repoId);
 
   const selected = repos.find((repo) => repo.id === repoId) ?? null;
 
@@ -89,35 +92,6 @@ export function PagesConfigModal({
       cancelled = true;
     };
   }, [entry, repoId, reloadKey, toast]);
-
-  useEffect(() => {
-    if (!repoId) {
-      setBranches([]);
-      return;
-    }
-    let cancelled = false;
-    void api
-      .listBranches(repoId, false)
-      .then((list) => {
-        if (!cancelled) setBranches(list);
-      })
-      .catch(() => {
-        if (!cancelled) setBranches([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [repoId]);
-
-  const branchChoices = useMemo(
-    () =>
-      branches.map((branch) => ({
-        value: branch.name,
-        label: branch.name,
-        hint: branch.isCurrent ? t("deploy.current") : undefined,
-      })),
-    [branches, t],
-  );
 
   const isGitHub = draft.provider === "github";
   const githubPreview = useMemo(
@@ -187,28 +161,15 @@ export function PagesConfigModal({
       subtitle={t("pages.configModalSubtitle")}
       width="max-w-xl"
       footer={
-        <>
-          <Button variant="secondary" disabled={saving || testing} onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button
-            variant="secondary"
-            loading={testing}
-            disabled={saving || !loaded || !repoId}
-            icon={<ShieldCheck className="size-4" />}
-            onClick={() => void handleTest()}
-          >
-            {t("common.testEnvironment")}
-          </Button>
-          <Button
-            loading={saving}
-            disabled={testing || !loaded}
-            icon={<Save className="size-4" />}
-            onClick={() => void handleSave()}
-          >
-            {t("common.save")}
-          </Button>
-        </>
+        <ConfigModalFooter
+          onClose={onClose}
+          onSave={() => void handleSave()}
+          onTest={() => void handleTest()}
+          saving={saving}
+          testing={testing}
+          testDisabled={!loaded || !repoId}
+          saveDisabled={!loaded}
+        />
       }
     >
       <div className="flex flex-col gap-4">

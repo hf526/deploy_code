@@ -6,7 +6,6 @@
 //! 3. 清空并重建目标 schema（默认 public，保留默认角色授权）；
 //! 4. `gunzip | psql` 全量导入目标数据库。
 
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,14 +15,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, AppConfig, BackupEvent, BackupRecord, BackupRequest, BackupTarget, DbBackupSource,
-    DeployStatus, LogLevel, ServerConfig, Settings,
+    DeployStatus, ServerConfig, Settings,
 };
 use crate::process::shell_quote;
 use crate::ssh::{OutputKind, SshClient};
 use crate::store::Store;
-
-/// 单条备份记录最多保留的日志行数。
-const MAX_LOG_LINES: usize = 8000;
+use crate::tasklog::TaskLogger;
+use crate::util::{format_duration, human_size};
 
 /// 本地临时脚本的清理守卫：无论正常返回还是 panic 都会删除文件。
 struct TempScriptGuard(PathBuf);
@@ -94,9 +92,13 @@ impl BackupEngine {
         events: Option<BackupEventSender>,
     ) -> BackupRecord {
         let started = Instant::now();
-        let mut logger = BackupLogger::new(events);
+        let mut logger = TaskLogger::new(
+            events,
+            |level, message| BackupEvent::Log { level, message },
+            Some(|percent, message| BackupEvent::Progress { percent, message }),
+        );
 
-        let _ = logger.send(BackupEvent::Started {
+        logger.send(BackupEvent::Started {
             record_id: record.id.clone(),
         });
         logger.info(format!(
@@ -123,7 +125,7 @@ impl BackupEngine {
             }
         }
 
-        record.log = join_log_lines(&logger);
+        record.log = logger.joined();
         record.finished_at = Some(now_string());
         record.duration_ms = started.elapsed().as_millis() as u64;
 
@@ -134,10 +136,10 @@ impl BackupEngine {
             .unwrap_or(200);
         if let Err(err) = self.store.upsert_backup(&record, limit) {
             logger.error(format!("保存备份记录失败: {err}"));
-            record.log = join_log_lines(&logger);
+            record.log = logger.joined();
         }
 
-        if let Some(sender) = logger.events.take() {
+        if let Some(sender) = logger.take_events() {
             let _ = sender.send(BackupEvent::Finished {
                 record: record.clone(),
             });
@@ -150,7 +152,7 @@ impl BackupEngine {
         record: &BackupRecord,
         source: &DbBackupSource,
         target: &str,
-        logger: &mut BackupLogger,
+        logger: &mut TaskLogger<BackupEvent>,
     ) -> Result<u64> {
         let config = self.store.load_config()?;
         let settings = config.settings.clone();
@@ -191,7 +193,7 @@ impl BackupEngine {
         remote: &str,
         script: &str,
         timeout: u64,
-        logger: &mut BackupLogger,
+        logger: &mut TaskLogger<BackupEvent>,
         record_id: &str,
     ) -> Result<u64> {
         self.put_script(client, remote, script).await?;
@@ -1022,99 +1024,6 @@ fn reset_schema_sql(schema: &str) -> String {
 
 fn sql_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-// ---------------------------------------------------------------------------
-// 日志
-// ---------------------------------------------------------------------------
-
-struct BackupLogger {
-    lines: VecDeque<String>,
-    events: Option<BackupEventSender>,
-}
-
-impl BackupLogger {
-    fn new(events: Option<BackupEventSender>) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            events,
-        }
-    }
-
-    fn send(&self, event: BackupEvent) -> Option<()> {
-        self.events.as_ref().map(|sender| {
-            let _ = sender.send(event);
-        })
-    }
-
-    fn line(&mut self, level: LogLevel, message: impl Into<String>) {
-        let text = format!(
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            message.into()
-        );
-        if self.lines.len() >= MAX_LOG_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(text.clone());
-        self.send(BackupEvent::Log {
-            level,
-            message: text,
-        });
-    }
-
-    fn info(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Info, message);
-    }
-
-    fn success(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Success, message);
-    }
-
-    fn warn(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Warn, message);
-    }
-
-    fn error(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Error, message);
-    }
-
-    fn progress(&self, percent: u8, message: &str) {
-        self.send(BackupEvent::Progress {
-            percent,
-            message: message.to_string(),
-        });
-    }
-}
-
-fn join_log_lines(logger: &BackupLogger) -> String {
-    logger.lines.iter().cloned().collect::<Vec<_>>().join("\n")
-}
-
-fn human_size(bytes: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = KB * 1024.0;
-    const GB: f64 = MB * 1024.0;
-    let value = bytes as f64;
-    if value >= GB {
-        format!("{:.2} GB", value / GB)
-    } else if value >= MB {
-        format!("{:.2} MB", value / MB)
-    } else if value >= KB {
-        format!("{:.1} KB", value / KB)
-    } else {
-        format!("{bytes} B")
-    }
-}
-
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
-    }
 }
 
 #[cfg(test)]

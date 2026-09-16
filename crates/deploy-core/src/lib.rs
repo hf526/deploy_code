@@ -12,6 +12,8 @@
 //! - [`backup`]：数据库备份（服务器 PG -> Supabase）
 //! - [`pages`]：Cloudflare Pages 部署（wrangler）
 //! - [`process`]：本地命令执行与 shell 工具
+//! - [`tasklog`]：三类任务共用的日志器
+//! - [`util`]：展示用格式化工具
 
 pub mod backup;
 pub mod engine;
@@ -24,6 +26,8 @@ pub mod release;
 pub mod security;
 pub mod ssh;
 pub mod store;
+pub mod tasklog;
+pub mod util;
 
 pub use backup::{BackupEngine, BackupEventSender, PreparedBackup};
 pub use engine::{repo_info, DeployEngine, EventSender};
@@ -33,3 +37,5 @@ pub use models::*;
 pub use pages::{PagesEngine, PagesEventSender, PreparedPagesDeploy};
 pub use security::SecurityReport;
 pub use store::Store;
+pub use tasklog::TaskLogger;
+pub use util::{format_duration, human_size};

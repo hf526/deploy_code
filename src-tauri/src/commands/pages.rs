@@ -129,29 +129,11 @@ pub fn save_pages_config(
     repo_id: String,
     config: PagesConfig,
 ) -> Result<PagesConfig> {
-    let mut normalized = config;
-    normalized.provider = normalized.provider.trim().to_lowercase();
-    if normalized.provider.is_empty() {
-        normalized.provider = "cloudflare".to_string();
-    }
+    let normalized = config.normalize();
     if normalized.provider != "cloudflare" && normalized.provider != "github" {
         return Err(CoreError::config(
             "不支持的 Pages 平台（可选 cloudflare / github）",
         ));
-    }
-    normalized.project_name = normalized.project_name.trim().to_string();
-    normalized.build_command = normalized.build_command.trim().to_string();
-    normalized.output_dir = normalized.output_dir.trim().to_string();
-    normalized.branch = normalized.branch.trim().to_string();
-    normalized.publish_branch = normalized.publish_branch.trim().to_string();
-    if normalized.output_dir.is_empty() {
-        normalized.output_dir = "dist".to_string();
-    }
-    if normalized.branch.is_empty() {
-        normalized.branch = "main".to_string();
-    }
-    if normalized.publish_branch.is_empty() {
-        normalized.publish_branch = "gh-pages".to_string();
     }
     if normalized.provider == "github" {
         if normalized.publish_branch.starts_with('-')

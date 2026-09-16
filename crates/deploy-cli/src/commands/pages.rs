@@ -39,14 +39,6 @@ pub(super) async fn pages_command(cli: &Cli, command: &PagesCommand) -> Result<(
                 if let Some(value) = provider {
                     pages.provider = value.trim().to_lowercase();
                 }
-                if pages.provider.is_empty() {
-                    pages.provider = "cloudflare".to_string();
-                }
-                if pages.provider != "cloudflare" && pages.provider != "github" {
-                    return Err(CoreError::config(
-                        "不支持的 Pages 平台（可选 cloudflare / github）",
-                    ));
-                }
                 if let Some(value) = project {
                     pages.project_name = value.trim().to_string();
                 }
@@ -62,14 +54,11 @@ pub(super) async fn pages_command(cli: &Cli, command: &PagesCommand) -> Result<(
                 if let Some(value) = publish_branch {
                     pages.publish_branch = value.trim().to_string();
                 }
-                if pages.output_dir.is_empty() {
-                    pages.output_dir = "dist".to_string();
-                }
-                if pages.branch.is_empty() {
-                    pages.branch = "main".to_string();
-                }
-                if pages.publish_branch.is_empty() {
-                    pages.publish_branch = "gh-pages".to_string();
+                let pages = pages.normalize();
+                if pages.provider != "cloudflare" && pages.provider != "github" {
+                    return Err(CoreError::config(
+                        "不支持的 Pages 平台（可选 cloudflare / github）",
+                    ));
                 }
                 repo_mut.pages = if pages.provider == "github" || !pages.project_name.is_empty() {
                     Some(pages.clone())

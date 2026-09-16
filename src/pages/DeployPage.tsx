@@ -1,9 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   Cloud,
+  Copy,
   History,
   Pencil,
   Plus,
@@ -19,6 +18,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { BindRemoteModal } from "../components/BindRemoteModal";
 import { LogConsole } from "../components/LogConsole";
+import { ExpandableRecordRow, RecordLog } from "../components/RecordRows";
 import {
   Badge,
   Button,
@@ -39,12 +39,24 @@ import type {
   PagesDeployRecord,
   RepoInfo,
 } from "../lib/types";
-import { cn, deployStatusClass, deployStatusLabel, formatDuration } from "../lib/utils";
+import {
+  cn,
+  deployStatusClass,
+  deployStatusLabel,
+  formatDuration,
+  statusBadgeKind,
+} from "../lib/utils";
 import { DeployConfigModal, type DeployPrefill } from "./deploy/DeployConfigModal";
 import { PagesConfigModal } from "./deploy/PagesConfigModal";
 
 type EditingState =
-  | { kind: "server"; config: DeployConfig | null; prefill?: DeployPrefill }
+  | {
+      kind: "server";
+      config: DeployConfig | null;
+      prefill?: DeployPrefill;
+      /** 复制已有配置：仅预填参数，保存时新建（见 DeployConfigModal）。 */
+      duplicate?: boolean;
+    }
   | { kind: "pages"; entry: PagesConfigEntry | null; prefillRepoId?: string };
 
 type DeletingState =
@@ -390,6 +402,29 @@ export default function DeployPage() {
                     >
                       <Pencil className="size-3.5" />
                     </Button>
+                    {row.kind === "server" && (
+                      <Button
+                        variant="secondary"
+                        size="sm"
+                        title={t("deploy.copyConfig")}
+                        disabled={running}
+                        onClick={() =>
+                          setEditing({
+                            kind: "server",
+                            // 清空 id / 创建时间：保存时新建一条，避免复用原配置的身份与创建时间。
+                            config: {
+                              ...row.config,
+                              id: "",
+                              createdAt: "",
+                              name: t("deploy.copyName", { name: row.config.name }),
+                            },
+                            duplicate: true,
+                          })
+                        }
+                      >
+                        <Copy className="size-3.5" />
+                      </Button>
+                    )}
                     <Button
                       variant="ghost"
                       size="sm"
@@ -619,6 +654,7 @@ export default function DeployPage() {
         <DeployConfigModal
           initial={editing.config}
           prefill={editing.prefill ?? null}
+          duplicate={editing.duplicate ?? false}
           onClose={() => setEditing(null)}
           onRefresh={() => void refreshDeployConfigs()}
           onSaved={(config) => {
@@ -769,56 +805,47 @@ function PagesRecordRow({
 }) {
   const { t } = useTranslation();
   return (
-    <div>
-      <div className="flex items-center gap-3 px-4 py-3">
-        <button
-          className="flex min-w-0 flex-1 items-center gap-3 text-left"
-          onClick={onToggle}
-        >
-          {expanded ? (
-            <ChevronDown className="size-3.5 shrink-0 text-ink-faint" />
-          ) : (
-            <ChevronRight className="size-3.5 shrink-0 text-ink-faint" />
-          )}
-          <div className="min-w-0 flex-1">
-            <p className="truncate text-[13px] font-medium text-ink">
-              {record.repoName} → {record.projectName}
-              <span className="ml-2 rounded bg-hover px-1.5 py-0.5 text-[10px] font-normal text-ink-dim">
-                {record.provider === "github" ? "GitHub" : "Cloudflare"}
-              </span>
-              <span className="ml-2 text-[11px] font-normal text-ink-faint">
-                {record.branch}
-                {record.commitShort ? ` · ${record.commitShort}` : ""}
-              </span>
-            </p>
-            <p className="mt-0.5 truncate text-[11px] text-ink-faint">
-              {record.startedAt}
-              {record.url ? ` · ${record.url}` : ""}
-            </p>
-          </div>
-          <Badge
-            kind={
-              record.status === "success" ? "green" : record.status === "failed" ? "red" : "amber"
-            }
-          >
-            {deployStatusLabel(record.status)}
-          </Badge>
-        </button>
-        {record.url && (
+    <ExpandableRecordRow
+      expanded={expanded}
+      onToggle={onToggle}
+      badge={
+        <Badge kind={statusBadgeKind(record.status)}>{deployStatusLabel(record.status)}</Badge>
+      }
+      actions={
+        record.url ? (
           <Button variant="ghost" size="sm" onClick={onCopy}>
             {t("pages.copyUrl")}
           </Button>
-        )}
-        <Button variant="ghost" size="sm" title={t("backup.deleteRecord")} onClick={onDelete}>
-          <Trash2 className="size-3.5" />
-        </Button>
-      </div>
-      {expanded && (
-        <pre className="max-h-80 overflow-auto border-t border-line bg-sunken px-4 py-3 font-mono text-[11px] leading-relaxed whitespace-pre-wrap text-ink-dim">
-          {record.error ? `${t("backup.errorPrefix", { error: record.error })}\n\n` : ""}
-          {record.log || t("backup.noLog")}
-        </pre>
-      )}
-    </div>
+        ) : undefined
+      }
+      deleteTitle={t("backup.deleteRecord")}
+      onDelete={onDelete}
+      title={
+        <>
+          {record.repoName} → {record.projectName}
+          <span className="ml-2 rounded bg-hover px-1.5 py-0.5 text-[10px] font-normal text-ink-dim">
+            {record.provider === "github" ? "GitHub" : "Cloudflare"}
+          </span>
+          <span className="ml-2 text-[11px] font-normal text-ink-faint">
+            {record.branch}
+            {record.commitShort ? ` · ${record.commitShort}` : ""}
+          </span>
+        </>
+      }
+      subtitle={
+        <>
+          {record.startedAt}
+          {record.url ? ` · ${record.url}` : ""}
+        </>
+      }
+      log={
+        <RecordLog
+          error={record.error}
+          errorPrefix={(error) => t("backup.errorPrefix", { error })}
+          log={record.log}
+          emptyText={t("backup.noLog")}
+        />
+      }
+    />
   );
 }

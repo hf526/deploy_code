@@ -7,7 +7,6 @@
 //!
 //! 两者都依赖本机的 Node.js / npx。
 
-use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,14 +16,13 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::error::{CoreError, Result};
 use crate::git::Git;
 use crate::models::{
-    now_string, DeployStatus, LogLevel, PagesConfig, PagesDeployRecord, PagesEvent, PagesRequest,
+    now_string, DeployStatus, PagesConfig, PagesDeployRecord, PagesEvent, PagesRequest,
 };
 use crate::process::{run, run_shell_stream, run_stream};
 use crate::ssh::OutputKind;
 use crate::store::Store;
-
-/// 单条记录最多保留的日志行数。
-const MAX_LOG_LINES: usize = 8000;
+use crate::tasklog::TaskLogger;
+use crate::util::format_duration;
 
 /// Pages 部署事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
 pub type PagesEventSender = UnboundedSender<PagesEvent>;
@@ -53,7 +51,7 @@ impl PagesEngine {
         let app_config = self.store.load_config()?;
         let repo = Store::find_repo(&app_config, &req.repo_id)?.clone();
 
-        let mut config = normalize_config(repo.pages.clone().unwrap_or_default());
+        let mut config = repo.pages.clone().unwrap_or_default().normalize();
         if let Some(value) = non_empty(&req.provider) {
             config.provider = value.to_lowercase();
         }
@@ -72,7 +70,7 @@ impl PagesEngine {
         if let Some(value) = non_empty(&req.publish_branch) {
             config.publish_branch = value.to_string();
         }
-        let config = normalize_config(config);
+        let config = config.normalize();
 
         let git = Git::open(&repo.path).ok();
         let remote = git
@@ -146,9 +144,13 @@ impl PagesEngine {
         events: Option<PagesEventSender>,
     ) -> PagesDeployRecord {
         let started = Instant::now();
-        let mut logger = PagesLogger::new(events);
+        let mut logger = TaskLogger::new(
+            events,
+            |level, message| PagesEvent::Log { level, message },
+            None,
+        );
 
-        let _ = logger.send(PagesEvent::Started {
+        logger.send(PagesEvent::Started {
             record_id: record.id.clone(),
         });
         logger.info(format!(
@@ -183,7 +185,7 @@ impl PagesEngine {
             }
         }
 
-        record.log = join_log_lines(&logger);
+        record.log = logger.joined();
         record.finished_at = Some(now_string());
         record.duration_ms = started.elapsed().as_millis() as u64;
 
@@ -194,10 +196,10 @@ impl PagesEngine {
             .unwrap_or(200);
         if let Err(err) = self.store.upsert_pages_record(&record, limit) {
             logger.error(format!("保存 Pages 部署记录失败: {err}"));
-            record.log = join_log_lines(&logger);
+            record.log = logger.joined();
         }
 
-        if let Some(sender) = logger.events.take() {
+        if let Some(sender) = logger.take_events() {
             let _ = sender.send(PagesEvent::Finished {
                 record: record.clone(),
             });
@@ -212,7 +214,7 @@ impl PagesEngine {
         token: &str,
         account_id: &str,
         skip_build: bool,
-        logger: &mut PagesLogger,
+        logger: &mut TaskLogger<PagesEvent>,
     ) -> Result<Option<String>> {
         let app_config = self.store.load_config()?;
         let timeout = Duration::from_secs(app_config.settings.script_timeout_secs.max(120));
@@ -302,7 +304,7 @@ impl PagesEngine {
         config: &PagesConfig,
         repo_path: &Path,
         skip_build: bool,
-        logger: &mut PagesLogger,
+        logger: &mut TaskLogger<PagesEvent>,
     ) -> Result<Option<String>> {
         let app_config = self.store.load_config()?;
         let build_timeout = Duration::from_secs(app_config.settings.script_timeout_secs.max(120));
@@ -389,8 +391,8 @@ impl PagesEngine {
         let app_config = self.store.load_config()?;
         let repo = Store::find_repo(&app_config, repo_id)?.clone();
         let config = match config {
-            Some(config) => normalize_config(config),
-            None => normalize_config(repo.pages.clone().unwrap_or_default()),
+            Some(config) => config.normalize(),
+            None => repo.pages.clone().unwrap_or_default().normalize(),
         };
         let path = PathBuf::from(&repo.path);
         let remote = Git::open(path.as_path())
@@ -456,30 +458,30 @@ impl PagesEngine {
     }
 }
 
-/// 与保存时一致地规范化表单配置：去空白并补默认值。
-fn normalize_config(mut config: PagesConfig) -> PagesConfig {
-    config.provider = config.provider.trim().to_lowercase();
-    if config.provider.is_empty() {
-        config.provider = "cloudflare".to_string();
-    }
-    config.project_name = config.project_name.trim().to_string();
-    config.build_command = config.build_command.trim().to_string();
-    config.output_dir = config.output_dir.trim().to_string();
-    config.branch = config.branch.trim().to_string();
-    config.publish_branch = config.publish_branch.trim().to_string();
-    if config.output_dir.is_empty() {
-        config.output_dir = "dist".to_string();
-    }
-    if config.branch.is_empty() {
-        config.branch = "main".to_string();
-    }
-    if config.publish_branch.is_empty() {
-        config.publish_branch = "gh-pages".to_string();
-    }
-    config
-}
-
 impl PagesConfig {
+    /// 规范化表单配置：去空白并补默认值（保存与测试共用，GUI / CLI 都调用）。
+    pub fn normalize(mut self) -> Self {
+        self.provider = self.provider.trim().to_lowercase();
+        if self.provider.is_empty() {
+            self.provider = "cloudflare".to_string();
+        }
+        self.project_name = self.project_name.trim().to_string();
+        self.build_command = self.build_command.trim().to_string();
+        self.output_dir = self.output_dir.trim().to_string();
+        self.branch = self.branch.trim().to_string();
+        self.publish_branch = self.publish_branch.trim().to_string();
+        if self.output_dir.is_empty() {
+            self.output_dir = "dist".to_string();
+        }
+        if self.branch.is_empty() {
+            self.branch = "main".to_string();
+        }
+        if self.publish_branch.is_empty() {
+            self.publish_branch = "gh-pages".to_string();
+        }
+        self
+    }
+
     fn is_github(&self) -> bool {
         self.provider == "github"
     }
@@ -856,7 +858,7 @@ fn ensure_github_pages(
     owner: &str,
     repo_name: &str,
     settings_token: &str,
-    logger: &mut PagesLogger,
+    logger: &mut TaskLogger<PagesEvent>,
 ) {
     let publish_branch = config.publish_branch.trim();
     let auth = github_auth(settings_token);
@@ -907,7 +909,7 @@ fn run_build(
     repo_path: &Path,
     skip_build: bool,
     timeout: Duration,
-    logger: &mut PagesLogger,
+    logger: &mut TaskLogger<PagesEvent>,
 ) -> Result<()> {
     if skip_build {
         logger.info("已按选项跳过构建");
@@ -1053,80 +1055,6 @@ fn strip_ansi(input: &str) -> String {
         }
     }
     output
-}
-
-// ---------------------------------------------------------------------------
-// 日志
-// ---------------------------------------------------------------------------
-
-struct PagesLogger {
-    lines: VecDeque<String>,
-    events: Option<PagesEventSender>,
-}
-
-impl PagesLogger {
-    fn new(events: Option<PagesEventSender>) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            events,
-        }
-    }
-
-    fn send(&self, event: PagesEvent) -> Option<()> {
-        self.events.as_ref().map(|sender| {
-            let _ = sender.send(event);
-        })
-    }
-
-    fn line(&mut self, level: LogLevel, message: impl Into<String>) {
-        let text = format!(
-            "[{}] {}",
-            chrono::Local::now().format("%H:%M:%S"),
-            message.into()
-        );
-        if self.lines.len() >= MAX_LOG_LINES {
-            self.lines.pop_front();
-        }
-        self.lines.push_back(text.clone());
-        self.send(PagesEvent::Log {
-            level,
-            message: text,
-        });
-    }
-
-    fn info(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Info, message);
-    }
-
-    fn command(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Command, message);
-    }
-
-    fn success(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Success, message);
-    }
-
-    fn warn(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Warn, message);
-    }
-
-    fn error(&mut self, message: impl Into<String>) {
-        self.line(LogLevel::Error, message);
-    }
-}
-
-fn join_log_lines(logger: &PagesLogger) -> String {
-    logger.lines.iter().cloned().collect::<Vec<_>>().join("\n")
-}
-
-fn format_duration(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{}m{:.0}s", ms / 60_000, (ms % 60_000) as f64 / 1000.0)
-    }
 }
 
 #[cfg(test)]

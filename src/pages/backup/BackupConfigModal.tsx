@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { Save, ShieldCheck } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { Button, Field, Input, Modal, Select } from "../../components/ui";
+import { ConfigModalFooter } from "../../components/ConfigModalFooter";
+import { ServerSelect } from "../../components/ServerSelect";
+import { Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
 import type { BackupConfig, BackupRequest, DbBackupSource } from "../../lib/types";
@@ -32,11 +33,14 @@ function normalized(source: DbBackupSource): DbBackupSource {
 /** 备份配置的新增 / 编辑弹窗：来源、目标与连接串都在这里配置。 */
 export function BackupConfigModal({
   config,
+  duplicate = false,
   onClose,
   onSaved,
   onRefresh,
 }: {
   config: BackupConfig | null;
+  /** 复制已有配置：保留全部参数，仅 id 为空，保存时新建一条（名称由调用方预填副本名）。 */
+  duplicate?: boolean;
   onClose: () => void;
   onSaved: (saved: BackupConfig) => void;
   /** 「测试环境」会先保存当前表单，保存后需要父组件刷新列表（弹窗保持打开）。 */
@@ -163,32 +167,24 @@ export function BackupConfigModal({
     <Modal
       open
       onClose={saving ? () => undefined : onClose}
-      title={config ? t("backup.editConfig") : t("backup.newConfig")}
+      title={
+        duplicate
+          ? t("backup.copyConfig")
+          : config
+            ? t("backup.editConfig")
+            : t("backup.newConfig")
+      }
       subtitle={t("backup.configModalSubtitle")}
       width="max-w-xl"
       footer={
-        <>
-          <Button variant="secondary" disabled={saving || testing} onClick={onClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button
-            variant="secondary"
-            loading={testing}
-            disabled={saving || !serverId}
-            icon={<ShieldCheck className="size-4" />}
-            onClick={() => void handleTest()}
-          >
-            {t("common.testEnvironment")}
-          </Button>
-          <Button
-            loading={saving}
-            disabled={testing}
-            icon={<Save className="size-4" />}
-            onClick={() => void handleSave()}
-          >
-            {t("common.save")}
-          </Button>
-        </>
+        <ConfigModalFooter
+          onClose={onClose}
+          onSave={() => void handleSave()}
+          onTest={() => void handleTest()}
+          saving={saving}
+          testing={testing}
+          testDisabled={!serverId}
+        />
       }
     >
       <div className="flex flex-col gap-4">
@@ -202,18 +198,13 @@ export function BackupConfigModal({
         </Field>
 
         <Field label={t("backup.server")} required>
-          <Select
+          <ServerSelect
             value={serverId}
-            onChange={(event) => setServerId(event.target.value)}
-            disabled={servers.length === 0 || saving}
-          >
-            {servers.length === 0 && <option value="">{t("backup.noServers")}</option>}
-            {servers.map((server) => (
-              <option key={server.id} value={server.id}>
-                {server.name} ({server.username}@{server.host})
-              </option>
-            ))}
-          </Select>
+            onChange={setServerId}
+            servers={servers}
+            disabled={saving}
+            emptyText={t("backup.noServers")}
+          />
         </Field>
 
         <div className="grid grid-cols-2 gap-4">
