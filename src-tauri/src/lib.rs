@@ -92,6 +92,12 @@ pub fn run() {
             commands::servers::kick_server_session,
             commands::servers::enable_server_guard,
             commands::servers::disable_server_guard,
+            commands::nginx::list_nginx_containers,
+            commands::nginx::list_nginx_configs,
+            commands::nginx::read_nginx_config,
+            commands::nginx::save_nginx_config,
+            commands::nginx::delete_nginx_config,
+            commands::nginx::reload_nginx,
             commands::deploy::start_deploy,
             commands::deploy::start_deploy_config,
             commands::deploy::list_deploy_configs,
@@ -144,11 +150,12 @@ pub fn run() {
             if !EXIT_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
                 let state = app_handle.state::<AppState>();
                 let pages_active = state.has_active_pages();
+                let nginx_active = state.has_active_nginx(); // Nginx 是否正在执行
                 let mut deploys = state.take_deploys();
                 // 取消部署后仍在做的远端清理也要纳入退出清理。
                 deploys.extend(state.take_pending_cleanups());
                 let backups = state.take_backups();
-                if deploys.is_empty() && backups.is_empty() && !pages_active {
+                if deploys.is_empty() && backups.is_empty() && !pages_active && !nginx_active {
                     // 没有进行中的任务：正常退出。
                     return;
                 }

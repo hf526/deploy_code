@@ -59,6 +59,19 @@ export function shortPath(path: string, max = 48): string {
   return `…${path.slice(path.length - max + 1)}`;
 }
 
+/** 字节数转展示文案（配置/日志大小等）。 */
+export function humanSize(bytes: number): string {
+  if (!bytes) return "-";
+  const units = ["B", "KB", "MB", "GB"];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
 /**
  * 由本地环境文件路径推导部署目录内的相对路径。
  * 命中仓库根目录时保留子目录（`<repo>/backend/.env` → `backend/.env`），

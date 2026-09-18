@@ -133,7 +133,7 @@ impl BackupEngine {
             .store
             .load_config()
             .map(|config| config.settings.backup_history_limit)
-            .unwrap_or(200);
+            .unwrap_or(200); // 默认保留最近 200 条备份记录
         if let Err(err) = self.store.upsert_backup(&record, limit) {
             logger.error(format!("保存备份记录失败: {err}"));
             record.log = logger.joined();
@@ -260,6 +260,7 @@ impl BackupEngine {
 
     /// 上传脚本到服务器（上传前先以 0600 创建，上传后 0700）。
     async fn put_script(&self, client: &SshClient, remote: &str, script: &str) -> Result<()> {
+        // 从远程路径提取文件名（如 /tmp/backup.sh → backup.sh），失败时默认用 "backup.sh"
         let local = self
             .store
             .prepare_temp_file(remote.rsplit('/').next().unwrap_or("backup.sh"))?;
@@ -940,6 +941,7 @@ fn build_backup_script(
         &[
             ("__ID__", record.id.clone()),
             ("__TARGET_URL__", shell_quote(target_url)),
+            // 目标密码可选：配置中未设置时为空字符串（不影响执行）
             (
                 "__TARGET_PASSWORD__",
                 shell_quote(target_password.unwrap_or("")),
@@ -964,6 +966,7 @@ fn build_test_script(
         TEST_TEMPLATE,
         &[
             ("__TARGET_URL__", shell_quote(target_url)),
+            // 目标密码可选：配置中未设置时为空字符串（不影响执行）
             (
                 "__TARGET_PASSWORD__",
                 shell_quote(target_password.unwrap_or("")),

@@ -39,6 +39,7 @@ pub enum ClaimKind {
     Deploy,
     Backup,
     Pages,
+    Nginx,
 }
 
 impl ClaimKind {
@@ -47,6 +48,7 @@ impl ClaimKind {
             ClaimKind::Deploy => state.try_claim_deploy(),
             ClaimKind::Backup => state.try_claim_backup(),
             ClaimKind::Pages => state.try_claim_pages(),
+            ClaimKind::Nginx => state.try_claim_nginx(),
         }
     }
 
@@ -55,11 +57,14 @@ impl ClaimKind {
             ClaimKind::Deploy => state.release_deploy_claim(),
             ClaimKind::Backup => state.release_backup_claim(),
             ClaimKind::Pages => state.release_pages_claim(),
+            ClaimKind::Nginx => state.release_nginx_claim(),
         }
     }
 }
 
 /// 任务抢占守卫：无论 prepare 失败、任务 panic 还是正常结束，都会释放抢占标记。
+/// 
+/// RAII 模式保证：**任何退出路径**（成功/取消/panic）都能触发 Drop，自动释放锁
 pub struct ClaimGuard {
     app: AppHandle,
     kind: ClaimKind,
@@ -67,6 +72,11 @@ pub struct ClaimGuard {
 
 impl ClaimGuard {
     /// 尝试抢占指定任务；已有同类任务在进行时返回 `Ok(None)`。
+    /// 
+    /// 返回值设计：
+    /// - `Ok(Some(guard))` → 抢占成功，调用方持有 guard，Drop 时自动释放
+    /// - `Ok(None)` → 抢占失败，返回 None，**不需要 Drop**
+    /// - 调用方只需 `guard?`，无论成功失败都会释放
     pub fn acquire(app: &AppHandle, kind: ClaimKind) -> Result<Option<Self>> {
         let state = app.state::<AppState>();
         if !kind.try_claim(&state)? {
@@ -82,7 +92,7 @@ impl ClaimGuard {
 impl Drop for ClaimGuard {
     fn drop(&mut self) {
         let state = self.app.state::<AppState>();
-        self.kind.release(&state);
+        self.kind.release(&state); // 确保独占标记被释放
     }
 }
 
@@ -161,12 +171,16 @@ pub struct AppState {
     backup_claim: AtomicBool,
     /// Pages 部署抢占标记：同一时间只允许一个 Pages 部署。
     pages_claim: AtomicBool,
+    /// Nginx 操作抢占标记：同一时间只允许一个 Nginx 操作（避免并发修改配置）。
+    nginx_claim: AtomicBool,
     /// 部署跨进程任务锁（持有时禁止 CLI 等其他进程执行部署）。
     deploy_lock: Mutex<Option<TaskLock>>,
     /// 备份跨进程任务锁。
     backup_lock: Mutex<Option<TaskLock>>,
     /// Pages 跨进程任务锁。
     pages_lock: Mutex<Option<TaskLock>>,
+    /// Nginx 跨进程任务锁。
+    nginx_lock: Mutex<Option<TaskLock>>,
 }
 
 impl AppState {
@@ -180,13 +194,21 @@ impl AppState {
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),
+            nginx_claim: AtomicBool::new(false),
             deploy_lock: Mutex::new(None),
             backup_lock: Mutex::new(None),
             pages_lock: Mutex::new(None),
+            nginx_lock: Mutex::new(None),
         }
     }
 
-    /// 尝试占用任务名额：先赢下进程内原子标记，再尝试获取跨进程文件锁。
+    /// 尝试占用任务名额：**双重保护机制**
+    /// 
+    /// 1️⃣ **进程内互斥**: `AtomicBool.compare_exchange` 确保同一进程只允许一个任务抢占成功
+    /// 2️⃣ **跨进程互斥**: `try_task_lock` 文件锁确保不同进程（GUI/CLI）不会同时执行同类任务
+    /// 
+    /// ⚠️ 注意：两步操作不是原子的，但设计如此——先快速失败（原子标记），再精确控制（文件锁）
+    /// 如果原子标记成功但文件锁失败，说明有其他进程抢到了锁，此时必须释放原子标记让出机会
     fn try_claim(
         &self,
         claimed: &AtomicBool,
@@ -197,10 +219,11 @@ impl AppState {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_err()
         {
-            return Ok(false);
+            return Ok(false); // 进程内已有任务在进行，快速失败
         }
         match self.store.try_task_lock(name) {
             Ok(Some(lock)) => {
+                // Mutex poison 处理：持有锁的线程 panic 时返回 poisoned，新线程接管锁并清理
                 let mut slot = held
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -261,6 +284,20 @@ impl AppState {
         self.release_claim(&self.pages_claim, &self.pages_lock);
     }
 
+    /// 尝试占用 Nginx 操作名额。
+    pub fn try_claim_nginx(&self) -> Result<bool> {
+        self.try_claim(&self.nginx_claim, &self.nginx_lock, "nginx")
+    }
+
+    pub fn release_nginx_claim(&self) {
+        self.release_claim(&self.nginx_claim, &self.nginx_lock);
+    }
+
+    /// Nginx 任务是否仍在进行（退出时用于判断是否需要推迟退出并清理子进程）。
+    pub fn has_active_nginx(&self) -> bool {
+        self.nginx_claim.load(Ordering::SeqCst)
+    }
+
     /// Pages 任务是否仍在进行（退出时用于判断是否需要推迟退出并清理子进程）。
     pub fn has_active_pages(&self) -> bool {
         self.pages_claim.load(Ordering::SeqCst)
@@ -271,6 +308,7 @@ impl AppState {
     }
 
     pub fn track_deploy(&self, record_id: &str, deploy: ActiveDeploy) {
+        // Mutex poison 处理：同 try_claim，poison 表示持有锁的线程 panic，新线程接管清理
         self.active_deploys
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -322,6 +360,7 @@ impl AppState {
 
     /// 取出并清空「取消清理中」的部署列表（退出时与 active_deploys 一起清理）。
     pub fn take_pending_cleanups(&self) -> Vec<(String, ActiveDeploy)> {
+        // Mutex poison 处理：同 track_deploy，poison 表示持有锁的线程 panic，新线程接管清理
         self.pending_cleanups
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

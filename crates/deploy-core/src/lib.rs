@@ -8,6 +8,7 @@
 //! - [`ssh`]：SSH 连接、命令执行与 SFTP 上传
 //! - [`security`]：服务器安全检查（登录日志 / sshd 配置 / 防火墙）
 //! - [`engine`]：部署流程编排
+//! - [`nginx`]：服务器 Nginx 容器配置管理
 //! - [`release`]：原子发布（releases + current 软链）
 //! - [`backup`]：数据库备份（服务器 PG -> Supabase）
 //! - [`pages`]：Cloudflare Pages 部署（wrangler）
@@ -20,6 +21,7 @@ pub mod engine;
 pub mod error;
 pub mod git;
 pub mod models;
+pub mod nginx;
 pub mod pages;
 pub mod process;
 pub mod release;
@@ -34,6 +36,7 @@ pub use engine::{repo_info, DeployEngine, EventSender};
 pub use error::{CoreError, Result};
 pub use git::Git;
 pub use models::*;
+pub use nginx::{NginxConfigContent, NginxConfigFile, NginxContainerInfo, NginxEngine};
 pub use pages::{PagesEngine, PagesEventSender, PreparedPagesDeploy};
 pub use security::SecurityReport;
 pub use store::Store;

@@ -17,7 +17,10 @@ export type TaskEvent<TRecord extends TaskRecord> =
 export interface TaskEventSink<TRecord extends TaskRecord> {
   getLive: () => LiveTask<TRecord> | null;
   setLive: (live: LiveTask<TRecord>) => void;
-  /** 重载后事件先到时，从持久化记录里找正在运行的任务 id 兜底。 */
+  /** 
+   * 重载后事件先到时，从持久化记录里找正在运行的任务 id 兜底。
+   * ⚠️ 注意：理论上同一时间只有一个 running 任务（抢占机制），所以直接返回第一个匹配的即可
+   */
   findRunningId: () => string;
   /** 任务结束：刷新对应记录列表并弹出结果提示。 */
   announce: (record: TRecord) => void;
@@ -40,6 +43,7 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
 
   if (!live) {
     // 刷新/重载后 live 为空，但后台任务仍在跑：按事件补建 live 状态，后续日志/进度才能继续接收。
+    // ⚠️ 注意：此时 event 可能还没携带完整 record，所以 log/progress 事件用 findRunningId() 兜底
     if (event.type === "started") {
       setLive(runningTask(event.recordId));
       return;

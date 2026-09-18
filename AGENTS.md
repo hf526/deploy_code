@@ -57,7 +57,7 @@ crates/deploy-cli/           CLI：与 GUI 复用 deploy-core，同源同行为
 
 ## 类型同步规则（Rust ↔ TypeScript）
 
-Rust 模型与 TS 类型**手工镜像，没有代码生成**；改一侧必须同步另一侧：
+⚠️ **重要**: Rust 模型与 TS 类型**手工镜像，没有代码生成**；改一侧必须同步另一侧！
 
 | Rust 源 | TS 镜像 |
 | --- | --- |
@@ -73,6 +73,7 @@ Rust 模型与 TS 类型**手工镜像，没有代码生成**；改一侧必须�
 - 可选字段：Rust `Option<T>` ↔ TS `T | null`（不是 `undefined`）。
 - 枚举值：Rust `DeployStatus::Success` ↔ TS `"success"`（camelCase 序列化）。
 - 新增字段三步走：`models.rs` → `types.ts` → 消费处（含 `store.ts`/页面）；漏改编译器不一定报错（`api.ts` 泛型仅约束返回类型）。
+- **AI 注意**: 修改 Rust 模型后，务必检查 TS 类型是否同步更新，不要依赖 IDE 提示（可能不报错但运行时类型错误）。
 
 ## 编码约定
 
@@ -96,7 +97,7 @@ Rust 模型与 TS 类型**手工镜像，没有代码生成**；改一侧必须�
 - 长任务（部署/备份/Pages）的事件归约与重载对账在 `src/lib/liveTask.ts`（`applyTaskEvent` / `reconcileLiveTask`），新增同类任务直接复用，不要在 store 里另写一遍。
 - 页面私有子组件放同目录子文件夹（如 `src/pages/repoDetail/`、`src/pages/deploy/`），页面级状态逻辑优先抽成同目录 `useXxx.ts` hook（参考 `repoDetail/useFileFilter.ts`）。
 - 新增纯逻辑（如 `src/lib/*.ts`）时补同名 `*.test.ts`（vitest，node 环境；依赖 i18n/api 的模块在测试里 `vi.mock`），组件层不做单测、靠 tsc + 手工验证。
-- 所有用户可见文案必须走 `t("...")`，并**同时**在 `src/locales/zh-CN.json` 与 `en-US.json` 增加同名 key（两边必须 1:1，当前 589 对全对齐）。状态文案/尺寸/耗时格式化用 `src/lib/utils.ts`。
+- 所有用户可见文案必须走 `t("...")`，并**同时**在 `src/locales/zh-CN.json` 与 `en-US.json` 增加同名 key（两边必须 1:1，当前 625 对全对齐）。状态文案/尺寸/耗时格式化用 `src/lib/utils.ts`。
 - TS 严格模式全开（`strict`、`noUnusedLocals`、`noUnusedParameters`），不允许 `any`/`@ts-ignore`；类型不匹配时改类型而不是断言。
 - 导入用相对路径（无 `@/` 别名）；组件文件 PascalCase，工具/状态文件 camelCase。
 
@@ -110,8 +111,9 @@ Rust 模型与 TS 类型**手工镜像，没有代码生成**；改一侧必须�
 ## 已知限制与坑
 
 - **部署 / 备份 / Pages 都是「列表 + 弹窗」配置模型**：服务器部署配置存 `AppConfig.deploy_configs`（`DeployConfig`，deploy-core `Store::save_deploy_config` / `delete_deploy_config`），备份配置存 `AppConfig.backup_configs`，Pages 配置仍按仓库存在 `RepoConfig.pages`（部署页只做列表展示，`list_pages_configs` / `delete_pages_config` 是唯一新增入口）。新增同类配置时沿用该模式，不要回到「表单常驻页面」。
+- **Nginx 模块不落盘配置**：`crates/deploy-core/src/nginx.rs` 直接通过 SSH 在服务器上 `docker ps/exec/cp` 管理容器内 `*.conf`（默认 `/etc/nginx/conf.d`），保存 / 删除前跑 `nginx -t`，失败自动回滚；短操作不占任务锁、不发事件。新增容器侧操作时沿用 `NginxEngine` 与 `validate_container/validate_dir/validate_file_name`，并使用 `shell_quote`。
 - **仍然偏大的文件**：`crates/deploy-core/src/git/mod.rs`（~1300 行，含测试）、`src/pages/RepoDetailPage.tsx`（~1130 行，主组件 hook 仍多）、`backup.rs`（~1600 行）、`engine.rs`（~1340 行）、`pages.rs`（~1300 行）、`src/pages/DeployPage.tsx`（~770 行）。修改前先定位到具体函数，尽量复用已有子组件/hook；`RepoDetailPage` 的编辑器与搜索已拆到 `src/pages/repoDetail/`，`DeployPage` 的部署 / Pages 弹窗在 `src/pages/deploy/`，备份弹窗在 `src/pages/backup/`。
-- **测试覆盖范围**：前端只有 `src/lib/*.test.ts`（vitest：liveTask/utils/graph/store，39 个用例），组件与 Tauri 交互仍靠 `tsc` + 手工验证；Rust 单测集中在 deploy-core 与 src-tauri 少量模块。无 lint/CI。
+- **测试覆盖范围**：前端只有 `src/lib/*.test.ts`（vitest：liveTask/utils/graph/store，44 个用例），组件与 Tauri 交互仍靠 `tsc` + 手工验证；Rust 单测集中在 deploy-core 与 src-tauri 少量模块。无 lint/CI。
 - **无图标/文案自动校验**：i18n key 漏加不会报错，只在界面显示原始 key，注意自查。
 - **Git 历史信息量低**（提交信息多为「优化」），不要依赖 `git blame` 理解设计，以本文件与代码注释为准。
 - `.cargo/config.toml` 的 `rustflags = ["--cfg", "deploycode"]` 是为绕过 360 误拦截，删除会导致构建路径回归被封锁目录。

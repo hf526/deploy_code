@@ -15,6 +15,9 @@ import type {
   FileEntry,
   GraphCommit,
   ImportSummary,
+  NginxConfigContent,
+  NginxConfigFile,
+  NginxContainerInfo,
   PagesConfig,
   PagesConfigEntry,
   PagesDeployRecord,
@@ -123,6 +126,25 @@ export const api = {
     invoke<string>("enable_server_guard", { server, threshold, windowMins }),
   disableServerGuard: (server: ServerConfig) =>
     invoke<string>("disable_server_guard", { server }),
+
+  // Nginx
+  listNginxContainers: (serverId: string) =>
+    invoke<NginxContainerInfo[]>("list_nginx_containers", { serverId }),
+  listNginxConfigs: (serverId: string, container: string, dir: string) =>
+    invoke<NginxConfigFile[]>("list_nginx_configs", { serverId, container, dir }),
+  readNginxConfig: (serverId: string, container: string, dir: string, name: string) =>
+    invoke<NginxConfigContent>("read_nginx_config", { serverId, container, dir, name }),
+  saveNginxConfig: (args: {
+    serverId: string;
+    container: string;
+    dir: string;
+    name: string;
+    content: string;
+  }) => invoke<string>("save_nginx_config", args),
+  deleteNginxConfig: (serverId: string, container: string, dir: string, name: string) =>
+    invoke<string>("delete_nginx_config", { serverId, container, dir, name }),
+  reloadNginx: (serverId: string, container: string) =>
+    invoke<string>("reload_nginx", { serverId, container }),
 
   // 部署
   startDeploy: (request: DeployRequest) => invoke<string>("start_deploy", { request }),
