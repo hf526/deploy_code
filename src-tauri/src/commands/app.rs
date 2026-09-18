@@ -1,8 +1,18 @@
-use deploy_core::models::{BackupConfig, BackupTarget, Settings};
+use deploy_core::models::{BackupConfig, BackupTarget, ImportSummary, Settings};
 use deploy_core::{CoreError, Result};
 use tauri::State;
 
 use crate::state::AppState;
+
+#[tauri::command(async)]
+pub fn export_config(state: State<AppState>) -> Result<String> {
+    state.store.export_config()
+}
+
+#[tauri::command(async)]
+pub fn import_config(state: State<AppState>, json_str: String) -> Result<ImportSummary> {
+    state.store.import_config(&json_str)
+}
 
 #[cfg(target_os = "windows")]
 const AUTOSTART_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";

@@ -7,7 +7,7 @@ use directories::ProjectDirs;
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployConfig, DeployRecord,
-    DeployStatus, PagesDeployRecord, RepoConfig, ServerConfig,
+    DeployStatus, ExportData, ImportSummary, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -245,6 +245,113 @@ impl Store {
         write_records::<PagesDeployRecord>(&self.pages_path(), &[])
     }
 
+    /// 导出配置（JSON 格式，敏感字段已脱敏）。
+    pub fn export_config(&self) -> Result<String> {
+        let config = self.load_config()?;
+        let export_data = ExportData::new(&config);
+        serde_json::to_string_pretty(&export_data).map_err(CoreError::Serde)
+    }
+
+    /// 导入配置（合并模式：同 ID 覆盖，新 ID 追加）。
+    pub fn import_config(&self, json_str: &str) -> Result<ImportSummary> {
+        let export_data: ExportData = serde_json::from_str(json_str)
+            .map_err(|e| CoreError::config(format!("配置文件格式错误：{}", e)))?;
+
+        // 版本检查
+        if export_data.version != "1.0" {
+            return Err(CoreError::config(format!(
+                "不支持的配置文件版本：{}",
+                export_data.version
+            )));
+        }
+
+        // 记录导入前的数量
+        let config_before = self.load_config()?;
+        let initial_count = (
+            config_before.servers.len(),
+            config_before.repos.len(),
+            config_before.backup_targets.len(),
+            config_before.deploy_configs.len(),
+            config_before.backup_configs.len(),
+            config_before.pages_configs.len(),
+        );
+
+        self.mutate_config(|config| {
+            // 服务器
+            for server in &export_data.servers {
+                match config.servers.iter_mut().find(|s| s.id == server.id) {
+                    Some(existing) => *existing = server.clone(),
+                    None => config.servers.push(server.clone()),
+                }
+            }
+
+            // 仓库
+            for repo in &export_data.repos {
+                match config.repos.iter_mut().find(|r| r.id == repo.id) {
+                    Some(existing) => *existing = repo.clone(),
+                    None => config.repos.push(repo.clone()),
+                }
+            }
+
+            // 备份目标
+            for target in &export_data.backup_targets {
+                match config.backup_targets.iter_mut().find(|t| t.id == target.id) {
+                    Some(existing) => *existing = target.clone(),
+                    None => config.backup_targets.push(target.clone()),
+                }
+            }
+
+            // 部署配置
+            for deploy_config in &export_data.deploy_configs {
+                match config.deploy_configs.iter_mut().find(|c| c.id == deploy_config.id) {
+                    Some(existing) => *existing = deploy_config.clone(),
+                    None => config.deploy_configs.push(deploy_config.clone()),
+                }
+            }
+
+            // 备份配置
+            for backup_config in &export_data.backup_configs {
+                match config.backup_configs.iter_mut().find(|c| c.id == backup_config.id) {
+                    Some(existing) => *existing = backup_config.clone(),
+                    None => config.backup_configs.push(backup_config.clone()),
+                }
+            }
+
+            // Pages 配置
+            for pages_config in &export_data.pages_configs {
+                match config.pages_configs.iter_mut().find(|c| c.id == pages_config.id) {
+                    Some(existing) => *existing = pages_config.clone(),
+                    None => config.pages_configs.push(pages_config.clone()),
+                }
+            }
+
+            // 设置（直接覆盖）
+            config.settings = export_data.settings.clone();
+
+            Ok(())
+        })?;
+
+        // 计算新增数量（导入后 - 导入前）
+        let config_after = self.load_config()?;
+        let final_count = (
+            config_after.servers.len(),
+            config_after.repos.len(),
+            config_after.backup_targets.len(),
+            config_after.deploy_configs.len(),
+            config_after.backup_configs.len(),
+            config_after.pages_configs.len(),
+        );
+
+        Ok(ImportSummary {
+            servers_imported: final_count.0.saturating_sub(initial_count.0),
+            repos_imported: final_count.1.saturating_sub(initial_count.1),
+            backup_targets_imported: final_count.2.saturating_sub(initial_count.2),
+            deploy_configs_imported: final_count.3.saturating_sub(initial_count.3),
+            backup_configs_imported: final_count.4.saturating_sub(initial_count.4),
+            pages_configs_imported: final_count.5.saturating_sub(initial_count.5),
+        })
+    }
+
     /// 启动时把上次异常退出（崩溃/强杀）遗留的 Running 记录收敛为失败，
     /// 避免历史里永远显示"进行中"且无法重新部署。
     /// 全程持有写守卫，防止与并发写（如 CLI 完成任务）互相覆盖。
@@ -414,6 +521,102 @@ impl Store {
             }
             app.deploy_configs.retain(|item| !removed.contains(&item.id));
             Ok(true)
+        })
+    }
+
+    /// 列出所有 Pages 配置条目。
+    pub fn list_pages_configs(config: &AppConfig) -> Vec<&PagesConfigEntry> {
+        config.pages_configs.iter().collect()
+    }
+
+    /// 保存一条 Pages 配置（新增或更新）。
+    pub fn save_pages_config(config: &mut AppConfig, entry: PagesConfigEntry) -> Result<()> {
+        let mut entry = entry;
+        entry.name = entry.name.trim().to_string();
+        if entry.name.is_empty() {
+            return Err(CoreError::config("Pages 配置名称不能为空"));
+        }
+        entry.repo_id = entry.repo_id.trim().to_string();
+        entry.repo_name = entry.repo_name.trim().to_string();
+        entry.config = entry.config.normalize();
+
+        // 校验仓库存在
+        if config.repos.iter().all(|r| r.id != entry.repo_id) {
+            return Err(CoreError::not_found(format!(
+                "仓库不存在：{}",
+                entry.repo_id
+            )));
+        }
+
+        // 名称唯一性校验（同一仓库内）
+        if config
+            .pages_configs
+            .iter()
+            .any(|item| item.id != entry.id && item.repo_id == entry.repo_id && item.name == entry.name)
+        {
+            return Err(CoreError::config(format!(
+                "该仓库下已存在同名 Pages 配置：{}",
+                entry.name
+            )));
+        }
+
+        match config.pages_configs.iter_mut().find(|e| e.id == entry.id) {
+            Some(existing) => *existing = entry,
+            None => config.pages_configs.push(entry),
+        }
+        Ok(())
+    }
+
+    /// 删除一条 Pages 配置（按 id 精确删除）。
+    pub fn delete_pages_config(config: &mut AppConfig, id: &str) -> Result<bool> {
+        let initial_count = config.pages_configs.len();
+        config.pages_configs.retain(|e| e.id != id);
+        if config.pages_configs.len() == initial_count {
+            return Ok(false);
+        }
+        // 如果该仓库的默认 Pages 配置被删除，清空默认引用
+        for repo in &mut config.repos {
+            if repo.default_pages_config_id.as_ref() == Some(&id.to_string()) {
+                repo.default_pages_config_id = None;
+            }
+        }
+        Ok(true)
+    }
+
+    /// 获取仓库的默认 Pages 配置（通过 default_pages_config_id 查找）。
+    pub fn get_repo_default_pages<'a>(config: &'a AppConfig, repo_id: &str) -> Option<&'a PagesConfigEntry> {
+        let repo = config.repos.iter().find(|r| r.id == repo_id)?;
+        let id = repo.default_pages_config_id.as_ref()?;
+        config.pages_configs.iter().find(|e| e.id == *id)
+    }
+
+    /// 启动时迁移旧版 repo.pages 到 pages_configs 列表（只执行一次）。
+    pub fn migrate_pages_configs(&self) -> Result<usize> {
+        if self.load_config()?.pages_configs_migrated {
+            return Ok(0);
+        }
+        self.mutate_config(|config| {
+            if config.pages_configs_migrated {
+                return Ok(0);
+            }
+            let mut additions: Vec<PagesConfigEntry> = Vec::new();
+            for repo in &mut config.repos {
+                if let Some(pages_config) = repo.pages.take() {
+                    let entry = PagesConfigEntry {
+                        id: new_id(),
+                        name: "default".to_string(),
+                        repo_id: repo.id.clone(),
+                        repo_name: repo.name.clone(),
+                        config: pages_config,
+                        created_at: now_string(),
+                    };
+                    additions.push(entry.clone());
+                    repo.default_pages_config_id = Some(entry.id);
+                }
+            }
+            config.pages_configs.extend(additions.clone());
+            config.pages_configs_migrated = true;
+            Ok(additions.len())
         })
     }
 

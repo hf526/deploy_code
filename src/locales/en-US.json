@@ -438,6 +438,23 @@
       "description": "Where settings, deploy history and temporary files are stored",
       "openDir": "Open Directory"
     },
+    "configBackup": {
+      "title": "Configuration Backup",
+      "description": "Export/import all configurations (sensitive data redacted, credentials need to be added manually)",
+      "export": "Export Configuration",
+      "import": "Import Configuration",
+      "selectFile": "Select Configuration File",
+      "confirmImport": "Confirm Import",
+      "summary": {
+        "title": "Import Summary",
+        "servers": "Servers: {{count}}",
+        "repos": "Repos: {{count}}",
+        "backupTargets": "Backup Targets: {{count}}",
+        "deployConfigs": "Deploy Configs: {{count}}",
+        "backupConfigs": "Backup Configs: {{count}}",
+        "pagesConfigs": "Pages Configs: {{count}}"
+      }
+    },
     "saved": "Settings saved",
     "targetsSaved": "Backup targets saved",
     "legacyConverted": "Legacy connection string converted to a backup target"

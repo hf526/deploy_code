@@ -438,6 +438,23 @@
       "description": "配置、部署记录与临时文件存放位置",
       "openDir": "打开目录"
     },
+    "configBackup": {
+      "title": "配置备份",
+      "description": "导出/导入所有配置（敏感信息已脱敏，需手动补充凭据）",
+      "export": "导出配置",
+      "import": "导入配置",
+      "selectFile": "选择配置文件",
+      "confirmImport": "确认导入",
+      "summary": {
+        "title": "导入统计",
+        "servers": "服务器：{{count}}",
+        "repos": "仓库：{{count}}",
+        "backupTargets": "备份目标：{{count}}",
+        "deployConfigs": "部署配置：{{count}}",
+        "backupConfigs": "备份配置：{{count}}",
+        "pagesConfigs": "Pages 配置：{{count}}"
+      }
+    },
     "saved": "设置已保存",
     "targetsSaved": "备份目标已保存",
     "legacyConverted": "已将旧连接串转为备份目标"

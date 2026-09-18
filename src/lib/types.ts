@@ -59,6 +59,7 @@ export interface RepoInfo {
   changeCount: number;
   defaultServerId: string | null;
   defaultTargetDir: string;
+  defaultPagesConfigId: string | null;
   envFiles: EnvFileConfig[];
 }
 
@@ -231,6 +232,16 @@ export interface Settings {
   scheduledBackupConfigId: string | null;
 }
 
+/** 导入配置的统计信息。 */
+export interface ImportSummary {
+  serversImported: number;
+  reposImported: number;
+  backupTargetsImported: number;
+  deployConfigsImported: number;
+  backupConfigsImported: number;
+  pagesConfigsImported: number;
+}
+
 /** 定时任务通知（如定时备份启动/失败）。 */
 export interface SchedulerNotice {
   kind: "started" | "noConfig" | "failed";
@@ -305,11 +316,14 @@ export interface PagesConfig {
   publishBranch: string;
 }
 
-/** 列表展示用的 Pages 配置条目（Pages 配置按仓库保存，一仓库一份）。 */
+/** 列表展示用的 Pages 配置条目（独立管理，可复用）。 */
 export interface PagesConfigEntry {
+  id: string;
+  name: string;
   repoId: string;
   repoName: string;
   config: PagesConfig;
+  createdAt: string;
 }
 
 export interface PagesDeployRecord {

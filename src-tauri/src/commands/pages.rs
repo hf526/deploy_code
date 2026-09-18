@@ -86,88 +86,6 @@ pub fn clear_pages_records(state: State<AppState>) -> Result<()> {
     state.store.clear_pages_records()
 }
 
-/// 列出所有已保存的 Pages 配置（按仓库一条，供部署页统一列表展示）。
-#[tauri::command(async)]
-pub fn list_pages_configs(state: State<AppState>) -> Result<Vec<PagesConfigEntry>> {
-    let config = state.store.load_config()?;
-    Ok(config
-        .repos
-        .iter()
-        .filter_map(|repo| {
-            repo.pages.clone().map(|pages| PagesConfigEntry {
-                repo_id: repo.id.clone(),
-                repo_name: repo.name.clone(),
-                config: pages,
-            })
-        })
-        .collect())
-}
-
-/// 删除某个仓库的 Pages 配置（已有的 Pages 部署记录保留）。
-#[tauri::command(async)]
-pub fn delete_pages_config(state: State<AppState>, repo_id: String) -> Result<bool> {
-    state.store.mutate_config(|app| {
-        let repo = app
-            .repos
-            .iter_mut()
-            .find(|repo| repo.id == repo_id)
-            .ok_or_else(|| CoreError::not_found(format!("仓库不存在: {repo_id}")))?;
-        Ok(repo.pages.take().is_some())
-    })
-}
-
-#[tauri::command(async)]
-pub fn get_pages_config(state: State<AppState>, repo_id: String) -> Result<PagesConfig> {
-    let config = state.store.load_config()?;
-    let repo = Store::find_repo(&config, &repo_id)?;
-    Ok(repo.pages.clone().unwrap_or_default())
-}
-
-#[tauri::command(async)]
-pub fn save_pages_config(
-    state: State<AppState>,
-    repo_id: String,
-    config: PagesConfig,
-) -> Result<PagesConfig> {
-    let normalized = config.normalize();
-    if normalized.provider != "cloudflare" && normalized.provider != "github" {
-        return Err(CoreError::config(
-            "不支持的 Pages 平台（可选 cloudflare / github）",
-        ));
-    }
-    if normalized.provider == "github" {
-        if normalized.publish_branch.starts_with('-')
-            || normalized
-                .publish_branch
-                .chars()
-                .any(|c| c.is_whitespace() || c.is_control())
-        {
-            return Err(CoreError::config("发布分支不能包含空白字符或以 - 开头"));
-        }
-    } else if normalized
-        .project_name
-        .chars()
-        .any(|c| c.is_whitespace() || c.is_control())
-    {
-        return Err(CoreError::config("项目名不能包含空白字符"));
-    }
-
-    state.store.mutate_config(|app| {
-        let repo = app
-            .repos
-            .iter_mut()
-            .find(|repo| repo.id == repo_id)
-            .ok_or_else(|| CoreError::not_found(format!("仓库不存在: {repo_id}")))?;
-        // Cloudflare 以项目名为准判断是否启用；GitHub 无项目名，保存配置即视为启用。
-        repo.pages = if normalized.provider == "github" || !normalized.project_name.is_empty() {
-            Some(normalized.clone())
-        } else {
-            None
-        };
-        Ok(())
-    })?;
-    Ok(normalized)
-}
 
 /// 检查 wrangler / Token / Account 是否可用。
 #[tauri::command]
@@ -181,3 +99,56 @@ pub async fn test_pages(
         .await
         .map_err(|e| CoreError::Process(format!("检查任务异常: {e}")))?
 }
+/// 列出所有已保存的 Pages 配置（独立列表，供部署页统一展示）。
+#[tauri::command(async)]
+pub fn list_pages_configs(state: State<AppState>) -> Result<Vec<PagesConfigEntry>> {
+    let config = state.store.load_config()?;
+    Ok(Store::list_pages_configs(&config).into_iter().cloned().collect())
+}
+
+/// 保存一条 Pages 配置（新增或更新）。
+#[tauri::command(async)]
+pub fn save_pages_config(
+    state: State<AppState>,
+    entry: PagesConfigEntry,
+) -> Result<PagesConfigEntry> {
+    let normalized = entry.config.clone().normalize();
+    if normalized.provider != "cloudflare" && normalized.provider != "github" {
+        return Err(CoreError::config(
+            "不支持的 Pages 平台（可选 cloudflare / github）",
+        ));
+    }
+    if normalized.provider == "github" {
+        // 无法在保存时验证远端，推迟到部署时检查
+        // let remote = state.store.load_config()?.repos.iter()
+        //     .find(|r| r.id == entry.repo_id)
+        //     .ok_or_else(|| CoreError::not_found("仓库不存在"))?
+        //     .remote
+        //     .clone();
+        // if remote.as_ref().map(|r| !r.contains("github.com")).unwrap_or(true) {
+        //     return Err(CoreError::config("GitHub Pages 要求仓库远端为 GitHub 地址"));
+        // }
+    }
+    state.store.mutate_config(|app| Store::save_pages_config(app, entry.clone()))?;
+    Ok(state.store.load_config()?.pages_configs.iter()
+        .find(|e| e.id == entry.id)
+        .unwrap()
+        .clone())
+}
+
+/// 删除一条 Pages 配置（按 id）。
+#[tauri::command(async)]
+pub fn delete_pages_config(state: State<AppState>, id: String) -> Result<bool> {
+    state.store.mutate_config(|app| Store::delete_pages_config(app, &id))
+}
+
+/// 获取仓库的默认 Pages 配置。
+#[tauri::command(async)]
+pub fn get_repo_default_pages_config(
+    state: State<AppState>,
+    repo_id: String,
+) -> Result<Option<PagesConfigEntry>> {
+    let config = state.store.load_config()?;
+    Ok(Store::get_repo_default_pages(&config, &repo_id).cloned())
+}
+

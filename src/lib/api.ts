@@ -14,6 +14,7 @@ import type {
   FileContent,
   FileEntry,
   GraphCommit,
+  ImportSummary,
   PagesConfig,
   PagesConfigEntry,
   PagesDeployRecord,
@@ -36,6 +37,8 @@ export const api = {
   getDataDir: () => invoke<string>("get_data_dir"),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
+  exportConfig: () => invoke<string>("export_config"),
+  importConfig: (jsonStr: string) => invoke<ImportSummary>("import_config", { jsonStr }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
@@ -175,4 +178,9 @@ export const api = {
   deletePagesConfig: (repoId: string) => invoke<boolean>("delete_pages_config", { repoId }),
   testPages: (repoId: string, config?: PagesConfig) =>
     invoke<string>("test_pages", { repoId, config }),
+  // 新的 Pages 配置 API（列表化）
+  savePagesConfigEntry: (entry: PagesConfigEntry) =>
+    invoke<PagesConfigEntry>("save_pages_config", { entry }),
+  deletePagesConfigById: (id: string) => invoke<boolean>("delete_pages_config", { id }),
+  getRepoDefaultPagesConfig: (repoId: string) => invoke<PagesConfigEntry | null>("get_repo_default_pages_config", { repoId }),
 };

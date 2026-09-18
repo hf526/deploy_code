@@ -160,13 +160,29 @@ pub struct DeployConfig {
     pub created_at: String,
 }
 
-/// 列表展示用的 Pages 配置条目（Pages 配置按仓库保存，一仓库一份）。
+/// 列表展示用的 Pages 配置条目（独立管理，可复用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PagesConfigEntry {
+    pub id: String,
+    pub name: String,
     pub repo_id: String,
     pub repo_name: String,
     pub config: PagesConfig,
+    pub created_at: String,
+}
+
+impl PagesConfigEntry {
+    pub fn new(repo_id: String, repo_name: String, config: PagesConfig) -> Self {
+        Self {
+            id: new_id(),
+            name: String::new(),
+            repo_id,
+            repo_name,
+            config,
+            created_at: now_string(),
+        }
+    }
 }
 
 /// 部署服务器配置。
@@ -241,9 +257,12 @@ pub struct RepoConfig {
     pub default_server_id: Option<String>,
     #[serde(default)]
     pub default_target_dir: String,
-    /// Cloudflare Pages 部署配置。
-    #[serde(default)]
+    /// [DEPRECATED] 已废弃，改用 pages_configs 列表管理。保留此字段用于向后兼容。
+    #[serde(default, skip_serializing)]
     pub pages: Option<PagesConfig>,
+    /// 默认 Pages 配置 ID（指向 pages_configs 列表中的某一项，为空表示无默认配置）。
+    #[serde(default)]
+    pub default_pages_config_id: Option<String>,
     /// 部署时上传覆盖的环境文件列表。
     #[serde(default)]
     pub env_files: Vec<EnvFileConfig>,
@@ -313,6 +332,7 @@ impl RepoConfig {
             default_server_id: None,
             default_target_dir: String::new(),
             pages: None,
+            default_pages_config_id: None,
             env_files: Vec::new(),
             added_at: now_string(),
         }
@@ -834,6 +854,12 @@ pub struct AppConfig {
     /// 是否已把服务器上旧版的单份 db_backup 迁移为备份配置（只迁移一次）。
     #[serde(default)]
     pub backup_configs_migrated: bool,
+    /// Pages 部署配置列表（独立管理，按仓库分组）。
+    #[serde(default)]
+    pub pages_configs: Vec<PagesConfigEntry>,
+    /// 是否已将旧版 repo.pages 迁移到 pages_configs（只迁移一次）。
+    #[serde(default)]
+    pub pages_configs_migrated: bool,
     #[serde(default)]
     pub settings: Settings,
 }
@@ -855,6 +881,81 @@ pub fn elapsed_ms_since(started_at: &str) -> u64 {
 /// 生成一个新的唯一 ID。
 pub fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
+}
+
+/// 导出配置的数据结构（敏感字段已脱敏）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportData {
+    pub version: String,
+    pub exported_at: String,
+    #[serde(default)]
+    pub servers: Vec<ServerConfig>,
+    #[serde(default)]
+    pub repos: Vec<RepoConfig>,
+    #[serde(default)]
+    pub backup_targets: Vec<BackupTarget>,
+    #[serde(default)]
+    pub deploy_configs: Vec<DeployConfig>,
+    #[serde(default)]
+    pub backup_configs: Vec<BackupConfig>,
+    #[serde(default)]
+    pub pages_configs: Vec<PagesConfigEntry>,
+    #[serde(default)]
+    pub settings: Settings,
+}
+
+/// 导入配置的统计信息。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportSummary {
+    pub servers_imported: usize,
+    pub repos_imported: usize,
+    pub backup_targets_imported: usize,
+    pub deploy_configs_imported: usize,
+    pub backup_configs_imported: usize,
+    pub pages_configs_imported: usize,
+}
+
+impl ExportData {
+    pub fn new(config: &AppConfig) -> Self {
+        // 脱敏：清空敏感字段
+        let mut servers = config.servers.clone();
+        for server in &mut servers {
+            match &mut server.auth {
+                SshAuth::Password { .. } => {
+                    server.auth = SshAuth::Password { password: String::new() };
+                }
+                SshAuth::PrivateKey { key_path: _, passphrase } => {
+                    *passphrase = None;
+                }
+            }
+        }
+
+        let mut repos = config.repos.clone();
+        for repo in &mut repos {
+            for file in &mut repo.env_files {
+                file.local_path = String::new();
+                file.remote_path = String::new();
+            }
+        }
+
+        let mut settings = config.settings.clone();
+        settings.cloudflare_api_token = String::new();
+        settings.cloudflare_account_id = String::new();
+        settings.github_token = String::new();
+
+        Self {
+            version: "1.0".to_string(),
+            exported_at: now_string(),
+            servers,
+            repos,
+            backup_targets: config.backup_targets.clone(),
+            deploy_configs: config.deploy_configs.clone(),
+            backup_configs: config.backup_configs.clone(),
+            pages_configs: config.pages_configs.clone(),
+            settings,
+        }
+    }
 }
 
 #[cfg(test)]

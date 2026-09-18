@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { FolderOpen, Plus, Save, Server, Settings2, Trash2 } from "lucide-react";
+import { FileJson, FolderOpen, Plus, Save, Server, Settings2, Trash2, Upload } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import {
@@ -8,6 +8,7 @@ import {
   Checkbox,
   Field,
   Input,
+  Modal,
   Page,
   SectionTitle,
   Select,
@@ -17,7 +18,7 @@ import { ThemeToggle } from "../components/ThemeToggle";
 import { api } from "../lib/api";
 import { applyLanguage, normalizeLanguagePreference } from "../lib/i18n";
 import { useApp } from "../lib/store";
-import type { BackupTarget, Settings } from "../lib/types";
+import type { BackupTarget, ImportSummary, Settings } from "../lib/types";
 
 export default function SettingsPage() {
   const { t } = useTranslation();
@@ -36,6 +37,9 @@ export default function SettingsPage() {
   const [fromServerOpen, setFromServerOpen] = useState(false);
   const [autostart, setAutostart] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
+  // 配置备份弹窗
+  const [importModalOpen, setImportModalOpen] = useState(false);
+  const [importSummary, setImportSummary] = useState<ImportSummary | null>(null);
   // 开机自启动当前仅 Windows 支持：其它平台不展示该开关。
   const isWindows =
     typeof navigator !== "undefined" && navigator.userAgent.includes("Windows");
@@ -67,6 +71,34 @@ export default function SettingsPage() {
       toast("error", String(error));
     } finally {
       setAutostartBusy(false);
+    }
+  }
+
+  async function handleExportConfig() {
+    try {
+      const json = await api.exportConfig();
+      const blob = new Blob([json], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `deploycode-config-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast("success", t("common.saved"));
+    } catch (error) {
+      toast("error", String(error));
+    }
+  }
+
+  async function handleImportConfig(file: File) {
+    try {
+      const text = await file.text();
+      const summary = await api.importConfig(text);
+      setImportSummary(summary);
+      setImportModalOpen(true);
+      toast("success", t("settings.configBackup.import"));
+    } catch (error) {
+      toast("error", String(error));
     }
   }
 
@@ -550,6 +582,41 @@ export default function SettingsPage() {
 
         <section>
           <SectionTitle
+            title={t("settings.configBackup.title")}
+            description={t("settings.configBackup.description")}
+          />
+          <Card className="flex items-center gap-3 p-5">
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                icon={<FileJson className="size-4" />}
+                onClick={handleExportConfig}
+              >
+                {t("settings.configBackup.export")}
+              </Button>
+              <label className="cursor-pointer">
+                <input
+                  type="file"
+                  accept=".json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) {
+                      void handleImportConfig(file);
+                      e.target.value = "";
+                    }
+                  }}
+                />
+                <Button variant="secondary" icon={<Upload className="size-4" />}>
+                  {t("settings.configBackup.import")}
+                </Button>
+              </label>
+            </div>
+          </Card>
+        </section>
+
+        <section>
+          <SectionTitle
             title={t("settings.dataDir.title")}
             description={t("settings.dataDir.description")}
           />
@@ -575,6 +642,45 @@ export default function SettingsPage() {
         onClose={() => setFromServerOpen(false)}
         onAdd={handleAddTargetFromServer}
       />
+
+      {importSummary && (
+        <Modal
+          title={t("settings.configBackup.confirmImport")}
+          open={importModalOpen}
+          onClose={() => {
+            setImportModalOpen(false);
+            setImportSummary(null);
+          }}
+        >
+          <div className="space-y-3">
+            <p className="text-sm text-ink-dim">
+              {t("settings.configBackup.summary.title")}
+            </p>
+            <div className="grid grid-cols-2 gap-2 text-sm">
+              <p>{t("settings.configBackup.summary.servers", { count: importSummary.serversImported })}</p>
+              <p>{t("settings.configBackup.summary.repos", { count: importSummary.reposImported })}</p>
+              <p>{t("settings.configBackup.summary.backupTargets", { count: importSummary.backupTargetsImported })}</p>
+              <p>{t("settings.configBackup.summary.deployConfigs", { count: importSummary.deployConfigsImported })}</p>
+              <p>{t("settings.configBackup.summary.backupConfigs", { count: importSummary.backupConfigsImported })}</p>
+              <p>{t("settings.configBackup.summary.pagesConfigs", { count: importSummary.pagesConfigsImported })}</p>
+            </div>
+            <p className="text-xs text-ink-dim">
+              ⚠️ 敏感信息（密码/密钥）已脱敏，请手动补充后再使用。
+            </p>
+            <div className="flex justify-end gap-2 pt-4">
+              <Button
+                variant="secondary"
+                onClick={() => {
+                  setImportModalOpen(false);
+                  setImportSummary(null);
+                }}
+              >
+                {t("common.close")}
+              </Button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </Page>
   );
 }

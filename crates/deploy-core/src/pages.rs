@@ -51,7 +51,14 @@ impl PagesEngine {
         let app_config = self.store.load_config()?;
         let repo = Store::find_repo(&app_config, &req.repo_id)?.clone();
 
-        let mut config = repo.pages.clone().unwrap_or_default().normalize();
+        // 优先从 pages_configs 列表获取默认配置，兼容旧版 repo.pages
+        let mut config = if let Some(entry) = Store::get_repo_default_pages(&app_config, &repo.id) {
+            entry.config.clone()
+        } else {
+            PagesConfig::default()
+        };
+        
+        // 允许请求参数覆盖
         if let Some(value) = non_empty(&req.provider) {
             config.provider = value.to_lowercase();
         }
@@ -392,8 +399,15 @@ impl PagesEngine {
         let repo = Store::find_repo(&app_config, repo_id)?.clone();
         let config = match config {
             Some(config) => config.normalize(),
-            None => repo.pages.clone().unwrap_or_default().normalize(),
-        };
+            None => {
+                // 优先从 pages_configs 列表获取默认配置
+                if let Some(entry) = Store::get_repo_default_pages(&app_config, repo_id) {
+                    entry.config.clone()
+                } else {
+                    PagesConfig::default()
+                }
+            }
+        }.normalize();
         let path = PathBuf::from(&repo.path);
         let remote = Git::open(path.as_path())
             .ok()
@@ -1181,19 +1195,33 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("deploycode-pages-test-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).unwrap();
         let store = Arc::new(Store::new(&dir));
-        let mut config = crate::models::AppConfig::default();
-        let repo = crate::models::RepoConfig {
-            id: "r1".to_string(),
-            name: "app".to_string(),
-            path: dir.display().to_string(),
-            pages: Some(PagesConfig {
+        
+        // 创建 PagesConfigEntry
+        let pages_entry = crate::models::PagesConfigEntry {
+            id: "p1".to_string(),
+            name: "default".to_string(),
+            repo_id: "r1".to_string(),
+            repo_name: "app".to_string(),
+            config: crate::models::PagesConfig {
                 project_name: "app".to_string(),
                 output_dir: "dist".to_string(),
-                ..PagesConfig::default()
-            }),
-            ..crate::models::RepoConfig::new("app".to_string(), dir.display().to_string())
+                ..crate::models::PagesConfig::default()
+            },
+            created_at: crate::models::now_string(),
         };
-        config.repos.push(repo);
+        
+        let mut config = crate::models::AppConfig {
+            repos: vec![crate::models::RepoConfig {
+                id: "r1".to_string(),
+                name: "app".to_string(),
+                path: dir.display().to_string(),
+                default_pages_config_id: Some("p1".to_string()),
+                ..crate::models::RepoConfig::new("app".to_string(), dir.display().to_string())
+            }],
+            pages_configs: vec![pages_entry],
+            pages_configs_migrated: true, // 标记已迁移，避免重复迁移
+            ..crate::models::AppConfig::default()
+        };
         store.save_config(&config).unwrap();
         let engine = PagesEngine::new(store.clone());
         let request = PagesRequest {
