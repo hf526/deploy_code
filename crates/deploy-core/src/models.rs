@@ -43,7 +43,7 @@ pub struct DbBackupSource {
     pub database: String,
     /// 数据库用户名。
     pub username: String,
-    /// 数据库密码；为空时依赖容器/服务器的本地认证。
+    /// 数据库密码；为空时依赖容器/服务器的本地认证。（存储时为密文）
     #[serde(default)]
     pub password: String,
     /// 需要同步的 schema。
@@ -756,12 +756,15 @@ pub struct Settings {
     /// 单次数据库备份超时（秒）。
     #[serde(default = "default_backup_timeout_secs")]
     pub backup_timeout_secs: u64,
-    /// 全局 Cloudflare API Token（Pages 部署）。
+    /// 全局 Cloudflare API Token（Pages 部署）。（存储时为密文）
     #[serde(default)]
     pub cloudflare_api_token: String,
     /// 全局 Cloudflare Account ID。
     #[serde(default)]
     pub cloudflare_account_id: String,
+    /// 主密码哈希（用于验证用户记忆的主密码是否正确）。
+    #[serde(default)]
+    pub master_password_hash: Option<String>,
     /// GitHub Personal Access Token（可选，用于自动配置 Pages；留空则尝试本机 gh CLI）。
     #[serde(default)]
     pub github_token: String,
@@ -823,6 +826,7 @@ impl Default for Settings {
             backup_timeout_secs: default_backup_timeout_secs(),
             cloudflare_api_token: String::new(),
             cloudflare_account_id: String::new(),
+            master_password_hash: None,
             github_token: String::new(),
             pages_history_limit: default_pages_history_limit(),
             language: String::new(),

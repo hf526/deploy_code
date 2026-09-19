@@ -15,8 +15,10 @@
 //! - [`process`]：本地命令执行与 shell 工具
 //! - [`tasklog`]：三类任务共用的日志器
 //! - [`util`]：展示用格式化工具
+//! - [`crypto`]：敏感数据加密（AES-256-GCM + HKDF）
 
 pub mod backup;
+pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod git;

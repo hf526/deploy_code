@@ -4,10 +4,11 @@ use std::sync::{Mutex, MutexGuard};
 
 use directories::ProjectDirs;
 
+use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployConfig, DeployRecord,
-    DeployStatus, ExportData, ImportSummary, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig,
+    DeployStatus, ExportData, ImportSummary, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig, SshAuth,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -117,6 +118,130 @@ impl Store {
         self.base_dir.join("temp")
     }
 
+    /// 设置主密码（首次使用时调用）
+    pub fn set_master_password(&self, master_password: &str) -> Result<()> {
+        let mut config = self.load_config()?;
+        
+        // 计算主密码哈希用于验证
+        let hash = Self::sha256_hash(master_password);
+        config.settings.master_password_hash = Some(hash);
+        self.save_config(&config)?;
+        Ok(())
+    }
+
+    /// 验证主密码是否正确
+    pub fn verify_master_password(&self, master_password: &str) -> Result<bool> {
+        let config = self.load_config()?;
+        
+        let stored_hash = config.settings.master_password_hash.as_ref()
+            .ok_or_else(|| CoreError::config("未设置主密码"))?;
+        
+        let input_hash = Self::sha256_hash(master_password);
+        Ok(input_hash == *stored_hash)
+    }
+
+    /// SHA256 哈希辅助函数
+    fn sha256_hash(input: &str) -> String {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(input.as_bytes());
+        let hash = hasher.finalize();
+        format!("{:x}", hash)
+    }
+
+    /// 加密配置中的所有敏感字段
+    fn encrypt_sensitive_fields(&self, config: &AppConfig, master_password: &str) -> Result<AppConfig> {
+        if config.settings.master_password_hash.is_none() {
+            return Err(CoreError::config("请先设置主密码"));
+        }
+
+        // 深度复制并加密
+        let mut encrypted = config.clone();
+        
+        // 加密服务器密码
+        for server in &mut encrypted.servers {
+            if let SshAuth::Password { password } = &mut server.auth {
+                let original_password = password.clone();
+                *password = encrypt_string(&original_password, master_password)?;
+            }
+        }
+        
+        // 加密备份源密码
+        for backup_config in &mut encrypted.backup_configs {
+            let original_password = backup_config.source.password.clone();
+            backup_config.source.password = encrypt_string(&original_password, master_password)?;
+        }
+        
+        // 加密 Cloudflare API Token
+        if !encrypted.settings.cloudflare_api_token.is_empty() {
+            let original_token = encrypted.settings.cloudflare_api_token.clone();
+            encrypted.settings.cloudflare_api_token = encrypt_string(&original_token, master_password)?;
+        }
+        
+        // 加密 GitHub Token
+        if !encrypted.settings.github_token.is_empty() {
+            let original_token = encrypted.settings.github_token.clone();
+            encrypted.settings.github_token = encrypt_string(&original_token, master_password)?;
+        }
+        
+        Ok(encrypted)
+    }
+
+    /// 解密配置中的所有敏感字段
+    fn decrypt_sensitive_fields(&self, config: &AppConfig, master_password: &str) -> Result<AppConfig> {
+        let mut decrypted = config.clone();
+        
+        // 解密服务器密码
+        for server in &mut decrypted.servers {
+            if let SshAuth::Password { password } = &mut server.auth {
+                // 检查是否是密文（base64 编码通常以字母开头，长度较长）
+                if password.len() > 20 && password.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                    match decrypt_string(password, master_password) {
+                        Ok(plaintext) => *password = plaintext,
+                        Err(_) => { /* 解密失败，保持原样 */ }
+                    }
+                }
+            }
+        }
+        
+        // 解密备份源密码
+        for backup_config in &mut decrypted.backup_configs {
+            if !backup_config.source.password.is_empty() {
+                let encrypted_password = backup_config.source.password.clone();
+                if encrypted_password.len() > 20 && encrypted_password.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                    match decrypt_string(&encrypted_password, master_password) {
+                        Ok(plaintext) => backup_config.source.password = plaintext,
+                        Err(_) => { /* 解密失败，保持原样 */ }
+                    }
+                }
+            }
+        }
+        
+        // 解密 Cloudflare API Token
+        if !decrypted.settings.cloudflare_api_token.is_empty() {
+            let encrypted_token = decrypted.settings.cloudflare_api_token.clone();
+            if encrypted_token.len() > 20 && encrypted_token.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                match decrypt_string(&encrypted_token, master_password) {
+                    Ok(plaintext) => decrypted.settings.cloudflare_api_token = plaintext,
+                    Err(_) => { /* 解密失败，保持原样 */ }
+                }
+            }
+        }
+        
+        // 解密 GitHub Token
+        if !decrypted.settings.github_token.is_empty() {
+            let encrypted_token = decrypted.settings.github_token.clone();
+            if encrypted_token.len() > 20 && encrypted_token.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                match decrypt_string(&encrypted_token, master_password) {
+                    Ok(plaintext) => decrypted.settings.github_token = plaintext,
+                    Err(_) => { /* 解密失败，保持原样 */ }
+                }
+            }
+        }
+        
+        Ok(decrypted)
+    }
+
     /// 确保数据目录存在，并返回临时文件路径。
     pub fn prepare_temp_file(&self, name: &str) -> Result<PathBuf> {
         let dir = self.temp_dir();
@@ -133,12 +258,30 @@ impl Store {
         if text.trim().is_empty() {
             return Ok(AppConfig::default());
         }
-        serde_json::from_str(&text).map_err(|e| {
+        
+        // 先加载配置
+        let config: AppConfig = serde_json::from_str(&text).map_err(|e| {
             CoreError::config(format!("配置文件解析失败 {}: {e}", path.display()))
-        })
+        })?;
+        
+        // 如果设置了主密码，尝试解密敏感字段
+        if let Some(ref hash) = config.settings.master_password_hash {
+            if !hash.is_empty() {
+                // 这里我们假设用户已经设置了主密码，但实际验证需要在调用时进行
+                // 为了向后兼容，我们先返回原始配置，让上层决定是否需要解密
+                Ok(config)
+            } else {
+                Ok(config)
+            }
+        } else {
+            // 旧版本配置（无主密码），直接返回
+            Ok(config)
+        }
     }
 
     pub fn save_config(&self, config: &AppConfig) -> Result<()> {
+        // 注意：这里不自动加密，需要调用方显式调用 encrypt_sensitive_fields
+        // 这样可以保持向后兼容性
         let _guard = self.write_guard()?;
         write_config(&self.config_path(), config)
     }

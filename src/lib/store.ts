@@ -43,6 +43,7 @@ export const defaultSettings: Settings = {
   backupTimeoutSecs: 3600,
   cloudflareApiToken: "",
   cloudflareAccountId: "",
+  masterPasswordHash: null,
   githubToken: "",
   pagesHistoryLimit: 200,
   language: "",

@@ -16,6 +16,12 @@ russh = { version = "0.63", default-features = false, features = ["ring", "rsa",
 russh-sftp = "3"
 flate2 = "1"
 sha2.workspace = true
+# 加密模块：AES-256-GCM + HKDF 主密码派生
+aes-gcm = "0.10"
+hkdf = "0.12"
+base64 = "0.21"
+zeroize = { version = "1", features = ["zeroize_derive"] }
+rand = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

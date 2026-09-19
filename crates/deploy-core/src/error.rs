@@ -3,40 +3,49 @@ use std::path::PathBuf;
 /// 核心库统一错误类型。
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
-    #[error("Git 操作失败: {0}")]
+    #[error("Git 操作失败：{0}")]
     Git(String),
 
-    #[error("SSH 操作失败: {0}")]
+    #[error("SSH 操作失败：{0}")]
     Ssh(String),
 
-    #[error("命令执行失败: {0}")]
+    #[error("命令执行失败：{0}")]
     Process(String),
 
-    #[error("配置错误: {0}")]
+    #[error("配置错误：{0}")]
     Config(String),
 
-    #[error("未找到: {0}")]
+    #[error("未找到：{0}")]
     NotFound(String),
 
     /// 有互斥任务正在进行（部署 / 备份 / Pages 抢占失败）。
     /// 调用方（如定时调度器）依赖该类型区分「稍后重试」与真实失败，不要只用字符串匹配。
-    #[error("任务冲突: {0}")]
+    #[error("任务冲突：{0}")]
     Busy(String),
 
-    #[error("部署失败: {0}")]
+    #[error("部署失败：{0}")]
     Deploy(String),
 
-    #[error("备份失败: {0}")]
+    #[error("备份失败：{0}")]
     Backup(String),
 
-    #[error("Pages 部署失败: {0}")]
+    #[error("Pages 部署失败：{0}")]
     Pages(String),
 
-    #[error("IO 错误: {0}")]
+    #[error("加密错误：{0}")]
+    Crypto(String),
+
+    #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
 
-    #[error("序列化错误: {0}")]
+    #[error("序列化错误：{0}")]
     Serde(#[from] serde_json::Error),
+}
+
+impl From<crate::crypto::CryptoError> for CoreError {
+    fn from(err: crate::crypto::CryptoError) -> Self {
+        CoreError::Crypto(err.to_string())
+    }
 }
 
 impl CoreError {

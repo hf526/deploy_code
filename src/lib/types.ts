@@ -241,6 +241,8 @@ export interface Settings {
   backupTimeoutSecs: number;
   cloudflareApiToken: string;
   cloudflareAccountId: string;
+  /** 主密码哈希（用于校验用户输入的主密码）；未设置时为 null。 */
+  masterPasswordHash: string | null;
   githubToken: string;
   pagesHistoryLimit: number;
   language: string;
