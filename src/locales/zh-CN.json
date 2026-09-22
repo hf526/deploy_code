@@ -150,6 +150,7 @@
   "repos": {
     "subtitle": "本地 Git 仓库的工作台：分支、差异与部署",
     "clone": "克隆仓库",
+    "refreshTitle": "刷新分支与未提交变动（切回窗口时会自动刷新）",
     "openFolder": "打开文件夹",
     "cloneRemote": "克隆远程仓库",
     "configureServers": "配置服务器",

@@ -75,7 +75,7 @@ interface AppStore {
   livePages: LivePages | null;
 
   loadAll: () => Promise<void>;
-  refreshRepos: () => Promise<void>;
+  refreshRepos: (silent?: boolean) => Promise<void>;
   addRepoFromPath: (path: string) => Promise<RepoInfo | null>;
   openTab: (repoId: string) => void;
   closeTab: (repoId: string) => void;
@@ -103,6 +103,10 @@ interface AppStore {
   startPagesDeploy: (request: PagesRequest) => Promise<string>;
   handlePagesEvent: (event: PagesEvent) => void;
 }
+
+// 仓库列表刷新的 in-flight 请求：轮询与手动点击会撞在一起，复用同一个请求，
+// 避免并发写回时“后发先至”把旧数据覆盖回去。
+let reposRefreshTask: Promise<void> | null = null;
 
 export const useApp = create<AppStore>((set, get) => ({
   ready: false,
@@ -202,15 +206,26 @@ export const useApp = create<AppStore>((set, get) => ({
     if (nextPages !== undefined) set({ livePages: nextPages });
   },
 
-  refreshRepos: async () => {
+  // silent：后台自动刷新时使用，失败不弹 toast（否则轮询会持续刷错误提示）。
+  refreshRepos: async (silent = false) => {
+    // 已有请求在跑就直接复用：并发调用只会多跑几次 git，且可能后发先至写回旧数据。
+    if (reposRefreshTask) return reposRefreshTask;
+    const task = (async () => {
+      try {
+        const repos = await api.listRepos();
+        set((state) => ({
+          repos,
+          tabs: state.tabs.filter((id) => repos.some((repo) => repo.id === id)),
+        }));
+      } catch (error) {
+        if (!silent) get().toast("error", String(error));
+      }
+    })();
+    reposRefreshTask = task;
     try {
-      const repos = await api.listRepos();
-      set((state) => ({
-        repos,
-        tabs: state.tabs.filter((id) => repos.some((repo) => repo.id === id)),
-      }));
-    } catch (error) {
-      get().toast("error", String(error));
+      await task;
+    } finally {
+      reposRefreshTask = null;
     }
   },
 

@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("./api", () => ({
   api: {
+    listRepos: vi.fn(async () => []),
     startDeployConfig: vi.fn(async () => "d1"),
     startPagesDeploy: vi.fn(async () => "p1"),
     listHistory: vi.fn(async () => []),
@@ -133,5 +134,29 @@ describe("store 长任务接线", () => {
     useApp.setState({ livePages: { recordId: "p1", lines: [], progress: 0, status: "running", record: null } });
     await expect(useApp.getState().startPagesDeploy({ repoId: "repo", skipBuild: false })).rejects.toThrow();
     expect(api.startPagesDeploy).not.toHaveBeenCalled();
+  });
+
+  it("并发 refreshRepos 复用同一个请求（轮询与手动点击撞车时只拉一次）", async () => {
+    let calls = 0;
+    vi.mocked(api.listRepos).mockImplementation(async () => {
+      calls += 1;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      return [];
+    });
+    await Promise.all([
+      useApp.getState().refreshRepos(true),
+      useApp.getState().refreshRepos(true),
+    ]);
+    expect(calls).toBe(1);
+  });
+
+  it("silent 刷新失败不弹 toast，普通刷新失败要提示", async () => {
+    vi.mocked(api.listRepos).mockRejectedValueOnce(new Error("读取失败"));
+    await useApp.getState().refreshRepos(true);
+    expect(useApp.getState().toasts).toHaveLength(0);
+
+    vi.mocked(api.listRepos).mockRejectedValueOnce(new Error("读取失败"));
+    await useApp.getState().refreshRepos();
+    expect(useApp.getState().toasts).toHaveLength(1);
   });
 });

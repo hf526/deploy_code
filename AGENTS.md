@@ -97,7 +97,7 @@ crates/deploy-cli/           CLI：与 GUI 复用 deploy-core，同源同行为
 - 长任务（部署/备份/Pages）的事件归约与重载对账在 `src/lib/liveTask.ts`（`applyTaskEvent` / `reconcileLiveTask`），新增同类任务直接复用，不要在 store 里另写一遍。
 - 页面私有子组件放同目录子文件夹（如 `src/pages/repoDetail/`、`src/pages/deploy/`），页面级状态逻辑优先抽成同目录 `useXxx.ts` hook（参考 `repoDetail/useFileFilter.ts`）。
 - 新增纯逻辑（如 `src/lib/*.ts`）时补同名 `*.test.ts`（vitest，node 环境；依赖 i18n/api 的模块在测试里 `vi.mock`），组件层不做单测、靠 tsc + 手工验证。
-- 所有用户可见文案必须走 `t("...")`，并**同时**在 `src/locales/zh-CN.json` 与 `en-US.json` 增加同名 key（两边必须 1:1，当前 625 对全对齐）。状态文案/尺寸/耗时格式化用 `src/lib/utils.ts`。
+- 所有用户可见文案必须走 `t("...")`，并**同时**在 `src/locales/zh-CN.json` 与 `en-US.json` 增加同名 key（两边必须 1:1，当前 639 对全对齐）。状态文案/尺寸/耗时格式化用 `src/lib/utils.ts`。
 - TS 严格模式全开（`strict`、`noUnusedLocals`、`noUnusedParameters`），不允许 `any`/`@ts-ignore`；类型不匹配时改类型而不是断言。
 - 导入用相对路径（无 `@/` 别名）；组件文件 PascalCase，工具/状态文件 camelCase。
 

@@ -6,6 +6,7 @@ import {
   GitBranch,
   Link2,
   Pencil,
+  RefreshCw,
   Rocket,
   Server,
   Terminal,
@@ -21,7 +22,11 @@ import { api } from "../lib/api";
 import { openRepoFolder } from "../lib/openRepo";
 import { useApp } from "../lib/store";
 import type { RepoInfo } from "../lib/types";
-import { shortPath } from "../lib/utils";
+import { useAutoRefresh } from "../lib/useAutoRefresh";
+import { cn, shortPath } from "../lib/utils";
+
+/** 后台轮询间隔：每个仓库跑 3 个 git 只读命令，10s 足够跟上编辑器里的改动。 */
+const AUTO_REFRESH_MS = 10_000;
 
 const FEATURES = [
   { icon: GitBranch, titleKey: "repos.featureBranchTitle", descKey: "repos.featureBranchDesc" },
@@ -47,8 +52,24 @@ export default function ReposPage() {
   const [cloneDir, setCloneDir] = useState("");
   const [cloning, setCloning] = useState(false);
   const [busy, setBusy] = useState(false);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+
+  // 自动刷新：进入页面拉一次 + 窗口切回来补一次 + 每 10s 轮询，保证分支/变动数和磁盘一致。
+  const { refreshing: autoRefreshing } = useAutoRefresh(() => refreshRepos(true), {
+    intervalMs: AUTO_REFRESH_MS,
+  });
 
   const totalChanges = repos.reduce((sum, repo) => sum + repo.changeCount, 0);
+
+  async function handleRefresh() {
+    if (manualRefreshing) return;
+    setManualRefreshing(true);
+    try {
+      await refreshRepos();
+    } finally {
+      setManualRefreshing(false);
+    }
+  }
 
   async function handleOpen() {
     setOpening(true);
@@ -141,6 +162,16 @@ export default function ReposPage() {
       subtitle={t("repos.subtitle")}
       actions={
         <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            // 后台轮询只让图标转圈：用 loading 会让按钮每 10s 闪一次加载态。
+            loading={manualRefreshing}
+            title={t("repos.refreshTitle")}
+            icon={<RefreshCw className={cn("size-4", autoRefreshing && "animate-spin")} />}
+            onClick={() => void handleRefresh()}
+          >
+            {t("common.refresh")}
+          </Button>
           <Button
             variant="secondary"
             icon={<Download className="size-4" />}

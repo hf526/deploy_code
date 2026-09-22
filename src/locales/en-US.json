@@ -150,6 +150,7 @@
   "repos": {
     "subtitle": "A workbench for local Git repositories: branches, diffs and deployments",
     "clone": "Clone Repository",
+    "refreshTitle": "Refresh branches and uncommitted changes (auto-refreshes when you come back to the window)",
     "openFolder": "Open Folder",
     "cloneRemote": "Clone Remote Repository",
     "configureServers": "Configure Servers",
