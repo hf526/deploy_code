@@ -3,6 +3,7 @@ dist/
 target/
 src-tauri/gen/
 .tauri-localappdata/
+.workbuddy/
 config.json
 history.json
 backups.json
