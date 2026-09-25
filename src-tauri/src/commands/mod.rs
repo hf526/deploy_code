@@ -1,5 +1,6 @@
 pub mod app;
 pub mod backup;
+pub mod cronjob;
 pub mod deploy;
 pub mod history;
 pub mod nginx;

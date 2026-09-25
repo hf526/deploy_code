@@ -1,6 +1,6 @@
 use deploy_core::models::{
-    Branch, Commit, EnvFileConfig, FileContent, FileEntry, GraphCommit, RepoConfig, RepoInfo,
-    RepoStatus, ReplaceSummary, ResolvedRev, SearchHit,
+    AppConfig, Branch, Commit, EnvFileConfig, FileContent, FileEntry, GraphCommit, RepoConfig,
+    RepoInfo, RepoStatus, ReplaceSummary, ResolvedRev, SearchHit,
 };
 use deploy_core::{engine::normalize_env_files, repo_info, CoreError, Git, Result, Store};
 use serde::Serialize;
@@ -194,17 +194,53 @@ fn register_repo(
     Ok(repo_info(&repo))
 }
 
+/// 规范化用户填写的本地目录：展开为绝对路径并要求目录已存在。
+/// 只校验目录存在，不要求是 Git 仓库（与 register_repo 一致）。
+fn normalize_repo_path(raw: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(CoreError::config("请选择仓库所在的本地目录"));
+    }
+    let buf = deploy_core::process::canonicalize_path(std::path::Path::new(trimmed));
+    if !buf.is_dir() {
+        return Err(CoreError::not_found(format!(
+            "目录不存在: {}，请先创建该目录或换一个位置",
+            buf.display()
+        )));
+    }
+    Ok(buf.to_string_lossy().into_owned())
+}
+
+/// 把仓库重新指向另一个本地目录时，拒绝与其他仓库指向同一位置（路径按规范化后比较）。
+fn path_owner(config: &AppConfig, repo_id: &str, next_path: &str) -> Option<String> {
+    let normalized = next_path.replace('\\', "/");
+    let normalized = normalized.trim_end_matches('/');
+    config
+        .repos
+        .iter()
+        .find(|item| {
+            item.id != repo_id
+                && {
+                    let existing = item.path.replace('\\', "/");
+                    existing.trim_end_matches('/') == normalized
+                }
+        })
+        .map(|item| item.name.clone())
+}
+
 #[tauri::command(async)]
 pub fn update_repo(
     state: State<AppState>,
     repo_id: String,
     name: Option<String>,
+    path: Option<String>,
     default_server_id: Option<String>,
     default_target_dir: Option<String>,
 ) -> Result<RepoInfo> {
     let next_name = name
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
+    let next_path = path.map(|value| normalize_repo_path(&value)).transpose()?;
 
     let updated = state.store.mutate_config(|config| {
         if let Some(name) = &next_name {
@@ -216,6 +252,13 @@ pub fn update_repo(
                 return Err(CoreError::config(format!("仓库名称已存在: {name}")));
             }
         }
+        if let Some(next_path) = &next_path {
+            if let Some(owner) = path_owner(config, &repo_id, next_path) {
+                return Err(CoreError::config(format!(
+                    "该目录已被仓库 {owner} 使用，请先移除或改指向别的目录"
+                )));
+            }
+        }
 
         let repo = config
             .repos
@@ -225,6 +268,10 @@ pub fn update_repo(
 
         if let Some(name) = next_name {
             repo.name = name;
+        }
+        // 路径同样遵循「None = 本次不修改」：旧目录已失效时前端只提交改动过的路径，改名才不会被存在性校验误挡。
+        if let Some(next_path) = next_path {
+            repo.path = next_path;
         }
         // None 表示“本次不修改”，空串才表示清空，避免重命名等局部更新把默认配置抹掉。
         if let Some(value) = default_server_id {
@@ -457,4 +504,46 @@ pub fn pull_repo(state: State<AppState>, repo_id: String) -> Result<String> {
 #[tauri::command(async)]
 pub fn resolve_rev(state: State<AppState>, repo_id: String, rev: String) -> Result<ResolvedRev> {
     git_for(&state, &repo_id)?.resolve(&rev)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repo(id: &str, name: &str, path: &str) -> RepoConfig {
+        let mut item = RepoConfig::new(name.into(), path.into());
+        item.id = id.into();
+        item
+    }
+
+    #[test]
+    fn normalize_repo_path_rejects_missing_dirs() {
+        assert!(normalize_repo_path("   ").is_err());
+        let missing = std::env::temp_dir().join("deploycode-没有这个目录-1a2b3c");
+        let err = normalize_repo_path(&missing.to_string_lossy()).unwrap_err();
+        assert!(matches!(err, CoreError::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn normalize_repo_path_accepts_existing_dir() {
+        let dir = std::env::temp_dir();
+        let ok = normalize_repo_path(&dir.to_string_lossy()).unwrap();
+        assert!(!ok.trim().is_empty());
+        assert!(std::path::Path::new(&ok).is_dir());
+    }
+
+    #[test]
+    fn path_owner_ignores_separators_and_self() {
+        let config = AppConfig {
+            repos: vec![repo("a", "甲", r"E:\code\alpha"), repo("b", "乙", "/srv/beta")],
+            ..Default::default()
+        };
+        // 同一目录的不同写法都算冲突，报错时给出占用方名称。
+        assert_eq!(path_owner(&config, "b", r"E:/code/alpha").as_deref(), Some("甲"));
+        assert_eq!(path_owner(&config, "a", "/srv/beta/").as_deref(), Some("乙"));
+        // 路径没改（或改回自己原来的目录）不算冲突。
+        assert_eq!(path_owner(&config, "a", r"E:\code\alpha").as_deref(), None);
+        assert_eq!(path_owner(&config, "b", "/srv/beta").as_deref(), None);
+        assert_eq!(path_owner(&config, "a", r"E:\code\gamma").as_deref(), None);
+    }
 }

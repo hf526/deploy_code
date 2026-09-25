@@ -14,6 +14,7 @@ import type { BackupEvent, DeployEvent, PagesEvent, SchedulerNotice } from "./li
 
 // 按页面分包：启动只加载首屏，其余页面首次访问时按需加载。
 const BackupsPage = lazy(() => import("./pages/BackupsPage"));
+const CronJobsPage = lazy(() => import("./pages/CronJobsPage"));
 const DeployPage = lazy(() => import("./pages/DeployPage"));
 const HistoryPage = lazy(() => import("./pages/HistoryPage"));
 const NginxPage = lazy(() => import("./pages/NginxPage"));
@@ -57,6 +58,7 @@ function TabsAndRoutes() {
             <Route path="/deploy" element={<DeployPage />} />
             <Route path="/servers" element={<ServersPage />} />
             <Route path="/nginx" element={<NginxPage />} />
+            <Route path="/cron-jobs" element={<CronJobsPage />} />
             <Route path="/backups" element={<BackupsPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/settings" element={<SettingsPage />} />

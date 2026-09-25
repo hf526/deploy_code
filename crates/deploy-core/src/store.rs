@@ -183,6 +183,12 @@ impl Store {
             let original_token = encrypted.settings.github_token.clone();
             encrypted.settings.github_token = encrypt_string(&original_token, master_password)?;
         }
+
+        // 加密 cron-job.org API Key
+        if !encrypted.settings.cronjob_api_key.is_empty() {
+            let original_key = encrypted.settings.cronjob_api_key.clone();
+            encrypted.settings.cronjob_api_key = encrypt_string(&original_key, master_password)?;
+        }
         
         Ok(encrypted)
     }
@@ -238,7 +244,18 @@ impl Store {
                 }
             }
         }
-        
+
+        // 解密 cron-job.org API Key
+        if !decrypted.settings.cronjob_api_key.is_empty() {
+            let encrypted_key = decrypted.settings.cronjob_api_key.clone();
+            if encrypted_key.len() > 20 && encrypted_key.chars().all(|c| c.is_alphanumeric() || c == '+' || c == '/' || c == '=') {
+                match decrypt_string(&encrypted_key, master_password) {
+                    Ok(plaintext) => decrypted.settings.cronjob_api_key = plaintext,
+                    Err(_) => { /* 解密失败，保持原样 */ }
+                }
+            }
+        }
+
         Ok(decrypted)
     }
 

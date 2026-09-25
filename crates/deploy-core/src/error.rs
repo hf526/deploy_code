@@ -32,6 +32,9 @@ pub enum CoreError {
     #[error("Pages 部署失败：{0}")]
     Pages(String),
 
+    #[error("定时请求服务调用失败：{0}")]
+    CronJob(String),
+
     #[error("加密错误：{0}")]
     Crypto(String),
 
@@ -79,6 +82,10 @@ impl CoreError {
 
     pub fn pages(msg: impl Into<String>) -> Self {
         Self::Pages(msg.into())
+    }
+
+    pub fn cronjob(msg: impl Into<String>) -> Self {
+        Self::CronJob(msg.into())
     }
 
     pub fn io_path(path: impl Into<PathBuf>, err: std::io::Error) -> Self {

@@ -768,6 +768,9 @@ pub struct Settings {
     /// GitHub Personal Access Token（可选，用于自动配置 Pages；留空则尝试本机 gh CLI）。
     #[serde(default)]
     pub github_token: String,
+    /// cron-job.org 的 API Key（控制台 Settings → API Keys 生成），用于管理云端定时请求。
+    #[serde(default)]
+    pub cronjob_api_key: String,
     /// Pages 部署记录保留条数。
     #[serde(default = "default_pages_history_limit")]
     pub pages_history_limit: usize,
@@ -828,6 +831,7 @@ impl Default for Settings {
             cloudflare_account_id: String::new(),
             master_password_hash: None,
             github_token: String::new(),
+            cronjob_api_key: String::new(),
             pages_history_limit: default_pages_history_limit(),
             language: String::new(),
             atomic_release: false,
@@ -947,6 +951,7 @@ impl ExportData {
         settings.cloudflare_api_token = String::new();
         settings.cloudflare_account_id = String::new();
         settings.github_token = String::new();
+        settings.cronjob_api_key = String::new();
 
         Self {
             version: "1.0".to_string(),

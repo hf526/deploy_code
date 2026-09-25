@@ -23,6 +23,7 @@ import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { BindRemoteModal } from "../components/BindRemoteModal";
+import { EditRepoModal } from "../components/EditRepoModal";
 import { SearchSelect } from "../components/SearchSelect";
 import { ConfirmModal } from "../components/ui";
 import { Button, Input } from "../components/ui";
@@ -68,6 +69,7 @@ export default function RepoDetailPage() {
   const [branchMenuOpen, setBranchMenuOpen] = useState(false);
   const [branchSearch, setBranchSearch] = useState("");
   const [remoteOpen, setRemoteOpen] = useState(false);
+  const [editOpen, setEditOpen] = useState(false);
   const [sensitiveFiles, setSensitiveFiles] = useState<string[] | null>(null);
   const branchMenuRef = useRef<HTMLDivElement>(null);
 
@@ -86,6 +88,7 @@ export default function RepoDetailPage() {
     setEditor({ kind: "none" });
     setReveal(null);
     setRemoteOpen(false);
+    setEditOpen(false);
     setSensitiveFiles(null);
     setPendingDiscard(null);
   }, [repoId]);
@@ -573,25 +576,37 @@ export default function RepoDetailPage() {
         />
         <div className="min-w-0">
           <h1 className="truncate text-sm font-semibold tracking-tight text-ink">{repo.name}</h1>
-          <p className="truncate text-[11px] text-ink-faint">{repo.path}</p>
-          <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px]">
-            {repo.remote ? (
-              <span className="truncate font-mono text-ink-dim" title={repo.remote}>
-                {repo.remote}
-              </span>
-            ) : (
-              <span className="text-ink-faint">
-                {repo.pathExists ? t("repos.noRemote") : t("repos.pathUnavailable")}
-              </span>
+          <p className="flex min-w-0 items-center gap-1.5 text-[11px] text-ink-faint">
+            <span className="truncate">{repo.path}</span>
+            {!repo.pathExists && (
+              // 目录失效时所有 Git 命令都跑不通，绑定远端等入口一并隐藏，只留修复入口。
+              <button
+                type="button"
+                className="shrink-0 text-brand hover:underline"
+                onClick={() => setEditOpen(true)}
+              >
+                {t("repos.repath")}
+              </button>
             )}
-            <button
-              type="button"
-              className="shrink-0 text-brand hover:underline"
-              onClick={() => setRemoteOpen(true)}
-            >
-              {repo.remote ? t("repoDetail.edit") : t("repoDetail.bind")}
-            </button>
           </p>
+          {repo.pathExists && (
+            <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px]">
+              {repo.remote ? (
+                <span className="truncate font-mono text-ink-dim" title={repo.remote}>
+                  {repo.remote}
+                </span>
+              ) : (
+                <span className="text-ink-faint">{t("repos.noRemote")}</span>
+              )}
+              <button
+                type="button"
+                className="shrink-0 text-brand hover:underline"
+                onClick={() => setRemoteOpen(true)}
+              >
+                {repo.remote ? t("repoDetail.edit") : t("repoDetail.bind")}
+              </button>
+            </p>
+          )}
         </div>
 
         <div className="ml-auto flex items-center gap-2">
@@ -1126,6 +1141,12 @@ export default function RepoDetailPage() {
       <BindRemoteModal
         repo={remoteOpen ? repo : null}
         onClose={() => setRemoteOpen(false)}
+        onSaved={() => void reload()}
+      />
+
+      <EditRepoModal
+        repo={editOpen ? repo : null}
+        onClose={() => setEditOpen(false)}
         onSaved={() => void reload()}
       />
     </div>

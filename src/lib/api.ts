@@ -7,6 +7,9 @@ import type {
   BackupTarget,
   Branch,
   Commit,
+  CronJob,
+  CronJobDraft,
+  CronJobRun,
   DeployConfig,
   DeployRecord,
   DeployRequest,
@@ -58,6 +61,7 @@ export const api = {
   updateRepo: (args: {
     repoId: string;
     name?: string | null;
+    path?: string | null;
     defaultServerId?: string | null;
     defaultTargetDir?: string | null;
   }) => invoke<RepoInfo>("update_repo", args),
@@ -205,4 +209,12 @@ export const api = {
     invoke<PagesConfigEntry>("save_pages_config", { entry }),
   deletePagesConfigById: (id: string) => invoke<boolean>("delete_pages_config", { id }),
   getRepoDefaultPagesConfig: (repoId: string) => invoke<PagesConfigEntry | null>("get_repo_default_pages_config", { repoId }),
+
+  // 定时请求（cron-job.org 云端调度，任务不落本地盘）
+  listCronJobs: () => invoke<CronJob[]>("list_cron_jobs"),
+  saveCronJob: (draft: CronJobDraft) => invoke<void>("save_cron_job", { draft }),
+  deleteCronJob: (jobId: number) => invoke<void>("delete_cron_job", { jobId }),
+  setCronJobEnabled: (jobId: number, enabled: boolean) =>
+    invoke<void>("set_cron_job_enabled", { jobId, enabled }),
+  cronJobHistory: (jobId: number) => invoke<CronJobRun[]>("cron_job_history", { jobId }),
 };

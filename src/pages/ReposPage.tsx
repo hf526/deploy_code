@@ -2,6 +2,7 @@ import { useState } from "react";
 import {
   ChevronRight,
   Download,
+  FolderInput,
   FolderOpen,
   GitBranch,
   Link2,
@@ -17,6 +18,7 @@ import { useNavigate } from "react-router-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import { BindRemoteModal } from "../components/BindRemoteModal";
+import { EditRepoModal } from "../components/EditRepoModal";
 import { Badge, Button, ConfirmModal, Field, Input, Modal, Page } from "../components/ui";
 import { api } from "../lib/api";
 import { openRepoFolder } from "../lib/openRepo";
@@ -43,8 +45,7 @@ export default function ReposPage() {
   const navigate = useNavigate();
 
   const [opening, setOpening] = useState(false);
-  const [renaming, setRenaming] = useState<RepoInfo | null>(null);
-  const [renameValue, setRenameValue] = useState("");
+  const [editing, setEditing] = useState<RepoInfo | null>(null);
   const [removing, setRemoving] = useState<RepoInfo | null>(null);
   const [remoteRepo, setRemoteRepo] = useState<RepoInfo | null>(null);
   const [cloneOpen, setCloneOpen] = useState(false);
@@ -117,26 +118,6 @@ export default function ReposPage() {
       toast("error", String(error));
     } finally {
       setCloning(false);
-    }
-  }
-
-  async function handleRename() {
-    if (!renaming || busy) return;
-    const target = renaming;
-    const nextName = renameValue.trim();
-    if (!nextName) {
-      toast("error", t("repos.nameRequired"));
-      return;
-    }
-    setBusy(true);
-    try {
-      await api.updateRepo({ repoId: target.id, name: nextName });
-      setRenaming((current) => (current?.id === target.id ? null : current));
-      await refreshRepos();
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setBusy(false);
     }
   }
 
@@ -309,17 +290,26 @@ export default function ReposPage() {
                     {shortPath(repo.path, 64)}
                   </p>
                   <p className="mt-1 flex min-w-0 items-center gap-1.5 text-[11px]">
-                    {repo.remote ? (
+                    {!repo.pathExists ? (
+                      // 目录已失效，远端信息读不到：这一行直接给出修复入口，不再重复状态。
+                      <button
+                        type="button"
+                        className="flex min-w-0 items-center gap-1 text-brand hover:underline"
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          setEditing(repo);
+                        }}
+                      >
+                        <FolderInput className="size-3 shrink-0" />
+                        {t("repos.repath")}
+                      </button>
+                    ) : repo.remote ? (
                       <span className="truncate font-mono text-ink-dim" title={repo.remote}>
                         {repo.remote}
                       </span>
                     ) : (
                       <span className="text-ink-faint">
-                        {!repo.pathExists
-                          ? t("repos.pathUnavailable")
-                          : repo.isRepo
-                            ? t("repos.noRemote")
-                            : t("repos.notRepo")}
+                        {repo.isRepo ? t("repos.noRemote") : t("repos.notRepo")}
                       </span>
                     )}
                   </p>
@@ -328,15 +318,17 @@ export default function ReposPage() {
                   className="flex shrink-0 items-center gap-1"
                   onClick={(event) => event.stopPropagation()}
                 >
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    title={t("repos.revealInFileManager")}
-                    onClick={() =>
-                      void api.revealPath(repo.path).catch((e) => toast("error", String(e)))
-                    }
-                    icon={<FolderOpen className="size-3.5" />}
-                  />
+                  {repo.pathExists && (
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      title={t("repos.revealInFileManager")}
+                      onClick={() =>
+                        void api.revealPath(repo.path).catch((e) => toast("error", String(e)))
+                      }
+                      icon={<FolderOpen className="size-3.5" />}
+                    />
+                  )}
                   {repo.pathExists && (
                     <Button
                       size="sm"
@@ -349,12 +341,9 @@ export default function ReposPage() {
                   <Button
                     size="sm"
                     variant="ghost"
-                    title={t("repos.rename")}
+                    title={t("repos.edit")}
                     className="opacity-0 group-hover:opacity-100"
-                    onClick={() => {
-                      setRenaming(repo);
-                      setRenameValue(repo.name);
-                    }}
+                    onClick={() => setEditing(repo)}
                     icon={<Pencil className="size-3.5" />}
                   />
                   <Button
@@ -375,35 +364,11 @@ export default function ReposPage() {
         </>
       )}
 
-      <Modal
-        open={!!renaming}
-        onClose={() => {
-          if (!busy) setRenaming(null);
-        }}
-        title={t("repos.renameTitle")}
-        subtitle={renaming?.path}
-        width="max-w-md"
-        footer={
-          <>
-            <Button variant="secondary" disabled={busy} onClick={() => setRenaming(null)}>
-              {t("common.cancel")}
-            </Button>
-            <Button loading={busy} onClick={() => void handleRename()}>
-              {t("common.save")}
-            </Button>
-          </>
-        }
-      >
-        <Input
-          autoFocus
-          value={renameValue}
-          onChange={(event) => setRenameValue(event.target.value)}
-          placeholder={t("repos.renamePlaceholder")}
-          onKeyDown={(event) => {
-            if (event.key === "Enter") void handleRename();
-          }}
-        />
-      </Modal>
+      <EditRepoModal
+        repo={editing}
+        onClose={() => setEditing(null)}
+        onSaved={() => void refreshRepos()}
+      />
 
       <ConfirmModal
         open={!!removing}

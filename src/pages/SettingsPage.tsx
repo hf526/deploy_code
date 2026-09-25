@@ -84,7 +84,7 @@ export default function SettingsPage() {
       a.download = `deploycode-config-${new Date().toISOString().slice(0, 10)}.json`;
       a.click();
       URL.revokeObjectURL(url);
-      toast("success", t("common.saved"));
+      toast("success", t("settings.configBackup.exported"));
     } catch (error) {
       toast("error", String(error));
     }
@@ -137,6 +137,7 @@ export default function SettingsPage() {
       cloudflareApiToken: source.cloudflareApiToken.trim(),
       cloudflareAccountId: source.cloudflareAccountId.trim(),
       githubToken: source.githubToken.trim(),
+      cronjobApiKey: source.cronjobApiKey.trim(),
       pagesHistoryLimit: Math.max(10, Number(source.pagesHistoryLimit) || 200),
       language: normalizeLanguagePreference(source.language),
       releaseKeep: Math.min(50, Math.max(1, Number(source.releaseKeep) || 5)),
@@ -512,6 +513,36 @@ export default function SettingsPage() {
                 onClick={() => void handleSaveSettings()}
               >
                 {t("settings.github.save")}
+              </Button>
+            </div>
+          </Card>
+        </section>
+
+        <section>
+          <SectionTitle
+            title={t("settings.cronjob.title")}
+            description={t("settings.cronjob.description")}
+          />
+          <Card className="p-5">
+            <Field
+              label={t("settings.cronjob.apiKey")}
+              hint={t("settings.cronjob.apiKeyHint")}
+            >
+              <Input
+                type="password"
+                value={draft.cronjobApiKey}
+                onChange={(event) => setDraft({ ...draft, cronjobApiKey: event.target.value })}
+                placeholder="cron-job.org API Key"
+              />
+            </Field>
+            <div className="mt-4 flex justify-end border-t border-line pt-4">
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<Save className="size-3.5" />}
+                onClick={() => void handleSaveSettings()}
+              >
+                {t("settings.cronjob.save")}
               </Button>
             </div>
           </Card>

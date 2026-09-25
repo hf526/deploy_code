@@ -45,6 +45,7 @@ export const defaultSettings: Settings = {
   cloudflareAccountId: "",
   masterPasswordHash: null,
   githubToken: "",
+  cronjobApiKey: "",
   pagesHistoryLimit: 200,
   language: "",
   atomicRelease: false,
