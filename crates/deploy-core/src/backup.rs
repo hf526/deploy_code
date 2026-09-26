@@ -978,7 +978,7 @@ fn build_test_script(
 }
 
 /// 单遍渲染模板占位符：替换结果不再被扫描，避免值中的 `__KEY__` 触发二次替换。
-fn render_template(template: &str, values: &[(&str, String)]) -> String {
+pub(crate) fn render_template(template: &str, values: &[(&str, String)]) -> String {
     let mut output = String::with_capacity(template.len());
     let mut rest = template;
     while let Some(start) = rest.find("__") {

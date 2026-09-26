@@ -7,6 +7,11 @@ import type {
   BackupTarget,
   Branch,
   Commit,
+  ComposeStack,
+  ComposeStackDetail,
+  ContainerRecord,
+  ContainerRequest,
+  ContainerRestoreRequest,
   CronJob,
   CronJobDraft,
   CronJobRun,
@@ -17,7 +22,7 @@ import type {
   FileContent,
   FileEntry,
   GraphCommit,
-  ImportSummary,
+  ImportPreview,
   NginxConfigContent,
   NginxConfigFile,
   NginxContainerInfo,
@@ -35,6 +40,7 @@ import type {
   SecurityReport,
   ServerConfig,
   Settings,
+  ShutdownStatus,
 } from "./types";
 
 /** 后端 Tauri 命令的类型化封装。 */
@@ -44,10 +50,16 @@ export const api = {
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   exportConfig: () => invoke<string>("export_config"),
-  importConfig: (jsonStr: string) => invoke<ImportSummary>("import_config", { jsonStr }),
+  previewConfigImport: (jsonStr: string) =>
+    invoke<ImportPreview>("preview_config_import", { jsonStr }),
+  importConfig: (jsonStr: string) => invoke<ImportPreview>("import_config", { jsonStr }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
+  getShutdownStatus: () => invoke<ShutdownStatus>("get_shutdown_status"),
+  scheduleShutdown: (minutes: number) =>
+    invoke<ShutdownStatus>("schedule_shutdown", { minutes }),
+  cancelShutdown: () => invoke<ShutdownStatus>("cancel_shutdown"),
 
   // 仓库
   listRepos: () => invoke<RepoInfo[]>("list_repos"),
@@ -152,8 +164,9 @@ export const api = {
 
   // 部署
   startDeploy: (request: DeployRequest) => invoke<string>("start_deploy", { request }),
-  startDeployConfig: (configId: string) =>
-    invoke<string>("start_deploy_config", { configId }),
+  /** 按配置发起一批部署：serverIds 必须是配置里已登记的，返回本批覆盖的台数。 */
+  deployConfigTargets: (configId: string, serverIds: string[]) =>
+    invoke<number>("deploy_config_targets", { configId, serverIds }),
   listDeployConfigs: () => invoke<DeployConfig[]>("list_deploy_configs"),
   saveDeployConfig: (config: DeployConfig) =>
     invoke<DeployConfig>("save_deploy_config", { config }),
@@ -171,6 +184,8 @@ export const api = {
     invoke<DeployRecord[]>("list_history", { repoId: repoId ?? null }),
   getRecord: (recordId: string) => invoke<DeployRecord>("get_record", { recordId }),
   deleteRecord: (recordId: string) => invoke<boolean>("delete_record", { recordId }),
+  deleteRecords: (recordIds: string[]) =>
+    invoke<number>("delete_records", { recordIds }),
   clearHistory: () => invoke<void>("clear_history"),
 
   // 数据库备份
@@ -179,6 +194,7 @@ export const api = {
     invoke<BackupRecord[]>("list_backups", { serverId: serverId ?? null }),
   getBackup: (backupId: string) => invoke<BackupRecord>("get_backup", { backupId }),
   deleteBackup: (backupId: string) => invoke<boolean>("delete_backup", { backupId }),
+  deleteBackups: (backupIds: string[]) => invoke<number>("delete_backups", { backupIds }),
   clearBackups: () => invoke<void>("clear_backups"),
   testBackup: (request: BackupRequest) => invoke<string>("test_backup", { request }),
   listBackupTargets: () => invoke<BackupTarget[]>("list_backup_targets"),
@@ -196,19 +212,18 @@ export const api = {
     invoke<PagesDeployRecord[]>("list_pages_records", { repoId: repoId ?? null }),
   getPagesRecord: (recordId: string) => invoke<PagesDeployRecord>("get_pages_record", { recordId }),
   deletePagesRecord: (recordId: string) => invoke<boolean>("delete_pages_record", { recordId }),
+  deletePagesRecords: (recordIds: string[]) =>
+    invoke<number>("delete_pages_records", { recordIds }),
   clearPagesRecords: () => invoke<void>("clear_pages_records"),
-  getPagesConfig: (repoId: string) => invoke<PagesConfig>("get_pages_config", { repoId }),
-  savePagesConfig: (repoId: string, config: PagesConfig) =>
-    invoke<PagesConfig>("save_pages_config", { repoId, config }),
   listPagesConfigs: () => invoke<PagesConfigEntry[]>("list_pages_configs"),
-  deletePagesConfig: (repoId: string) => invoke<boolean>("delete_pages_config", { repoId }),
+  // 一条 Pages 配置：id 留空表示新建，后端补齐 id / 创建时间并回传落盘结果。
+  savePagesConfig: (entry: PagesConfigEntry) =>
+    invoke<PagesConfigEntry>("save_pages_config", { entry }),
+  deletePagesConfig: (id: string) => invoke<boolean>("delete_pages_config", { id }),
+  getRepoDefaultPagesConfig: (repoId: string) =>
+    invoke<PagesConfigEntry | null>("get_repo_default_pages_config", { repoId }),
   testPages: (repoId: string, config?: PagesConfig) =>
     invoke<string>("test_pages", { repoId, config }),
-  // 新的 Pages 配置 API（列表化）
-  savePagesConfigEntry: (entry: PagesConfigEntry) =>
-    invoke<PagesConfigEntry>("save_pages_config", { entry }),
-  deletePagesConfigById: (id: string) => invoke<boolean>("delete_pages_config", { id }),
-  getRepoDefaultPagesConfig: (repoId: string) => invoke<PagesConfigEntry | null>("get_repo_default_pages_config", { repoId }),
 
   // 定时请求（cron-job.org 云端调度，任务不落本地盘）
   listCronJobs: () => invoke<CronJob[]>("list_cron_jobs"),
@@ -217,4 +232,20 @@ export const api = {
   setCronJobEnabled: (jobId: number, enabled: boolean) =>
     invoke<void>("set_cron_job_enabled", { jobId, enabled }),
   cronJobHistory: (jobId: number) => invoke<CronJobRun[]>("cron_job_history", { jobId }),
+
+  // 容器备份与迁移
+  getContainerBackupDir: () => invoke<string>("get_container_backup_dir"),
+  listComposeStacks: (serverId: string) => invoke<ComposeStack[]>("list_compose_stacks", { serverId }),
+  inspectComposeStack: (serverId: string, project: string) =>
+    invoke<ComposeStackDetail>("inspect_compose_stack", { serverId, project }),
+  /** 快照（可选目标时再恢复到目标服务器）；返回记录 id，进度走 container://event。 */
+  startContainerTransfer: (request: ContainerRequest) =>
+    invoke<string>("start_container_transfer", { request }),
+  restoreContainerBundle: (request: ContainerRestoreRequest) =>
+    invoke<string>("restore_container_bundle", { request }),
+  cancelContainer: (recordId: string) => invoke<string>("cancel_container", { recordId }),
+  listContainerRecords: () => invoke<ContainerRecord[]>("list_container_records"),
+  deleteContainerRecord: (recordId: string) =>
+    invoke<boolean>("delete_container_record", { recordId }),
+  clearContainerRecords: () => invoke<void>("clear_container_records"),
 };

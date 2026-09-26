@@ -263,6 +263,71 @@ impl SshClient {
         Ok(())
     }
 
+    /// 通过 SFTP 下载远端文件到本地路径，并回调下载进度。
+    ///
+    /// 只负责传输：调用方给什么路径就写什么路径。大文件（容器备份包）建议先落到
+    /// `.part` 再自行改名，避免中断后留下一个看起来完整的半截包。
+    pub async fn download_file(
+        &self,
+        remote: &str,
+        local: &Path,
+        on_progress: &mut (dyn FnMut(u64, u64) + Send),
+    ) -> Result<()> {
+        let channel = self
+            .session
+            .channel_open_session()
+            .await
+            .map_err(|e| CoreError::ssh(format!("打开 SFTP 通道失败: {e}")))?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| CoreError::ssh(format!("启动 SFTP 子系统失败: {e}")))?;
+
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| CoreError::ssh(format!("初始化 SFTP 失败: {e}")))?;
+        sftp.set_timeout(120);
+
+        let total = sftp
+            .metadata(remote.to_string())
+            .await
+            .map_err(|e| CoreError::ssh(format!("读取远端文件信息失败 {remote}: {e}")))?
+            .len();
+
+        let mut remote_file = sftp
+            .open(remote.to_string())
+            .await
+            .map_err(|e| CoreError::ssh(format!("打开远端文件失败 {remote}: {e}")))?;
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CoreError::io_path(parent, e))?;
+        }
+        let mut file = tokio::fs::File::create(local)
+            .await
+            .map_err(|e| CoreError::io_path(local, e))?;
+
+        let mut buffer = vec![0u8; 256 * 1024];
+        let mut received = 0u64;
+        loop {
+            let read = remote_file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| CoreError::ssh(format!("下载数据失败 {remote}: {e}")))?;
+            if read == 0 {
+                break;
+            }
+            file.write_all(&buffer[..read])
+                .await
+                .map_err(|e| CoreError::io_path(local, e))?;
+            received += read as u64;
+            on_progress(received, total);
+        }
+
+        file.flush().await.map_err(|e| CoreError::io_path(local, e))?;
+        drop(file);
+        let _ = sftp.close().await;
+        Ok(())
+    }
+
     /// 主动断开连接。
     pub async fn disconnect(&self) {
         let _ = self

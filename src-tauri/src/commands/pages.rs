@@ -81,6 +81,12 @@ pub fn delete_pages_record(state: State<AppState>, record_id: String) -> Result<
     state.store.remove_pages_record(&record_id)
 }
 
+/// 批量删除 Pages 部署记录，返回真正删掉的条数。
+#[tauri::command(async)]
+pub fn delete_pages_records(state: State<AppState>, record_ids: Vec<String>) -> Result<usize> {
+    state.store.remove_pages_records_many(&record_ids)
+}
+
 #[tauri::command(async)]
 pub fn clear_pages_records(state: State<AppState>) -> Result<()> {
     state.store.clear_pages_records()
@@ -106,34 +112,13 @@ pub fn list_pages_configs(state: State<AppState>) -> Result<Vec<PagesConfigEntry
     Ok(Store::list_pages_configs(&config).into_iter().cloned().collect())
 }
 
-/// 保存一条 Pages 配置（新增或更新）。
+/// 保存一条 Pages 配置（新增或更新）：id 留空即新建，返回落盘后的条目。
 #[tauri::command(async)]
 pub fn save_pages_config(
     state: State<AppState>,
     entry: PagesConfigEntry,
 ) -> Result<PagesConfigEntry> {
-    let normalized = entry.config.clone().normalize();
-    if normalized.provider != "cloudflare" && normalized.provider != "github" {
-        return Err(CoreError::config(
-            "不支持的 Pages 平台（可选 cloudflare / github）",
-        ));
-    }
-    if normalized.provider == "github" {
-        // 无法在保存时验证远端，推迟到部署时检查
-        // let remote = state.store.load_config()?.repos.iter()
-        //     .find(|r| r.id == entry.repo_id)
-        //     .ok_or_else(|| CoreError::not_found("仓库不存在"))?
-        //     .remote
-        //     .clone();
-        // if remote.as_ref().map(|r| !r.contains("github.com")).unwrap_or(true) {
-        //     return Err(CoreError::config("GitHub Pages 要求仓库远端为 GitHub 地址"));
-        // }
-    }
-    state.store.mutate_config(|app| Store::save_pages_config(app, entry.clone()))?;
-    Ok(state.store.load_config()?.pages_configs.iter()
-        .find(|e| e.id == entry.id)
-        .unwrap()
-        .clone())
+    Store::save_pages_config(&state.store, entry)
 }
 
 /// 删除一条 Pages 配置（按 id）。

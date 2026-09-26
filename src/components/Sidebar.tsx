@@ -1,4 +1,4 @@
-import { Database, FolderOpen, GitBranch, History, Network, Rocket, Server, Settings, Webhook } from "lucide-react";
+import { Container, Database, FolderOpen, GitBranch, History, Network, Rocket, Server, Settings, Webhook } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink, useNavigate } from "react-router-dom";
 
@@ -13,6 +13,7 @@ const NAV_ITEMS = [
   { to: "/deploy", labelKey: "nav.deploy", icon: Rocket },
   { to: "/servers", labelKey: "nav.servers", icon: Server },
   { to: "/nginx", labelKey: "nav.nginx", icon: Network },
+  { to: "/containers", labelKey: "nav.containers", icon: Container },
   { to: "/cron-jobs", labelKey: "nav.cronJobs", icon: Webhook },
   { to: "/backups", labelKey: "nav.backups", icon: Database },
   { to: "/history", labelKey: "nav.history", icon: History },
@@ -24,6 +25,7 @@ export function Sidebar() {
   const liveRunning = useApp((state) => state.live?.status === "running");
   const backupRunning = useApp((state) => state.liveBackup?.status === "running");
   const pagesRunning = useApp((state) => state.livePages?.status === "running");
+  const containerRunning = useApp((state) => state.liveContainer?.status === "running");
   const navigate = useNavigate();
 
   return (
@@ -65,6 +67,9 @@ export function Sidebar() {
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}
             {item.to === "/backups" && backupRunning && (
+              <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
+            )}
+            {item.to === "/containers" && containerRunning && (
               <span className="ml-auto size-1.5 shrink-0 animate-pulse rounded-full bg-pos" />
             )}
           </NavLink>

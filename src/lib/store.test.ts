@@ -3,7 +3,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("./api", () => ({
   api: {
     listRepos: vi.fn(async () => []),
-    startDeployConfig: vi.fn(async () => "d1"),
+    deployConfigTargets: vi.fn(async () => 2),
     startPagesDeploy: vi.fn(async () => "p1"),
     listHistory: vi.fn(async () => []),
     listBackups: vi.fn(async () => []),
@@ -54,7 +54,7 @@ beforeEach(() => {
 
 describe("store 长任务接线", () => {
   it("部署事件写入 live：日志追加、完成后收敛状态并刷新历史", () => {
-    useApp.setState({ live: { recordId: "d1", lines: [], progress: 0, status: "running", record: null } });
+    useApp.setState({ live: { recordId: "d1", lines: [], progress: 0, progressMessage: "", status: "running", record: null } });
     useApp.getState().handleDeployEvent({ type: "log", level: "info", message: "编译中" });
     expect(useApp.getState().live?.lines).toEqual([{ level: "info", message: "编译中" }]);
 
@@ -92,7 +92,7 @@ describe("store 长任务接线", () => {
   });
 
   it("Pages 事件归约到 livePages（保证记录类型映射不错位）", () => {
-    useApp.setState({ livePages: { recordId: "p1", lines: [], progress: 0, status: "running", record: null } });
+    useApp.setState({ livePages: { recordId: "p1", lines: [], progress: 0, progressMessage: "", status: "running", record: null } });
     useApp.getState().handlePagesEvent({ type: "finished", record: pagesRecord("failed") });
     expect(useApp.getState().livePages?.status).toBe("failed");
     expect(useApp.getState().livePages?.record?.projectName).toBe("site");
@@ -106,32 +106,34 @@ describe("store 长任务接线", () => {
       recordId: "p1",
       lines: [],
       progress: 0,
+      progressMessage: "",
       status: "running",
       record: null,
     });
   });
 
-  it("按配置启动服务器部署：参数取自配置 id，建立 running 状态", async () => {
-    const id = await useApp.getState().startDeployConfig("config-1");
-    expect(id).toBe("d1");
-    expect(api.startDeployConfig).toHaveBeenCalledWith("config-1");
+  it("按配置发起批量部署：目标随配置 id 一起提交，recordId 留给 started 事件补齐", async () => {
+    const count = await useApp.getState().deployConfigTargets("config-1", ["s1", "s2"]);
+    expect(count).toBe(2);
+    expect(api.deployConfigTargets).toHaveBeenCalledWith("config-1", ["s1", "s2"]);
     expect(useApp.getState().live).toEqual({
-      recordId: "d1",
+      recordId: "",
       lines: [],
       progress: 0,
+      progressMessage: "",
       status: "running",
       record: null,
     });
   });
 
   it("服务器部署进行中时拒绝再次启动", async () => {
-    useApp.setState({ live: { recordId: "d1", lines: [], progress: 0, status: "running", record: null } });
-    await expect(useApp.getState().startDeployConfig("config-1")).rejects.toThrow();
-    expect(api.startDeployConfig).not.toHaveBeenCalled();
+    useApp.setState({ live: { recordId: "d1", lines: [], progress: 0, progressMessage: "", status: "running", record: null } });
+    await expect(useApp.getState().deployConfigTargets("config-1", ["s1"])).rejects.toThrow();
+    expect(api.deployConfigTargets).not.toHaveBeenCalled();
   });
 
   it("已有任务运行时拒绝并发启动", async () => {
-    useApp.setState({ livePages: { recordId: "p1", lines: [], progress: 0, status: "running", record: null } });
+    useApp.setState({ livePages: { recordId: "p1", lines: [], progress: 0, progressMessage: "", status: "running", record: null } });
     await expect(useApp.getState().startPagesDeploy({ repoId: "repo", skipBuild: false })).rejects.toThrow();
     expect(api.startPagesDeploy).not.toHaveBeenCalled();
   });

@@ -87,6 +87,12 @@ pub fn delete_backup(state: State<AppState>, backup_id: String) -> Result<bool> 
     state.store.remove_backup(&backup_id)
 }
 
+/// 批量删除备份记录，返回真正删掉的条数。
+#[tauri::command(async)]
+pub fn delete_backups(state: State<AppState>, backup_ids: Vec<String>) -> Result<usize> {
+    state.store.remove_backups_many(&backup_ids)
+}
+
 #[tauri::command(async)]
 pub fn clear_backups(state: State<AppState>) -> Result<()> {
     state.store.clear_backups()

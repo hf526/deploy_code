@@ -10,7 +10,7 @@ export interface TaskRecord {
 export type TaskEvent<TRecord extends TaskRecord> =
   | { type: "started"; recordId: string }
   | { type: "log"; level: LogLevel; message: string }
-  | { type: "progress"; percent: number }
+  | { type: "progress"; percent: number; message: string }
   | { type: "finished"; record: TRecord };
 
 /** 事件归约需要的最小副作用集合（由 store 提供）。 */
@@ -30,7 +30,14 @@ export interface TaskEventSink<TRecord extends TaskRecord> {
 export const MAX_LIVE_LINES = 6000;
 
 function runningTask<TRecord>(recordId: string): LiveTask<TRecord> {
-  return { recordId, lines: [], progress: 0, status: "running", record: null };
+  return {
+    recordId,
+    lines: [],
+    progress: 0,
+    progressMessage: "",
+    status: "running",
+    record: null,
+  };
 }
 
 /** 三类长任务共用的事件归约：维护日志 / 进度 / 状态，避免三份重复实现逐渐分叉。 */
@@ -56,7 +63,11 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
       return;
     }
     if (event.type === "progress") {
-      setLive({ ...runningTask(findRunningId()), progress: event.percent });
+      setLive({
+        ...runningTask(findRunningId()),
+        progress: event.percent,
+        progressMessage: event.message,
+      });
       return;
     }
     announce(event.record);
@@ -75,7 +86,7 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
       break;
     }
     case "progress":
-      setLive({ ...live, progress: event.percent });
+      setLive({ ...live, progress: event.percent, progressMessage: event.message });
       break;
     case "finished":
       setLive({ ...live, status: event.record.status, record: event.record, progress: 100 });

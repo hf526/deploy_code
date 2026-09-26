@@ -312,7 +312,10 @@ function FileEditorView({
                 event.preventDefault();
                 step(event.shiftKey ? -1 : 1);
               }
-              if (event.key === "Escape") setFindOpen(false);
+              if (event.key === "Escape") {
+                event.preventDefault();
+                setFindOpen(false);
+              }
             }}
             placeholder={t("repoDetail.findPlaceholder")}
             className="ui-input h-6 w-44 rounded px-2 text-[11px] text-ink placeholder:text-ink-faint"

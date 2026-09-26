@@ -7,8 +7,8 @@ use crate::cli::*;
 use crate::output;
 
 use super::{
-    claim_task_lock, find_record, format_duration, open_store, print_json, run_deploy, short_id,
-    truncate,
+    claim_task_lock, find_record, format_duration, open_store, print_json, run_deploy,
+    run_deploy_batch, short_id, truncate,
 };
 
 pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
@@ -50,21 +50,32 @@ pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
         },
     };
 
-    let server = if let Some(key) = args
+    // 目标服务器：--server 优先，其次配置里的全部服务器（顺序即执行顺序），最后仓库默认值。
+    let server_keys: Vec<String> = if let Some(key) = args
         .server
         .as_deref()
         .filter(|value| !value.trim().is_empty())
     {
-        Store::find_server(&config, key)?.clone()
-    } else if let Some(key) = saved.as_ref().map(|item| item.server_id.clone()) {
-        Store::find_server(&config, &key)?.clone()
+        vec![key.to_string()]
+    } else if let Some(ids) = saved
+        .as_ref()
+        .map(|item| item.server_ids.clone())
+        .filter(|ids| !ids.is_empty())
+    {
+        ids
     } else if let Some(default_id) = &repo.default_server_id {
-        Store::find_server(&config, default_id)
-            .map(|server| server.clone())
-            .map_err(|_| CoreError::config("仓库配置的默认服务器不存在，请用 --server 指定"))?
+        vec![default_id.clone()]
     } else {
         return Err(CoreError::config("请使用 --server 指定部署服务器"));
     };
+    // 先全部解析成真实 id：任何一台不存在就在动手前报错，不会发出半批部署。
+    let mut server_ids: Vec<String> = Vec::with_capacity(server_keys.len());
+    for key in &server_keys {
+        let id = Store::find_server(&config, key)?.id.clone();
+        if !server_ids.contains(&id) {
+            server_ids.push(id);
+        }
+    }
 
     let target_dir = args
         .dir
@@ -77,15 +88,21 @@ pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
                 .filter(|value| !value.trim().is_empty())
         })
         .or_else(|| Some(repo.default_target_dir.clone()).filter(|value| !value.trim().is_empty()))
-        .or_else(|| {
-            Some(server.default_target_dir.clone()).filter(|value| !value.trim().is_empty())
+        // 回落到服务器默认目录只适用于单台；多台共用一个目录，与 GUI 的配置语义一致。
+        .or_else(|| match server_ids.len() {
+            1 => Store::find_server(&config, &server_ids[0])
+                .ok()
+                .map(|server| server.default_target_dir.clone())
+                .filter(|value| !value.trim().is_empty()),
+            _ => None,
         })
         .ok_or_else(|| CoreError::config("请使用 --dir 指定部署目录"))?;
 
     let request = DeployRequest {
         repo_id: repo.id.clone(),
         rev,
-        server_id: server.id.clone(),
+        // 多台时由 run_deploy_batch 逐台覆盖，这里先放第一台。
+        server_id: server_ids[0].clone(),
         target_dir,
         // 显式 --script 表示用户明确要执行脚本，即使全局设置或配置关闭了脚本执行。
         run_scripts: if args.no_scripts {
@@ -120,8 +137,16 @@ pub(super) async fn deploy_command(cli: &Cli, args: &DeployArgs) -> Result<()> {
         },
     };
 
-    let record = run_deploy(&store, request, cli.json).await?;
-    if record.status == DeployStatus::Failed {
+    // 单台保持原有输出（含 prepare 提示）；多台交给与 GUI 同一套 run_targets，失败即停。
+    let records = if server_ids.len() == 1 {
+        vec![run_deploy(&store, request, cli.json).await?]
+    } else {
+        run_deploy_batch(&store, request, server_ids, cli.json).await?
+    };
+    if records
+        .iter()
+        .any(|record| record.status == DeployStatus::Failed)
+    {
         std::process::exit(2);
     }
     Ok(())

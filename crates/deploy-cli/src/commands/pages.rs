@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use deploy_core::models::{DeployStatus, PagesEvent, PagesRequest};
+use deploy_core::models::{
+    DeployStatus, PagesConfig, PagesConfigEntry, PagesEvent, PagesRequest,
+};
 use deploy_core::{CoreError, PagesEngine, Result, Store};
 use tokio::sync::mpsc;
 
@@ -21,57 +23,46 @@ pub(super) async fn pages_command(cli: &Cli, command: &PagesCommand) -> Result<(
             branch,
             publish_branch,
         } => {
-            let (repo_name, pages) = store.mutate_config(|config| {
-                let repo_id = Store::find_repo(config, repo)?.id.clone();
-                let repo_name = config
-                    .repos
-                    .iter()
-                    .find(|item| item.id == repo_id)
-                    .map(|item| item.name.clone())
-                    .unwrap_or_default();
-                let repo_mut = config
-                    .repos
-                    .iter_mut()
-                    .find(|item| item.id == repo_id)
-                    .expect("repo exists");
-
-                let mut pages = repo_mut.pages.clone().unwrap_or_default();
-                if let Some(value) = provider {
-                    pages.provider = value.trim().to_lowercase();
-                }
-                if let Some(value) = project {
-                    pages.project_name = value.trim().to_string();
-                }
-                if let Some(value) = build {
-                    pages.build_command = value.trim().to_string();
-                }
-                if let Some(value) = output {
-                    pages.output_dir = value.trim().to_string();
-                }
-                if let Some(value) = branch {
-                    pages.branch = value.trim().to_string();
-                }
-                if let Some(value) = publish_branch {
-                    pages.publish_branch = value.trim().to_string();
-                }
-                let pages = pages.normalize();
-                if pages.provider != "cloudflare" && pages.provider != "github" {
-                    return Err(CoreError::config(
-                        "不支持的 Pages 平台（可选 cloudflare / github）",
-                    ));
-                }
-                repo_mut.pages = if pages.provider == "github" || !pages.project_name.is_empty() {
-                    Some(pages.clone())
-                } else {
-                    None
-                };
-                Ok((repo_name, pages))
-            })?;
+            // 与 GUI 共用 Store::save_pages_config：配置存在 pages_configs 列表里，
+            // 并绑定为该仓库的默认配置。旧写法直接改 repo.pages —— 那个字段已不再落盘，
+            // 命令报「已更新」却什么都没保存。
+            let config = store.load_config()?;
+            let repo = Store::find_repo(&config, repo)?;
+            let mut entry = Store::get_repo_default_pages(&config, &repo.id)
+                .cloned()
+                .unwrap_or_else(|| {
+                    PagesConfigEntry::new(
+                        repo.id.clone(),
+                        repo.name.clone(),
+                        PagesConfig::default(),
+                    )
+                });
+            let mut pages = entry.config.clone();
+            if let Some(value) = provider {
+                pages.provider = value.trim().to_lowercase();
+            }
+            if let Some(value) = project {
+                pages.project_name = value.trim().to_string();
+            }
+            if let Some(value) = build {
+                pages.build_command = value.trim().to_string();
+            }
+            if let Some(value) = output {
+                pages.output_dir = value.trim().to_string();
+            }
+            if let Some(value) = branch {
+                pages.branch = value.trim().to_string();
+            }
+            if let Some(value) = publish_branch {
+                pages.publish_branch = value.trim().to_string();
+            }
+            entry.config = pages;
+            let saved = Store::save_pages_config(&store, entry)?;
 
             if cli.json {
-                return print_json(&pages);
+                return print_json(&saved.config);
             }
-            output::success(format!("已更新 {repo_name} 的 Pages 配置"));
+            output::success(format!("已更新 {} 的 Pages 配置", saved.repo_name));
             Ok(())
         }
         PagesCommand::Run {
@@ -91,6 +82,8 @@ pub(super) async fn pages_command(cli: &Cli, command: &PagesCommand) -> Result<(
             let engine = PagesEngine::new(store.clone());
             let request = PagesRequest {
                 repo_id: repo.id.clone(),
+                // CLI 没有按行选择的入口：留空表示沿用仓库绑定的默认 Pages 配置。
+                config_id: None,
                 provider: provider.clone(),
                 project_name: project.clone(),
                 build_command: build.clone(),

@@ -8,6 +8,7 @@ function makeLive(overrides: Partial<LiveTask<TaskRecord>> = {}): LiveTask<TaskR
     recordId: "",
     lines: [],
     progress: 0,
+    progressMessage: "",
     status: "running",
     record: null,
     ...overrides,
@@ -45,6 +46,7 @@ describe("applyTaskEvent", () => {
       recordId: "r1",
       lines: [],
       progress: 0,
+      progressMessage: "",
       status: "running",
       record: null,
     });
@@ -57,13 +59,14 @@ describe("applyTaskEvent", () => {
     expect(state.live?.lines).toEqual([{ level: "command", message: "hello" }]);
   });
 
-  it("无 live 时 progress 补建并带上百分比", () => {
+  it("无 live 时 progress 补建并带上百分比与文案", () => {
     const { state, sink } = makeSink(null, "r9");
-    applyTaskEvent({ type: "progress", percent: 42 }, sink);
+    applyTaskEvent({ type: "progress", percent: 42, message: "上传压缩包" }, sink);
     expect(state.live).toEqual({
       recordId: "r9",
       lines: [],
       progress: 42,
+      progressMessage: "上传压缩包",
       status: "running",
       record: null,
     });
@@ -86,6 +89,7 @@ describe("applyTaskEvent", () => {
       recordId: "new",
       lines: [],
       progress: 0,
+      progressMessage: "",
       status: "running",
       record: null,
     });
@@ -113,10 +117,12 @@ describe("applyTaskEvent", () => {
     expect(state.live?.lines[MAX_LIVE_LINES - 1].message).toBe("last");
   });
 
-  it("progress 更新百分比", () => {
+  it("progress 更新百分比与后端带来的步骤文案", () => {
     const { state, sink } = makeSink(makeLive({ recordId: "r1", progress: 10 }));
-    applyTaskEvent({ type: "progress", percent: 66 }, sink);
+    applyTaskEvent({ type: "progress", percent: 66, message: "解压到 releases" }, sink);
     expect(state.live?.progress).toBe(66);
+    // 文案曾经在这里被丢掉：界面只剩一个百分比，用户看不到卡在哪一步。
+    expect(state.live?.progressMessage).toBe("解压到 releases");
   });
 
   it("finished 收敛状态、进度并通知", () => {
@@ -127,6 +133,7 @@ describe("applyTaskEvent", () => {
       recordId: "r1",
       lines: [],
       progress: 100,
+      progressMessage: "",
       status: "failed",
       record,
     });
@@ -148,6 +155,7 @@ describe("reconcileLiveTask", () => {
       recordId: "r1",
       lines: [],
       progress: 100,
+      progressMessage: "",
       status: "success",
       record,
     });

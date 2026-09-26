@@ -441,20 +441,6 @@ fn pump_lines(pipe: impl Read, kind: OutputKind, tx: mpsc::Sender<(OutputKind, S
     }
 }
 
-/// 执行本地命令，非零退出码返回错误。
-pub fn run_checked(program: &str, args: &[String], cwd: Option<&Path>) -> Result<String> {
-    let output = run(program, args, cwd)?;
-    if !output.success() {
-        let detail = output.combined();
-        return Err(CoreError::Process(format!(
-            "`{program}` 执行失败（退出码 {}）：{}",
-            output.code,
-            if detail.is_empty() { "无输出" } else { &detail }
-        )));
-    }
-    Ok(output.stdout)
-}
-
 /// 计算本地文件的 SHA-256（十六进制小写），用于上传完整性校验。
 pub fn sha256_file(path: &Path) -> Result<String> {
     use sha2::{Digest, Sha256};

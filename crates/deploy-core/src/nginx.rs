@@ -430,7 +430,7 @@ fn check_failed_error(name: &str, output: &str, restored: bool) -> CoreError {
 
 /// 只保留 stdout 行：`exec_capture` 会把 stderr 行合并进来并加上 `[stderr] ` 前缀，
 /// docker 成功但输出警告时，这些行不能被当成容器 / 配置记录。
-fn stdout_lines(output: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn stdout_lines(output: &str) -> impl Iterator<Item = &str> {
     output.lines().filter(|line| !line.starts_with("[stderr] "))
 }
 

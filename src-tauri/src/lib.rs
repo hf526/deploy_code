@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use deploy_core::shutdown::OS_GRACE_SECS;
 use deploy_core::{BackupEngine, DeployEngine, Store};
 use state::AppState;
 use tauri::{Manager, RunEvent, WindowEvent};
@@ -25,6 +26,10 @@ pub fn run() {
             let _ = store.reconcile_interrupted();
             // 旧版「服务器单份 db_backup」升级为备份配置列表。
             let _ = store.migrate_backup_configs();
+            // 旧版「每仓库一份 repo.pages」升级为 Pages 配置列表（并绑定回仓库默认项）。
+            // 必须在任何一次写配置之前跑：repo.pages 是 skip_serializing 的字段，
+            // 配置一被重写就再也读不回来。
+            let _ = store.migrate_pages_configs();
             // 托盘文案先按已保存偏好初始化，前端启动后会按解析出的界面语言再同步一次。
             let language = store
                 .load_config()
@@ -32,7 +37,7 @@ pub fn run() {
                 .unwrap_or_default();
             app.manage(AppState::new(Arc::new(store)));
             tray::create(app.handle(), &language)?;
-            // 定时备份：应用运行期间（含隐藏到托盘）按设置的时间点自动执行。
+            // 定时任务：应用运行期间（含隐藏到托盘）按设置的时间点自动备份与关机。
             scheduler::spawn(app.handle().clone());
             Ok(())
         })
@@ -48,10 +53,14 @@ pub fn run() {
             commands::app::get_settings,
             commands::app::save_settings,
             commands::app::export_config,
+            commands::app::preview_config_import,
             commands::app::import_config,
             commands::app::reveal_path,
             commands::app::get_autostart,
             commands::app::set_autostart,
+            commands::shutdown::get_shutdown_status,
+            commands::shutdown::schedule_shutdown,
+            commands::shutdown::cancel_shutdown,
             commands::tray::set_tray_language,
             commands::repos::list_repos,
             commands::repos::repo_detail,
@@ -103,8 +112,17 @@ pub fn run() {
             commands::nginx::save_nginx_config,
             commands::nginx::delete_nginx_config,
             commands::nginx::reload_nginx,
+            commands::container::get_container_backup_dir,
+            commands::container::list_compose_stacks,
+            commands::container::inspect_compose_stack,
+            commands::container::start_container_transfer,
+            commands::container::restore_container_bundle,
+            commands::container::cancel_container,
+            commands::container::list_container_records,
+            commands::container::delete_container_record,
+            commands::container::clear_container_records,
             commands::deploy::start_deploy,
-            commands::deploy::start_deploy_config,
+            commands::deploy::deploy_config_targets,
             commands::deploy::list_deploy_configs,
             commands::deploy::save_deploy_config,
             commands::deploy::delete_deploy_config,
@@ -116,6 +134,7 @@ pub fn run() {
             commands::backup::list_backups,
             commands::backup::get_backup,
             commands::backup::delete_backup,
+            commands::backup::delete_backups,
             commands::backup::clear_backups,
             commands::backup::test_backup,
             commands::backup::list_backup_targets,
@@ -127,6 +146,7 @@ pub fn run() {
             commands::pages::list_pages_records,
             commands::pages::get_pages_record,
             commands::pages::delete_pages_record,
+            commands::pages::delete_pages_records,
             commands::pages::clear_pages_records,
             commands::pages::save_pages_config,
             commands::pages::list_pages_configs,
@@ -138,6 +158,7 @@ pub fn run() {
             commands::history::list_history,
             commands::history::get_record,
             commands::history::delete_record,
+            commands::history::delete_records,
             commands::history::clear_history,
         ])
         .build(tauri::generate_context!())
@@ -156,11 +177,22 @@ pub fn run() {
                 let state = app_handle.state::<AppState>();
                 let pages_active = state.has_active_pages();
                 let nginx_active = state.has_active_nginx(); // Nginx 是否正在执行
+                let container_active = state.has_active_container();
                 let mut deploys = state.take_deploys();
                 // 取消部署后仍在做的远端清理也要纳入退出清理。
                 deploys.extend(state.take_pending_cleanups());
                 let backups = state.take_backups();
-                if deploys.is_empty() && backups.is_empty() && !pages_active && !nginx_active {
+                let mut containers = state.take_containers();
+                // 取消容器任务后仍在做的远端清理也要纳入退出清理，
+                // 否则取消途中退出会把含项目文件与卷 dump 的备份包留在两台服务器上。
+                containers.extend(state.take_pending_container_cleanups());
+                if deploys.is_empty()
+                    && backups.is_empty()
+                    && containers.is_empty()
+                    && !pages_active
+                    && !nginx_active
+                    && !container_active
+                {
                     // 没有进行中的任务：正常退出。
                     return;
                 }
@@ -175,9 +207,20 @@ pub fn run() {
                     for (_, backup) in &backups {
                         backup.abort.abort();
                     }
+                    for (_, container) in &containers {
+                        container.abort.abort();
+                    }
                     // 留一点时间给已在途的远端脚本写完 pidfile。
                     tokio::time::sleep(Duration::from_millis(400)).await;
-                    cleanup_remote_tasks(&handle, deploys, backups).await;
+                    // 每台 5s 的远端清理没有总上限：定时关机只给系统 OS_GRACE_SECS 秒，
+                    // 多台不可达时会在清理中途被系统强杀，连本地子进程都来不及回收。
+                    // 超预算就提前收尾，保证下面的 kill_all_children 一定跑到。
+                    let budget = Duration::from_secs(u64::from(OS_GRACE_SECS.saturating_sub(6)));
+                    let _ = tokio::time::timeout(
+                        budget,
+                        cleanup_remote_tasks(&handle, deploys, backups, containers),
+                    )
+                    .await;
                     // Pages 是阻塞任务、无法 abort：再兜底杀一次清理期间新拉起的子进程。
                     deploy_core::process::kill_all_children();
                     EXIT_CLEANUP_DONE.store(true, Ordering::SeqCst);
@@ -191,11 +234,12 @@ pub fn run() {
     });
 }
 
-/// 逐个重连服务器，终止仍在运行的部署/备份脚本进程组；单项有独立超时，互不挤占预算。
+/// 逐个重连服务器，终止仍在运行的远端脚本进程组并删除工作目录；单项有独立超时，互不挤占预算。
 async fn cleanup_remote_tasks(
     app: &tauri::AppHandle,
     deploys: Vec<(String, state::ActiveDeploy)>,
     backups: Vec<(String, state::ActiveBackup)>,
+    containers: Vec<(String, state::ActiveContainer)>,
 ) {
     // 每台服务器/每个任务最多 5s：慢或不可达的服务器不会吃掉其它任务的清理时间。
     const PER_TASK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -206,7 +250,8 @@ async fn cleanup_remote_tasks(
         Err(_) => return,
     };
     let deploy_engine = DeployEngine::new(store.clone());
-    let backup_engine = BackupEngine::new(store);
+    let backup_engine = BackupEngine::new(store.clone());
+    let container_engine = deploy_core::ContainerEngine::new(store);
 
     for (record_id, active) in &deploys {
         let server = match Store::find_server(&config, &active.server_id) {
@@ -229,5 +274,19 @@ async fn cleanup_remote_tasks(
             backup_engine.cleanup_remote_script(&server, &active.record_id),
         )
         .await;
+    }
+    // 容器任务一台会碰两台机器（来源打包 + 目标恢复），逐台清。
+    for (_, active) in &containers {
+        for server_id in &active.server_ids {
+            let server = match Store::find_server(&config, server_id) {
+                Ok(server) => server.clone(),
+                Err(_) => continue,
+            };
+            let _ = tokio::time::timeout(
+                PER_TASK_TIMEOUT,
+                container_engine.cleanup_remote(&server, &active.record_id),
+            )
+            .await;
+        }
     }
 }

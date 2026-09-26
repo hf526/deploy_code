@@ -138,8 +138,10 @@ export function BackupConfigModal({
     if (testing) return;
     setTesting(true);
     try {
-      if (config) {
-        // 已保存的配置：先保存当前表单再测试，否则后端会回退到配置里的旧目标。
+      // 只在配置真正落过盘时才「先保存再测试」：复制出来的副本 id 为空，
+      // 直接 save 会静默新建一条用户还没确认的配置，副本按未保存表单测试即可。
+      if (config?.id) {
+        // 已保存的配置先落盘再测，否则后端会回退到配置里的旧目标。
         const saved = await save();
         if (!saved) return;
         // 表单已写盘：同步列表，避免关闭弹窗后仍显示旧名称 / 旧目标。

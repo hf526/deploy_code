@@ -749,6 +749,9 @@ function ServerFormModal({
       onClose={requestClose}
       title={initial ? t("servers.editTitle", { name: initial.name }) : t("servers.addTitle")}
       subtitle={t("servers.formSubtitle")}
+      onEnter={() => {
+        if (!busy && !testing) void save();
+      }}
       footer={
         <>
           <Button

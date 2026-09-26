@@ -149,7 +149,16 @@ impl Git {
 
     /// 工作区状态（当前分支、领先/落后提交数、变动文件）。
     pub fn status(&self) -> Result<RepoStatus> {
-        let output = self.run(&["status", "--porcelain=v1", "-b", "--untracked-files=normal"])?;
+        // `-z` 按 NUL 分段且不对路径做引号转义：重命名 / 复制只在新路径那条里出现，
+        // 旧路径紧随其后单独成段。默认的 `R  旧 -> 新` 形式会把整串当成文件名，
+        // 列表里显示假路径，拿它去 diff / 暂存也都匹配不到文件。
+        let output = self.run(&[
+            "status",
+            "--porcelain=v1",
+            "-b",
+            "-z",
+            "--untracked-files=normal",
+        ])?;
 
         let mut status = RepoStatus {
             branch: String::new(),
@@ -159,19 +168,29 @@ impl Git {
             changes: Vec::new(),
         };
 
-        for line in output.lines() {
-            if let Some(header) = line.strip_prefix("## ") {
+        let mut records = output.split('\0');
+        while let Some(record) = records.next() {
+            if record.is_empty() {
+                continue;
+            }
+            if let Some(header) = record.strip_prefix("## ") {
                 parse_status_header(header, &mut status);
                 continue;
             }
-            if line.len() < 3 {
+            if record.len() < 3 {
                 continue;
             }
-            let (code, path) = line.split_at(2);
+            let (code, path) = record.split_at(2);
+            if code.starts_with('R') || code.starts_with('C') {
+                // 丢掉紧跟其后的旧路径段：它不是一个独立文件的条目。
+                records.next();
+            }
             status.changes.push(FileChange {
                 code: code.to_string(),
                 status: describe_code(code),
-                path: path.trim().to_string(),
+                // 前两列与路径之间固定一个空格，只剥这一个字符，
+                // 路径自身含首尾空格时不能被当作空白处理掉。
+                path: path.strip_prefix(' ').unwrap_or(path).to_string(),
             });
         }
         Ok(status)
@@ -1338,5 +1357,67 @@ mod tests {
         assert!(git.status().unwrap().changes.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_lists_only_the_new_path_for_renamed_files() {
+        if !git_available() {
+            return;
+        }
+        let base =
+            std::env::temp_dir().join(format!("deploycode-git-rename-{}", uuid::Uuid::new_v4()));
+        let work = base.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join("old name.txt"), "hello world content").unwrap();
+        std::fs::write(work.join("keep.txt"), "keep").unwrap();
+
+        let git = Git::open(&work).unwrap();
+        git.run(&["init"]).unwrap();
+        git.run(&["config", "user.name", "DeployCode Test"]).unwrap();
+        git.run(&["config", "user.email", "test@example.com"]).unwrap();
+        git.run(&["config", "commit.gpgsign", "false"]).unwrap();
+        git.commit_all("init", false).unwrap();
+
+        std::fs::rename(work.join("old name.txt"), work.join("new name.txt")).unwrap();
+        git.run(&["add", "-A"]).unwrap();
+        let changes = git.status().unwrap().changes;
+        assert_eq!(changes.len(), 1, "旧路径段不该算一条：{changes:?}");
+        let renamed = &changes[0];
+        // 显示与后续操作（diff / 暂存 / 丢弃）都以新路径为准，且带空格的路径不被引号包住。
+        assert_eq!(renamed.path, "new name.txt");
+        assert!(renamed.code.starts_with('R'), "code = {}", renamed.code);
+        assert_eq!(renamed.status, "重命名");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn parse_decorations_labels_local_remote_tag_and_head() {
+        // `git log %D` 的典型形态：HEAD 与当前分支同指一条提交，远端与标签混排。
+        let refs = parse_decorations(
+            "HEAD -> main, origin/main, origin/HEAD, tag: v1.2.0",
+            "main",
+            &["origin".to_string()],
+        );
+        let shaped: Vec<(&str, &str, bool)> = refs
+            .iter()
+            .map(|item| (item.kind.as_str(), item.name.as_str(), item.is_head))
+            .collect();
+        assert_eq!(
+            shaped,
+            vec![
+                ("local", "main", true),
+                ("remote", "origin/main", false),
+                ("remote", "origin/HEAD", false),
+                ("tag", "v1.2.0", false),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_decorations_ignores_detached_head_and_empty_decorations() {
+        // 游离 HEAD 只打印一个裸 "HEAD"：不该画成引用，否则界面上多出一个切不动的假标签。
+        assert!(parse_decorations("HEAD", "main", &[]).is_empty());
+        assert!(parse_decorations("", "main", &[]).is_empty());
     }
 }

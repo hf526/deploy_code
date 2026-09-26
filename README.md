@@ -12,12 +12,23 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 - 托盘菜单支持「显示主窗口」与「退出程序」，只有「退出程序」才会彻底退出（退出前仍会清理远端部署/备份脚本与本地子进程）
 - 托盘菜单文案跟随界面语言（中文 / English）
 
+### 定时关机（Windows）
+
+在 **设置 → 启动与自动化** 配置，到点让运行 DeployCode 的这台电脑关机：
+
+- 每天定时：设置一个 24 小时制时间点，到点进入 60 秒可取消倒计时，结束后下发系统关机请求
+- 倒计时关机：手动指定 1-1440 分钟后关机，随时可在设置页或底部状态栏取消
+- 关机前先正常退出本程序：终止本地构建 / 部署子进程，并回收服务器上仍在执行的部署与备份脚本，避免远端留下半截任务
+- 只在软件运行期间生效（窗口收到托盘也算）：软件启动前已错过的时间点不补跑，不会开机就被关机；要让每天都能重新排上，需同时开启「开机时自动启动」
+- 底部状态栏常驻显示剩余时间与「取消关机」，倒计时进入最后 60 秒会转为醒目颜色
+
 ### 仓库管理
 
 - 添加本地文件夹（IDE 式：选目录即用，不要求已经是 Git 仓库），支持多仓库标签页
 - 非 Git 文件夹可绑定远端地址（origin）：自动 `git init` 后绑定，即可提交并推送到指定仓库
 - 分支切换 / 创建 / 删除，远程分支查看
-- 提交历史、提交图（含分支 / 标签引用）、工作区状态、文件 diff
+- 提交图（含分支 / 标签引用）：仓库详情页左栏「提交图」开关打开为底部面板，展示最近 200 条跨分支提交，点分支标签即可切分支；合并提交画成菱形，HEAD 与当前分支高亮
+- 工作区状态与文件 diff 在左栏「源代码管理」面板
 - 文件树浏览、文件预览 / 编辑、内容搜索与批量替换
 - 提交改动、硬回退、fetch / pull / push
 - 提交保护：自动检测 `.env` / `*.pem` / `id_rsa` / `credentials` 等疑似敏感文件，默认阻止提交，界面二次确认后才放行（CLI 需 `--allow-sensitive`）
@@ -58,6 +69,20 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 - 实时日志与进度；支持环境检查（pg_dump 版本 + 目标连通性）
 - 备份记录持久化，可查看 / 删除 / 清空
 
+### 容器备份与迁移（docker-compose）
+
+在 **容器** 页选择一台服务器，扫描出它上面由 `docker compose` 管理的项目，把整套服务无损搬到另一台服务器：
+
+- 一个项目打包成**一个本机备份包**（`.tar`）：项目目录原样（compose 文件、`.env`、bind mount 的本地文件、build 上下文）+ 每个命名数据卷的 tar + `docker save` 出的镜像 tar + `manifest.json` 清单
+- **无损的关键是项目名**：compose 的命名卷叫 `<项目名>_<短名>`，恢复时保持同一个项目名，新容器就会挂到刚灌好数据的卷上
+- 数据经本机中转（源机 -> 本机备份包 -> 目标机），两台服务器之间不需要互相配 SSH 信任；这份备份包可以反复用于恢复
+- 只备份到本机、或备份后接着迁移到目标机，是同一条流程的两个出口；恢复目标目录默认照抄来源机的项目目录
+- 打包前可选「暂停源服务、卷导完立即恢复」：数据库这类服务在写入中途的快照可能不一致
+- 预检与提示：compose 命令可用性（`docker compose` / `docker-compose`）、远端磁盘空间、卷能否从宿主机直接读（不能则改用容器内 `tar`）、匿名卷与项目目录之外的 bind mount 会明确提示带不走
+- 快照与恢复都在服务器上跑一个可中断的脚本（pidfile + 进程组终止），进度与结果实时显示，任务记录持久化；应用退出会回收两台服务器上残留的工作目录
+- 已完成的记录可再次「恢复到服务器」（用本机备份包），需显式确认同名数据卷会被覆盖
+- CLI：`deploy-code-cli container ls / inspect / backup / migrate / restore / list / show`
+
 ### Pages 部署（Cloudflare / GitHub）
 
 仓库本地构建（可选）后一键发布静态产物，配置在「部署」页与服务器部署统一列表管理，按仓库选择平台：
@@ -81,7 +106,7 @@ GitHub Pages（`gh-pages`）：
 
 ### CLI
 
-命令行覆盖仓库 / 分支 / 服务器 / 部署 / 备份 / Pages / 历史等操作，适合脚本化与服务器环境使用。
+命令行覆盖仓库 / 分支 / 服务器 / 部署 / 备份 / 容器 / Pages / 历史等操作，适合脚本化与服务器环境使用。
 
 ## 技术栈
 
@@ -119,7 +144,7 @@ deploy_code/
 配置与部署历史保存在系统数据目录，**不会写入代码仓库**：
 
 - Windows：`%APPDATA%\deploycode\DeployCode\data`
-- 文件：`config.json`（服务器 / 仓库 / 部署配置 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`pages.json`（Pages 部署记录）、`temp/`（临时归档）
+- 文件：`config.json`（服务器 / 仓库 / 部署配置 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`containers.json`（容器备份 / 迁移记录）、`pages.json`（Pages 部署记录）、`containers/`（容器备份包）、`temp/`（临时归档）
 
 > ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
 
@@ -200,6 +225,19 @@ deploy-code-cli backup test prod
 deploy-code-cli backup run prod --target Aiven
 deploy-code-cli backup list -n 10
 deploy-code-cli backup show <记录ID>
+
+# 容器备份与迁移（docker-compose 项目经本机中转）
+deploy-code-cli container dir
+deploy-code-cli container ls --server prod
+deploy-code-cli container inspect --server prod --project blog
+# 只打包到本机（默认带数据卷与镜像；--pause 会在导出卷前暂停源服务）
+deploy-code-cli container backup --server prod --project blog --pause
+# 打包并迁移到另一台服务器（来源服务器上的服务保持不变）
+deploy-code-cli container migrate --server prod --project blog --to staging --dir /opt/blog
+# 用本机已有的备份包再恢复到一台服务器
+deploy-code-cli container restore --bundle "<数据目录>\containerslog-20260926-031000-ab12cd34.tar" --to staging
+deploy-code-cli container list -n 10
+deploy-code-cli container show <记录ID>
 
 # Cloudflare Pages 部署
 deploy-code-cli pages config myapp --project my-site --build "npm run build" --output dist

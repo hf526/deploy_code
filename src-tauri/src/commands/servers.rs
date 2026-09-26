@@ -23,6 +23,10 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
     if server.port == 0 {
         return Err(CoreError::config("SSH 端口必须在 1-65535 之间"));
     }
+    // 默认部署目录会直接填进部署表单，和部署时同样要求服务器上的绝对路径。
+    if !server.default_target_dir.trim().is_empty() {
+        server.default_target_dir = deploy_core::release::normalize_target(&server.default_target_dir)?;
+    }
     if server.id.trim().is_empty() {
         server.id = new_id();
     }
@@ -57,10 +61,8 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
             .map(|saved| saved.id.clone())
             .collect();
         config.backup_configs.retain(|saved| saved.server_id != server_id);
-        // 服务器已删除，指向它的部署配置同样不可用（部署记录保留作历史）。
-        config
-            .deploy_configs
-            .retain(|saved| saved.server_id != server_id);
+        // 服务器已删除：从各部署配置的目标列表里摘掉这一台，没有剩余目标的配置整条删除。
+        Store::detach_server_from_deploy_configs(config, &server_id);
         // 定时备份若引用被删配置，清空引用，避免每天到点报错。
         if config
             .settings

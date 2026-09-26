@@ -1,18 +1,25 @@
 import { create } from "zustand";
 
 import { api } from "./api";
+import { containerSummary } from "./container";
 import i18n from "./i18n";
 import { applyTaskEvent, reconcileLiveTask } from "./liveTask";
+import { formatClockTime } from "./shutdown";
 import type {
   BackupConfig,
   BackupEvent,
   BackupRecord,
   BackupRequest,
   BackupTarget,
+  ContainerEvent,
+  ContainerRecord,
+  ContainerRequest,
+  ContainerRestoreRequest,
   DeployConfig,
   DeployEvent,
   DeployRecord,
   LiveBackup,
+  LiveContainer,
   LiveDeploy,
   LivePages,
   PagesConfigEntry,
@@ -22,6 +29,7 @@ import type {
   RepoInfo,
   ServerConfig,
   Settings,
+  ShutdownStatus,
 } from "./types";
 
 export interface Toast {
@@ -47,12 +55,16 @@ export const defaultSettings: Settings = {
   githubToken: "",
   cronjobApiKey: "",
   pagesHistoryLimit: 200,
+  containerHistoryLimit: 200,
+  containerTimeoutSecs: 7200,
   language: "",
   atomicRelease: false,
   releaseKeep: 5,
   scheduledBackupEnabled: false,
   scheduledBackupTime: "03:00",
   scheduledBackupConfigId: null,
+  scheduledShutdownEnabled: false,
+  scheduledShutdownTime: "04:00",
 };
 
 let toastSeq = 0;
@@ -70,10 +82,14 @@ interface AppStore {
   deployConfigs: DeployConfig[];
   pagesRecords: PagesDeployRecord[];
   pagesConfigs: PagesConfigEntry[];
+  containerRecords: ContainerRecord[];
   toasts: Toast[];
   live: LiveDeploy | null;
   liveBackup: LiveBackup | null;
   livePages: LivePages | null;
+  liveContainer: LiveContainer | null;
+  /** 排定中的关机状态；null 表示还没拿到后端状态，此时界面不显示倒计时。 */
+  shutdownStatus: ShutdownStatus | null;
 
   loadAll: () => Promise<void>;
   refreshRepos: (silent?: boolean) => Promise<void>;
@@ -88,12 +104,15 @@ interface AppStore {
   refreshDeployConfigs: () => Promise<void>;
   refreshPagesRecords: (repoId?: string | null) => Promise<void>;
   refreshPagesConfigs: () => Promise<void>;
+  refreshContainerRecords: () => Promise<void>;
   setSettings: (settings: Settings) => void;
+  setShutdownStatus: (status: ShutdownStatus) => void;
+  cancelShutdown: () => Promise<void>;
 
   toast: (kind: Toast["kind"], message: string) => void;
   dismissToast: (id: number) => void;
 
-  startDeployConfig: (configId: string) => Promise<string>;
+  deployConfigTargets: (configId: string, serverIds: string[]) => Promise<number>;
   redeploy: (recordId: string) => Promise<string>;
   cancelDeploy: () => Promise<void>;
   handleDeployEvent: (event: DeployEvent) => void;
@@ -103,6 +122,11 @@ interface AppStore {
 
   startPagesDeploy: (request: PagesRequest) => Promise<string>;
   handlePagesEvent: (event: PagesEvent) => void;
+
+  startContainerTransfer: (request: ContainerRequest) => Promise<string>;
+  restoreContainerBundle: (request: ContainerRestoreRequest) => Promise<string>;
+  cancelContainer: () => Promise<void>;
+  handleContainerEvent: (event: ContainerEvent) => void;
 }
 
 // 仓库列表刷新的 in-flight 请求：轮询与手动点击会撞在一起，复用同一个请求，
@@ -122,10 +146,13 @@ export const useApp = create<AppStore>((set, get) => ({
   deployConfigs: [],
   pagesRecords: [],
   pagesConfigs: [],
+  containerRecords: [],
   toasts: [],
   live: null,
   liveBackup: null,
   livePages: null,
+  liveContainer: null,
+  shutdownStatus: null,
 
   loadAll: async () => {
     // 各接口独立处理，避免单个失败（如历史文件损坏）导致设置/服务器全部回退成默认值。
@@ -140,6 +167,8 @@ export const useApp = create<AppStore>((set, get) => ({
       deployConfigsResult,
       pagesResult,
       pagesConfigsResult,
+      containersResult,
+      shutdownResult,
     ] = await Promise.allSettled([
       api.listRepos(),
       api.listServers(),
@@ -151,6 +180,8 @@ export const useApp = create<AppStore>((set, get) => ({
       api.listDeployConfigs(),
       api.listPagesRecords(),
       api.listPagesConfigs(),
+      api.listContainerRecords(),
+      api.getShutdownStatus(),
     ]);
     set({
       ready: true,
@@ -168,6 +199,10 @@ export const useApp = create<AppStore>((set, get) => ({
       ...(pagesConfigsResult.status === "fulfilled"
         ? { pagesConfigs: pagesConfigsResult.value }
         : {}),
+      ...(containersResult.status === "fulfilled"
+        ? { containerRecords: containersResult.value }
+        : {}),
+      ...(shutdownResult.status === "fulfilled" ? { shutdownStatus: shutdownResult.value } : {}),
     });
     const failures = [
       reposResult,
@@ -180,6 +215,8 @@ export const useApp = create<AppStore>((set, get) => ({
       deployConfigsResult,
       pagesResult,
       pagesConfigsResult,
+      containersResult,
+      shutdownResult,
     ].filter((result): result is PromiseRejectedResult => result.status === "rejected");
     if (failures.length > 0) {
       // 汇总所有失败，避免只看到第一个出错接口而忽略后面的。
@@ -189,7 +226,12 @@ export const useApp = create<AppStore>((set, get) => ({
 
     // 对账后台任务：重载后可能错过 finished/started 事件，用持久化记录收敛，避免 live 永久卡在 running。
     // history 等列表接口返回的是「新 -> 旧」，find 直接取最近一条即可。
-    const { live: currentLive, liveBackup: currentBackup, livePages: currentPages } = get();
+    const {
+      live: currentLive,
+      liveBackup: currentBackup,
+      livePages: currentPages,
+      liveContainer: currentContainer,
+    } = get();
     const nextLive = reconcileLiveTask(
       currentLive,
       historyResult.status === "fulfilled" ? historyResult.value : null,
@@ -205,6 +247,11 @@ export const useApp = create<AppStore>((set, get) => ({
       pagesResult.status === "fulfilled" ? pagesResult.value : null,
     );
     if (nextPages !== undefined) set({ livePages: nextPages });
+    const nextContainer = reconcileLiveTask(
+      currentContainer,
+      containersResult.status === "fulfilled" ? containersResult.value : null,
+    );
+    if (nextContainer !== undefined) set({ liveContainer: nextContainer });
   },
 
   // silent：后台自动刷新时使用，失败不弹 toast（否则轮询会持续刷错误提示）。
@@ -315,7 +362,38 @@ export const useApp = create<AppStore>((set, get) => ({
     }
   },
 
+  refreshContainerRecords: async () => {
+    try {
+      set({ containerRecords: await api.listContainerRecords() });
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
+
   setSettings: (settings) => set({ settings }),
+
+  setShutdownStatus: (status) => {
+    const previous = get().shutdownStatus;
+    set({ shutdownStatus: status });
+    // 定时任务到点排下的关机：用户可能在别的页面，用 toast 说一声。
+    // 手动倒计时由设置页自己提示，同一动作不弹两次。
+    const armed = status.pending;
+    if (armed && armed.source === "scheduled" && previous?.pending?.atMs !== armed.atMs) {
+      get().toast(
+        "info",
+        i18n.t("settings.shutdown.armedToast", { time: formatClockTime(armed.atMs) }),
+      );
+    }
+  },
+
+  cancelShutdown: async () => {
+    try {
+      set({ shutdownStatus: await api.cancelShutdown() });
+      get().toast("success", i18n.t("settings.shutdown.cancelled"));
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
 
   toast: (kind, message) => {
     const id = ++toastSeq;
@@ -325,20 +403,19 @@ export const useApp = create<AppStore>((set, get) => ({
 
   dismissToast: (id) => set((state) => ({ toasts: state.toasts.filter((t) => t.id !== id) })),
 
-  /** 按保存的部署配置发起部署：参数由后端从配置读取，避免前端传参不一致。 */
-  startDeployConfig: async (configId) => {
+  /** 按配置发起一批部署：服务器取自配置已登记的目标，返回本批覆盖的台数。 */
+  deployConfigTargets: async (configId, serverIds) => {
     if (get().live?.status === "running") {
       const message = i18n.t("deploy.toast.running");
       get().toast("error", message);
       throw new Error(message);
     }
     set({
-      live: { recordId: "", lines: [], progress: 0, status: "running", record: null },
+      live: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
     });
     try {
-      const recordId = await api.startDeployConfig(configId);
-      set((state) => (state.live ? { live: { ...state.live, recordId } } : {}));
-      return recordId;
+      // 一台一条记录，recordId 交给各自的 started 事件补齐，这里不回写。
+      return await api.deployConfigTargets(configId, serverIds);
     } catch (error) {
       set({ live: null });
       get().toast("error", String(error));
@@ -352,7 +429,7 @@ export const useApp = create<AppStore>((set, get) => ({
       get().toast("error", message);
       throw new Error(message);
     }
-    set({ live: { recordId: "", lines: [], progress: 0, status: "running", record: null } });
+    set({ live: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null } });
     try {
       const newId = await api.redeploy(recordId);
       set((state) => (state.live ? { live: { ...state.live, recordId: newId } } : {}));
@@ -414,7 +491,7 @@ export const useApp = create<AppStore>((set, get) => ({
       throw new Error(message);
     }
     set({
-      liveBackup: { recordId: "", lines: [], progress: 0, status: "running", record: null },
+      liveBackup: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
     });
     try {
       const recordId = await api.startBackup(request);
@@ -456,7 +533,7 @@ export const useApp = create<AppStore>((set, get) => ({
       throw new Error(message);
     }
     set({
-      livePages: { recordId: "", lines: [], progress: 0, status: "running", record: null },
+      livePages: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
     });
     try {
       const recordId = await api.startPagesDeploy(request);
@@ -488,6 +565,99 @@ export const useApp = create<AppStore>((set, get) => ({
           get().toast(
             "error",
             i18n.t("pages.toast.failed", { name, error: record.error ?? i18n.t("common.unknownError") }),
+          );
+        }
+      },
+    });
+  },
+
+  /** 快照（带 target 时同时恢复到目标服务器）；进度与结果走 container://event。 */
+  startContainerTransfer: async (request) => {
+    if (get().liveContainer?.status === "running") {
+      const message = i18n.t("containers.toast.running");
+      get().toast("error", message);
+      throw new Error(message);
+    }
+    set({
+      liveContainer: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+    });
+    try {
+      const recordId = await api.startContainerTransfer(request);
+      set((state) =>
+        state.liveContainer ? { liveContainer: { ...state.liveContainer, recordId } } : {},
+      );
+      return recordId;
+    } catch (error) {
+      set({ liveContainer: null });
+      get().toast("error", String(error));
+      throw error;
+    }
+  },
+
+  restoreContainerBundle: async (request) => {
+    if (get().liveContainer?.status === "running") {
+      const message = i18n.t("containers.toast.running");
+      get().toast("error", message);
+      throw new Error(message);
+    }
+    set({
+      liveContainer: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+    });
+    try {
+      const recordId = await api.restoreContainerBundle(request);
+      set((state) =>
+        state.liveContainer ? { liveContainer: { ...state.liveContainer, recordId } } : {},
+      );
+      return recordId;
+    } catch (error) {
+      set({ liveContainer: null });
+      get().toast("error", String(error));
+      throw error;
+    }
+  },
+
+  cancelContainer: async () => {
+    const { liveContainer, containerRecords } = get();
+    if (!liveContainer || liveContainer.status !== "running") return;
+    const recordId =
+      liveContainer.recordId || containerRecords.find((item) => item.status === "running")?.id;
+    if (!recordId) return;
+    try {
+      await api.cancelContainer(recordId);
+      set((state) =>
+        state.liveContainer?.status === "running" &&
+        (!state.liveContainer.recordId || state.liveContainer.recordId === recordId)
+          ? { liveContainer: { ...state.liveContainer, recordId, status: "failed", progress: 100 } }
+          : {},
+      );
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
+
+  handleContainerEvent: (event) => {
+    applyTaskEvent<ContainerRecord>(event, {
+      getLive: () => get().liveContainer,
+      setLive: (live) => set({ liveContainer: live }),
+      findRunningId: () =>
+        get().containerRecords.find((item) => item.status === "running")?.id ?? "",
+      announce: (record) => {
+        void get().refreshContainerRecords();
+        const name = containerSummary(record);
+        if (record.status === "success") {
+          get().toast(
+            "success",
+            record.targetServerId
+              ? i18n.t("containers.toast.migrated", { name })
+              : i18n.t("containers.toast.backedUp", { name }),
+          );
+        } else {
+          get().toast(
+            "error",
+            i18n.t("containers.toast.failed", {
+              name,
+              error: record.error ?? i18n.t("common.unknownError"),
+            }),
           );
         }
       },

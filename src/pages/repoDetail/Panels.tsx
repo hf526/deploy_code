@@ -11,23 +11,27 @@ export function RailButton({
   label,
   active,
   badge,
+  disabled,
   onClick,
 }: {
   icon: ReactNode;
   label: string;
   active: boolean;
   badge?: number;
+  disabled?: boolean;
   onClick: () => void;
 }) {
   return (
     <button
       type="button"
       onClick={onClick}
+      disabled={disabled}
       title={label}
       aria-label={label}
       className={cn(
         "relative flex size-10 items-center justify-center rounded-md transition-colors",
         active ? "text-ink" : "text-ink-dim hover:bg-hover hover:text-ink",
+        disabled && "cursor-default text-ink-faint hover:bg-transparent",
       )}
     >
       {icon}

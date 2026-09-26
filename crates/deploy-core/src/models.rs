@@ -9,12 +9,6 @@ pub enum DeployStatus {
     Failed,
 }
 
-impl DeployStatus {
-    pub fn is_failure(self) -> bool {
-        matches!(self, DeployStatus::Failed)
-    }
-}
-
 /// SSH 认证方式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -43,7 +37,7 @@ pub struct DbBackupSource {
     pub database: String,
     /// 数据库用户名。
     pub username: String,
-    /// 数据库密码；为空时依赖容器/服务器的本地认证。（存储时为密文）
+    /// 数据库密码；为空时依赖容器/服务器的本地认证。（明文存于 config.json）
     #[serde(default)]
     pub password: String,
     /// 需要同步的 schema。
@@ -135,9 +129,14 @@ pub struct DeployConfig {
     /// 要部署的仓库 id。
     #[serde(default)]
     pub repo_id: String,
-    /// 目标服务器 id。
-    #[serde(default)]
-    pub server_id: String,
+    /// 目标服务器 id 列表：一条配置可以带多台，顺序即批量部署的执行顺序。
+    /// 旧数据里的单个 `serverId` 会被读成只有一台的列表。
+    #[serde(
+        default,
+        alias = "serverId",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub server_ids: Vec<String>,
     /// 服务器上的绝对部署目录。
     #[serde(default)]
     pub target_dir: String,
@@ -173,14 +172,15 @@ pub struct PagesConfigEntry {
 }
 
 impl PagesConfigEntry {
+    /// 新建草稿：id 与创建时间留空，由 `Store::save_pages_config` 补齐。
     pub fn new(repo_id: String, repo_name: String, config: PagesConfig) -> Self {
         Self {
-            id: new_id(),
+            id: String::new(),
             name: String::new(),
             repo_id,
             repo_name,
             config,
-            created_at: now_string(),
+            created_at: String::new(),
         }
     }
 }
@@ -335,6 +335,39 @@ impl RepoConfig {
             default_pages_config_id: None,
             env_files: Vec::new(),
             added_at: now_string(),
+        }
+    }
+
+    /// 目录重新指向后，把环境文件的本地路径从旧目录搬到新目录。
+    ///
+    /// 只改写确实位于旧目录之下的项（用户从别处挑的文件保持原样），且按整段目录名比较，
+    /// 所以 `E:\code\alpha` 不会牵连 `E:\code\alphas`。远端路径本来就是相对部署目录的，
+    /// 本地搬家不影响它。不搬的话部署会去读旧目录：旧目录已删是「环境文件不存在」，
+    /// 旧目录还留着（复制搬迁、只改了指向）则是把过期配置静默传上服务器。
+    pub fn rebase_env_files(&mut self, old_root: &str, new_root: &str) {
+        let root = old_root.replace('\\', "/").trim_end_matches('/').to_string();
+        if root.is_empty() || crate::store::paths_equal(old_root, new_root) {
+            return;
+        }
+        let base = new_root.trim_end_matches(['/', '\\']);
+        for file in &mut self.env_files {
+            let flat = file.local_path.replace('\\', "/");
+            let Some(rest) = flat.get(root.len()..) else { continue };
+            // 旧根之后必须正好跨过一个分隔符，`E:\code\alpha` 才不会牵连 `E:\code\alphas`。
+            let Some(relative) = rest.strip_prefix('/') else { continue };
+            let head = &flat[..root.len()];
+            // 大小写不敏感只适用于 Windows，与 store::paths_equal 的口径保持一致。
+            let same_root = if cfg!(windows) {
+                head.eq_ignore_ascii_case(&root)
+            } else {
+                head == root
+            };
+            if !same_root || relative.is_empty() {
+                continue;
+            }
+            // 分隔符替换是逐字符一一对应的，所以偏移量在原文上同样成立：
+            // 直接切原文，新根的写法和文件段落自身的大小写都原样保留。
+            file.local_path = format!("{base}{}", &file.local_path[root.len()..]);
         }
     }
 }
@@ -502,7 +535,7 @@ pub struct DeployRecord {
     pub target_dir: String,
     pub script_dir: String,
     /// 指定执行的脚本列表（按顺序执行）；为空表示自动执行脚本目录下的全部 .sh。
-    #[serde(default, alias = "script", deserialize_with = "deserialize_script_list")]
+    #[serde(default, alias = "script", deserialize_with = "deserialize_string_or_vec")]
     pub scripts: Vec<String>,
     pub run_scripts: bool,
     /// 本次部署实际替换的环境文件列表。
@@ -529,15 +562,16 @@ pub struct DeployRequest {
     #[serde(default = "default_script_dir")]
     pub script_dir: String,
     /// 指定执行的脚本列表（按顺序执行）；为空表示自动执行脚本目录下的全部 .sh。
-    #[serde(default, alias = "script", deserialize_with = "deserialize_script_list")]
+    #[serde(default, alias = "script", deserialize_with = "deserialize_string_or_vec")]
     pub scripts: Vec<String>,
     /// 是否在解压后、执行脚本前上传并替换 `env_files` 中配置的环境文件。
     #[serde(default = "default_true")]
     pub upload_env: bool,
 }
 
-/// 兼容旧数据：`script` 字段可能是单个字符串，新字段 `scripts` 是数组。
-fn deserialize_script_list<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+/// 把「单个字符串」与「字符串数组」都读成数组：旧数据里 `script` 是单值、
+/// `serverId` 是单台，新字段统一是数组，读入时按一条处理。
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -671,6 +705,10 @@ pub enum BackupEvent {
 pub struct PagesRequest {
     /// 仓库 id / 名称 / 路径。
     pub repo_id: String,
+    /// 用哪一条已保存的 Pages 配置（界面点列表某行时带上）。
+    /// 为空才回落到仓库绑定的默认配置。
+    #[serde(default)]
+    pub config_id: Option<String>,
     /// 覆盖部署平台（cloudflare | github）。
     #[serde(default)]
     pub provider: Option<String>,
@@ -728,6 +766,103 @@ pub enum PagesEvent {
     Finished { record: PagesDeployRecord },
 }
 
+// ---------------------------------------------------------------------------
+// 容器备份与迁移（deploy-core src/container.rs）
+// ---------------------------------------------------------------------------
+
+/// 迁移 / 恢复的目标：另一台服务器上的项目目录。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerTarget {
+    pub server_id: String,
+    /// 目标服务器上的绝对项目目录；恢复时留空表示沿用备份包内记录的目录。
+    #[serde(default)]
+    pub target_dir: String,
+    /// 恢复完成后自动 `docker compose up -d`。
+    #[serde(default = "default_true")]
+    pub start_services: bool,
+}
+
+/// 发起一次容器快照 / 迁移的参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRequest {
+    /// 来源服务器 id。
+    pub server_id: String,
+    /// compose 项目名。
+    pub project: String,
+    /// 打包数据卷前 `compose stop`、结束后 `compose start`，保证卷内数据一致。
+    #[serde(default)]
+    pub pause_source: bool,
+    #[serde(default = "default_true")]
+    pub include_volumes: bool,
+    #[serde(default = "default_true")]
+    pub include_images: bool,
+    /// 为空表示只备份到本机。
+    #[serde(default)]
+    pub target: Option<ContainerTarget>,
+}
+
+/// 用本机已有的备份包再恢复一次。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRestoreRequest {
+    /// 本机备份包的绝对路径。
+    pub bundle_path: String,
+    pub target: ContainerTarget,
+}
+
+/// 一条容器任务做了什么。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ContainerRecordKind {
+    /// 只打包到本机。
+    Backup,
+    /// 打包到本机并接着恢复到目标服务器。
+    Migrate,
+    /// 从本机已有备份包恢复。
+    Restore,
+}
+
+/// 一条容器备份 / 迁移记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerRecord {
+    pub id: String,
+    pub kind: ContainerRecordKind,
+    pub project: String,
+    /// 来源服务器（`restore` 记录里为空）。
+    pub server_id: String,
+    pub server_name: String,
+    pub target_server_id: String,
+    pub target_server_name: String,
+    pub target_dir: String,
+    /// 本机备份包路径；`restore` 记录里是被恢复的来源包。
+    pub bundle_path: String,
+    pub bundle_size: u64,
+    pub services: Vec<String>,
+    pub volumes: Vec<String>,
+    pub images: Vec<String>,
+    pub include_volumes: bool,
+    pub include_images: bool,
+    pub status: DeployStatus,
+    pub error: Option<String>,
+    pub log: String,
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub duration_ms: u64,
+}
+
+/// 容器备份 / 迁移过程中推送的事件（与部署、备份同构）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum ContainerEvent {
+    Started { record_id: String },
+    Log { level: LogLevel, message: String },
+    Progress { percent: u8, message: String },
+    Finished { record: ContainerRecord },
+}
+
 /// 全局设置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -756,7 +891,7 @@ pub struct Settings {
     /// 单次数据库备份超时（秒）。
     #[serde(default = "default_backup_timeout_secs")]
     pub backup_timeout_secs: u64,
-    /// 全局 Cloudflare API Token（Pages 部署）。（存储时为密文）
+    /// 全局 Cloudflare API Token（Pages 部署）。（明文存于 config.json）
     #[serde(default)]
     pub cloudflare_api_token: String,
     /// 全局 Cloudflare Account ID。
@@ -774,6 +909,12 @@ pub struct Settings {
     /// Pages 部署记录保留条数。
     #[serde(default = "default_pages_history_limit")]
     pub pages_history_limit: usize,
+    /// 容器备份 / 迁移记录保留条数。
+    #[serde(default = "default_container_history_limit")]
+    pub container_history_limit: usize,
+    /// 单次容器快照 / 迁移的超时（秒）：包含打包、下载、上传与恢复全过程。
+    #[serde(default = "default_container_timeout_secs")]
+    pub container_timeout_secs: u64,
     /// 界面语言偏好（空字符串表示跟随系统）。
     #[serde(default)]
     pub language: String,
@@ -792,10 +933,21 @@ pub struct Settings {
     /// 定时备份使用的备份配置 id（为空表示未选择，跳过执行）。
     #[serde(default)]
     pub scheduled_backup_config_id: Option<String>,
+    /// 定时关机开关：应用运行期间（含托盘后台）每天到点让本机关机。
+    #[serde(default)]
+    pub scheduled_shutdown_enabled: bool,
+    /// 定时关机时间（HH:MM，24 小时制，本机时区）。
+    /// 默认比定时备份（03:00）晚一小时，避免把当天该跑的备份掐掉。
+    #[serde(default = "default_scheduled_shutdown_time")]
+    pub scheduled_shutdown_time: String,
 }
 
 fn default_scheduled_backup_time() -> String {
     "03:00".to_string()
+}
+
+fn default_scheduled_shutdown_time() -> String {
+    "04:00".to_string()
 }
 
 fn default_release_keep() -> usize {
@@ -812,6 +964,15 @@ fn default_backup_timeout_secs() -> u64 {
 
 fn default_pages_history_limit() -> usize {
     200
+}
+
+fn default_container_history_limit() -> usize {
+    200
+}
+
+/// 容器备份要过一遍本机磁盘，GB 级数据卷 + 慢链路很容易超过数据库备份的 1 小时上限。
+fn default_container_timeout_secs() -> u64 {
+    7200
 }
 
 impl Default for Settings {
@@ -833,12 +994,16 @@ impl Default for Settings {
             github_token: String::new(),
             cronjob_api_key: String::new(),
             pages_history_limit: default_pages_history_limit(),
+            container_history_limit: default_container_history_limit(),
+            container_timeout_secs: default_container_timeout_secs(),
             language: String::new(),
             atomic_release: false,
             release_keep: default_release_keep(),
             scheduled_backup_enabled: false,
             scheduled_backup_time: default_scheduled_backup_time(),
             scheduled_backup_config_id: None,
+            scheduled_shutdown_enabled: false,
+            scheduled_shutdown_time: default_scheduled_shutdown_time(),
         }
     }
 }
@@ -913,20 +1078,37 @@ pub struct ExportData {
     pub settings: Settings,
 }
 
-/// 导入配置的统计信息。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ImportSummary {
-    pub servers_imported: usize,
-    pub repos_imported: usize,
-    pub backup_targets_imported: usize,
-    pub deploy_configs_imported: usize,
-    pub backup_configs_imported: usize,
-    pub pages_configs_imported: usize,
+/// 一类配置在导入时的去向计数。
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportCounts {
+    /// 本机没有同 ID 条目、会新增的条数。
+    pub added: usize,
+    /// 本机已有同 ID 条目、会被覆盖的条数。
+    pub overwritten: usize,
+}
+
+/// 导入配置的比对结果。预览与实际导入共用同一套合并语义，因此两边数字必然一致。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportPreview {
+    pub exported_at: String,
+    pub servers: ImportCounts,
+    pub repos: ImportCounts,
+    pub backup_targets: ImportCounts,
+    pub deploy_configs: ImportCounts,
+    pub backup_configs: ImportCounts,
+    pub pages_configs: ImportCounts,
+    /// 导出文件里被脱敏清空、因而保留本机值的敏感字段条数
+    /// （SSH 凭据 / 数据库口令与连接串 / 备份目标 DSN / env 路径 / API Token / 主密码哈希）。
+    pub kept_local_secrets: usize,
 }
 
 impl ExportData {
     pub fn new(config: &AppConfig) -> Self {
-        // 脱敏：清空敏感字段
+        // 脱敏：清空敏感字段。一律用空串，而不是 CLI 输出里那种 "***" 占位符——
+        // 导入时「空」的语义是「本次没提供，保留本机值」（见 store::keep_when_blank），
+        // 填占位符会把本机能用的凭据覆盖成废值。
         let mut servers = config.servers.clone();
         for server in &mut servers {
             match &mut server.auth {
@@ -937,6 +1119,12 @@ impl ExportData {
                     *passphrase = None;
                 }
             }
+            // 数据库凭据与 SSH 凭据同级：整条连接串清空。只遮密码会导出一条没有口令的 DSN，
+            // 导入时它是「非空」，反而会顶掉本机可用那条。
+            if let Some(source) = server.db_backup.as_mut() {
+                source.password = String::new();
+            }
+            server.supabase_url = None;
         }
 
         let mut repos = config.repos.clone();
@@ -947,20 +1135,33 @@ impl ExportData {
             }
         }
 
+        let mut backup_targets = config.backup_targets.clone();
+        for target in &mut backup_targets {
+            target.url = String::new();
+        }
+
+        let mut backup_configs = config.backup_configs.clone();
+        for backup in &mut backup_configs {
+            backup.source.password = String::new();
+            backup.supabase_url = None;
+        }
+
         let mut settings = config.settings.clone();
         settings.cloudflare_api_token = String::new();
         settings.cloudflare_account_id = String::new();
         settings.github_token = String::new();
         settings.cronjob_api_key = String::new();
+        // 主密码哈希等价于主密码的可离线破解替身，导出的配置用不上它。
+        settings.master_password_hash = None;
 
         Self {
             version: "1.0".to_string(),
             exported_at: now_string(),
             servers,
             repos,
-            backup_targets: config.backup_targets.clone(),
+            backup_targets,
             deploy_configs: config.deploy_configs.clone(),
-            backup_configs: config.backup_configs.clone(),
+            backup_configs,
             pages_configs: config.pages_configs.clone(),
             settings,
         }
@@ -970,6 +1171,22 @@ impl ExportData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 旧 config.json 里部署配置只有一台服务器，读入后要变成单元素列表而不是报错。
+    #[test]
+    fn deploy_config_reads_legacy_single_server_id() {
+        let legacy: DeployConfig = serde_json::from_str(
+            r#"{"id":"c1","name":"n","repoId":"r","serverId":"s1","targetDir":"/opt/app"}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.server_ids, vec!["s1".to_string()]);
+
+        let current: DeployConfig = serde_json::from_str(
+            r#"{"id":"c1","name":"n","repoId":"r","serverIds":["s1","s2"],"targetDir":"/opt/app"}"#,
+        )
+        .unwrap();
+        assert_eq!(current.server_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
 
     #[test]
     fn ssh_auth_private_key_serializes_camel_case() {
@@ -989,6 +1206,22 @@ mod tests {
             SshAuth::PrivateKey { key_path, .. } => assert_eq!(key_path, "/k"),
             _ => panic!("expected private key auth"),
         }
+    }
+
+    /// 旧版本 config.json 里没有定时关机字段：必须按默认值补齐而不是报错。
+    #[test]
+    fn settings_without_shutdown_fields_keep_defaults() {
+        let settings: Settings = serde_json::from_value(serde_json::json!({
+            "scriptDir": "docker",
+            "runScripts": true,
+            "connectTimeoutSecs": 15,
+            "scriptTimeoutSecs": 1800,
+            "keepRemoteArchive": false,
+            "historyLimit": 500
+        }))
+        .unwrap();
+        assert!(!settings.scheduled_shutdown_enabled);
+        assert_eq!(settings.scheduled_shutdown_time, "04:00");
     }
 
     #[test]
@@ -1078,5 +1311,121 @@ mod tests {
         )
         .unwrap();
         assert!(request.upload_env);
+    }
+
+    fn env(local: &str, remote: &str) -> EnvFileConfig {
+        EnvFileConfig {
+            local_path: local.to_string(),
+            remote_path: remote.to_string(),
+        }
+    }
+
+    #[test]
+    fn rebase_env_files_moves_only_files_under_the_old_root() {
+        let mut repo = RepoConfig::new("demo".to_string(), "/srv/new".to_string());
+        repo.env_files = vec![
+            env("/srv/old/docker/.env", "docker/.env"),
+            env("/srv/old/.env", ".env"),
+            // 只是前缀相同：/srv/oldies 不该被 /srv/old 的改写牵连。
+            env("/srv/oldies/app/.env", ".env"),
+            // 用户从别处挑的文件保持原样。
+            env("/etc/shared/.env", ".env"),
+        ];
+
+        repo.rebase_env_files("/srv/old", "/srv/new");
+
+        assert_eq!(repo.env_files[0].local_path, "/srv/new/docker/.env");
+        assert_eq!(repo.env_files[1].local_path, "/srv/new/.env");
+        assert_eq!(repo.env_files[2].local_path, "/srv/oldies/app/.env");
+        assert_eq!(repo.env_files[3].local_path, "/etc/shared/.env");
+        // 远端路径相对部署目录，与本地搬家无关。
+        assert_eq!(repo.env_files[0].remote_path, "docker/.env");
+    }
+
+    #[test]
+    fn rebase_env_files_skips_a_root_that_did_not_move() {
+        let mut repo = RepoConfig::new("demo".to_string(), r"E:\code\new".to_string());
+        repo.env_files = vec![env(r"E:\code\old\a\.env", "a/.env")];
+
+        // 同一目录的不同写法（分隔符、结尾斜杠）不算搬家。
+        repo.rebase_env_files(r"E:\code\old\", r"E:/code/old");
+        assert_eq!(repo.env_files[0].local_path, r"E:\code\old\a\.env");
+
+        repo.rebase_env_files("", r"E:\code\new");
+        assert_eq!(repo.env_files[0].local_path, r"E:\code\old\a\.env");
+
+        // 磁盘上只改了目录名大小写：还是同一个目录，一条都不该改写。
+        #[cfg(windows)]
+        {
+            repo.rebase_env_files(r"E:\CODE\OLD", r"E:\code\old");
+            assert_eq!(repo.env_files[0].local_path, r"E:\code\old\a\.env");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rebase_env_files_folds_case_on_windows() {
+        let mut repo = RepoConfig::new("demo".to_string(), r"E:\code\new".to_string());
+        repo.env_files = vec![env(r"E:\code\old\Docker\.env", "Docker/.env")];
+
+        repo.rebase_env_files(r"E:\CODE\OLD", r"E:\Code\New");
+
+        // 命中旧根靠大小写折叠，改写后的文件段落保留原来的大小写。
+        assert_eq!(repo.env_files[0].local_path, r"E:\Code\New\Docker\.env");
+    }
+
+    #[test]
+    fn export_blanks_every_credential() {
+        let marker = "SUP3R-SECRET-MARKER";
+        let mut config = AppConfig::default();
+
+        let mut server = ServerConfig::new(
+            "生产机".to_string(),
+            "10.0.0.9".to_string(),
+            "root".to_string(),
+            SshAuth::Password { password: marker.to_string() },
+        );
+        server.default_target_dir = "/opt/app".to_string();
+        server.supabase_url = Some(format!("postgres://u:{marker}@h/db"));
+        server.db_backup = Some(DbBackupSource {
+            container: "pg".to_string(),
+            database: "appdb".to_string(),
+            username: "postgres".to_string(),
+            password: marker.to_string(),
+            ..DbBackupSource::default()
+        });
+        config.servers.push(server);
+
+        config
+            .backup_targets
+            .push(BackupTarget::new("目标库".to_string(), format!("postgres://u:{marker}@h:5432/db")));
+        let mut backup = BackupConfig::new("每晚".to_string(), "s1".to_string(), DbBackupSource {
+            database: "appdb".to_string(),
+            password: marker.to_string(),
+            ..DbBackupSource::default()
+        });
+        backup.supabase_url = Some(format!("postgres://u:{marker}@h/db"));
+        config.backup_configs.push(backup);
+
+        config.settings.cloudflare_api_token = marker.to_string();
+        config.settings.github_token = marker.to_string();
+        config.settings.cronjob_api_key = marker.to_string();
+        config.settings.master_password_hash = Some(marker.to_string());
+
+        let mut repo = RepoConfig::new("app".to_string(), "/srv/app".to_string());
+        repo.env_files.push(EnvFileConfig {
+            local_path: format!("/srv/app/{marker}.env"),
+            remote_path: "docker/.env".to_string(),
+        });
+        config.repos.push(repo);
+
+        let text = serde_json::to_string(&ExportData::new(&config)).unwrap();
+        assert!(!text.contains(marker), "导出内容里不该出现任何凭据：{text}");
+
+        // 只清凭据：可用的非敏感信息必须留下，否则这份导出等于白导。
+        assert!(text.contains("10.0.0.9"), "服务器地址该保留");
+        assert!(text.contains("/opt/app"), "默认部署目录该保留");
+        assert!(text.contains("\"database\":\"appdb\""), "数据库名该保留");
+        assert!(text.contains("\"schema\":\"public\""), "schema 该保留");
     }
 }

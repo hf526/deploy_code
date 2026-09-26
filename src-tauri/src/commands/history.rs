@@ -24,6 +24,12 @@ pub fn delete_record(state: State<AppState>, record_id: String) -> Result<bool> 
     state.store.remove_history(&record_id)
 }
 
+/// 批量删除部署记录，返回真正删掉的条数。
+#[tauri::command(async)]
+pub fn delete_records(state: State<AppState>, record_ids: Vec<String>) -> Result<usize> {
+    state.store.remove_history_many(&record_ids)
+}
+
 #[tauri::command(async)]
 pub fn clear_history(state: State<AppState>) -> Result<()> {
     state.store.clear_history()

@@ -14,7 +14,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import { ConfigModalFooter } from "../../components/ConfigModalFooter";
 import { SearchSelect } from "../../components/SearchSelect";
-import { ServerSelect } from "../../components/ServerSelect";
+import { ServerCheckList } from "../../components/ServerCheckList";
 import { Button, Checkbox, Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
@@ -32,7 +32,7 @@ function emptyConfig(): DeployConfig {
     id: "",
     name: "",
     repoId: "",
-    serverId: "",
+    serverIds: [],
     targetDir: "",
     rev: "",
     runScripts: true,
@@ -87,7 +87,7 @@ export function DeployConfigModal({
       ...emptyConfig(),
       repoId: initialRepoId,
       rev: prefill?.rev ?? initialRepo?.currentBranch ?? "",
-      serverId: initialRepo?.defaultServerId ?? "",
+      serverIds: initialRepo?.defaultServerId ? [initialRepo.defaultServerId] : [],
       targetDir: initialRepo?.defaultTargetDir ?? "",
       runScripts: settings.runScripts,
       scriptDir: settings.scriptDir,
@@ -147,7 +147,7 @@ export function DeployConfigModal({
       setDraft((current) => ({
         ...current,
         rev: initial.rev,
-        serverId: initial.serverId,
+        serverIds: [...initial.serverIds],
         targetDir: initial.targetDir,
         scripts: [...initial.scripts],
         uploadEnv: initial.uploadEnv,
@@ -164,7 +164,7 @@ export function DeployConfigModal({
       ...current,
       repoId: repo.id,
       rev: preservedRev || repo.currentBranch || "",
-      serverId: repo.defaultServerId ?? "",
+      serverIds: repo.defaultServerId ? [repo.defaultServerId] : [],
       targetDir: repo.defaultTargetDir ?? "",
       // 脚本列表属于「单次部署选择」，切换仓库时清空，避免把上一个仓库的脚本带到新仓库。
       scripts: [],
@@ -249,7 +249,9 @@ export function DeployConfigModal({
   );
 
   const selectedRepo = repos.find((item) => item.id === draft.repoId);
-  const selectedServer = servers.find((item) => item.id === draft.serverId);
+  const selectedServers = draft.serverIds
+    .map((id) => servers.find((item) => item.id === id))
+    .filter((server): server is NonNullable<typeof server> => server !== undefined);
 
   function update(patch: Partial<DeployConfig>) {
     setDraft((current) => ({ ...current, ...patch }));
@@ -312,7 +314,8 @@ export function DeployConfigModal({
   async function handleSave() {
     if (!draft.name.trim()) return toast("error", t("deploy.configNameRequired"));
     if (!draft.repoId) return toast("error", t("deploy.errorRepo"));
-    if (!draft.serverId) return toast("error", t("deploy.errorServer"));
+    if (draft.serverIds.length === 0)
+      return toast("error", t("deploy.errorServer"));
     if (!draft.targetDir.trim()) return toast("error", t("deploy.errorTargetDir"));
     if (resolveError) return toast("error", t("deploy.errorResolve"));
 
@@ -397,22 +400,26 @@ export function DeployConfigModal({
             </Select>
           </Field>
 
-          <Field label={t("deploy.server")} required>
-            <ServerSelect
-              value={draft.serverId}
-              onChange={(next) => {
-                const server = servers.find((item) => item.id === next);
-                update({
-                  serverId: next,
-                  ...(server && !draft.targetDir.trim()
-                    ? { targetDir: server.defaultTargetDir }
-                    : {}),
-                });
-              }}
-              servers={servers}
-              disabled={saving}
-              placeholder={t("deploy.serverPlaceholder")}
-            />
+          <Field label={t("deploy.server")} required hint={t("deploy.serversHint")}>
+            {servers.length > 0 && (
+              <ServerCheckList
+                servers={servers}
+                checkedIds={draft.serverIds}
+                disabled={saving}
+                onChange={(ids) =>
+                  update({
+                    serverIds: ids,
+                    // 目录还空着时用这一台的默认目录兜底，省掉一次手填。
+                    ...(ids.length > 0 && !draft.targetDir.trim()
+                      ? {
+                          targetDir:
+                            servers.find((item) => item.id === ids[0])?.defaultTargetDir ?? "",
+                        }
+                      : {}),
+                  })
+                }
+              />
+            )}
             {servers.length === 0 && (
               <p className="mt-2 text-[11px] text-ink-faint">
                 <Trans
@@ -687,7 +694,7 @@ export function DeployConfigModal({
 
         {selectedRepo && (
           <p className="truncate text-[11px] text-ink-faint" title={selectedRepo.path}>
-            {selectedServer ? `${selectedServer.name} → ` : ""}
+            {selectedServers.length > 0 ? `${selectedServers.map((item) => item.name).join("、")} → ` : ""}
             {draft.targetDir || t("deploy.targetDirEmpty")}
           </p>
         )}

@@ -1,4 +1,4 @@
-use deploy_core::models::{BackupConfig, BackupTarget, ImportSummary, Settings};
+use deploy_core::models::{BackupConfig, BackupTarget, ImportPreview, Settings};
 use deploy_core::{CoreError, Result};
 use tauri::State;
 
@@ -9,8 +9,14 @@ pub fn export_config(state: State<AppState>) -> Result<String> {
     state.store.export_config()
 }
 
+/// 只读比对：不落盘，供确认框展示新增 / 覆盖 / 保留本机凭据的条数。
 #[tauri::command(async)]
-pub fn import_config(state: State<AppState>, json_str: String) -> Result<ImportSummary> {
+pub fn preview_config_import(state: State<AppState>, json_str: String) -> Result<ImportPreview> {
+    state.store.preview_import(&json_str)
+}
+
+#[tauri::command(async)]
+pub fn import_config(state: State<AppState>, json_str: String) -> Result<ImportPreview> {
     state.store.import_config(&json_str)
 }
 

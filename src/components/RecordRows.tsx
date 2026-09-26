@@ -1,7 +1,7 @@
 import type { ReactNode } from "react";
 import { ChevronDown, ChevronRight, Trash2 } from "lucide-react";
 
-import { Button } from "./ui";
+import { Button, SelectBox } from "./ui";
 
 /**
  * 任务记录日志：备份 / Pages / 部署历史共用的展示块。
@@ -39,6 +39,10 @@ export function ExpandableRecordRow({
   onDelete,
   deleteTitle,
   log,
+  selected,
+  onSelect,
+  selectionLabel,
+  selectionDisabled,
 }: {
   expanded: boolean;
   onToggle: () => void;
@@ -49,10 +53,23 @@ export function ExpandableRecordRow({
   onDelete: () => void;
   deleteTitle: string;
   log: ReactNode;
+  /** 传入 onSelect 才渲染勾选框，未启用多选的列表保持原样。 */
+  selected?: boolean;
+  onSelect?: (on: boolean) => void;
+  selectionLabel?: string;
+  selectionDisabled?: boolean;
 }) {
   return (
     <div>
       <div className="flex items-center gap-3 px-4 py-3">
+        {onSelect && (
+          <SelectBox
+            checked={selected ?? false}
+            disabled={selectionDisabled}
+            label={selectionLabel ?? ""}
+            onChange={onSelect}
+          />
+        )}
         <button className="flex min-w-0 flex-1 items-center gap-3 text-left" onClick={onToggle}>
           {expanded ? (
             <ChevronDown className="size-3.5 shrink-0 text-ink-faint" />

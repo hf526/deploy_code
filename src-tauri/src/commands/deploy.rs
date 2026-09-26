@@ -7,7 +7,9 @@ use deploy_core::models::{
 use deploy_core::{release, CoreError, DeployEngine, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::state::{ActiveDeploy, AppState, ClaimGuard, ClaimKind, DeployTaskGuard};
+use crate::state::{
+    ActiveDeploy, AppState, ClaimGuard, ClaimKind, DeployBatchTracking, DeployTaskGuard,
+};
 
 /// 在后台执行部署，并把日志/进度/结果通过事件推送给前端。
 fn spawn_deploy(
@@ -55,6 +57,63 @@ fn spawn_deploy(
     record_id
 }
 
+/// 后台执行「一份配置 → 多台服务器」的串行批次（失败即停由 `run_targets` 负责）。
+///
+/// 记录在每台真正开始时才 prepare，历史列表不会提前冒出一堆「进行中」；
+/// 整批共用一次抢占和一个任务句柄，取消任意一台即停止整个批次。
+///
+/// 返回的接收端在「首台已经登记并开始部署」或「整批一台都没启动」时送达结果，
+/// 命令要等它 —— 见 `deploy_config_targets`。
+fn spawn_deploy_batch(
+    app: AppHandle,
+    engine: DeployEngine,
+    base: DeployRequest,
+    server_ids: Vec<String>,
+    claim: ClaimGuard,
+) -> tokio::sync::oneshot::Receiver<Result<usize>> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+
+    let emit_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // 抢占标记随事件转发任务释放：事件没转发完就放行下一次部署的话，
+        // 新任务会收到上一批残留的 finished 事件。
+        let _claim = claim;
+        while let Some(event) = receiver.recv().await {
+            let _ = emit_app.emit("deploy://event", &event);
+        }
+    });
+
+    let tracking_app = app;
+    let total = server_ids.len();
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
+    let handle = tokio::spawn(async move {
+        // AbortHandle 要等 JoinHandle 生成本身才能拿到，拿不到就没有取消入口，直接放弃这一批。
+        let Ok(abort) = abort_rx.await else {
+            let _ = start_tx.send(Err(CoreError::deploy("部署任务启动失败")));
+            return;
+        };
+        let mut tracked = DeployBatchTracking::new(tracking_app, abort);
+        let mut start_tx = Some(start_tx);
+        let batch = engine
+            .run_targets(&base, &server_ids, Some(sender), |record| {
+                tracked.begin(record);
+                // 首台一旦开始，后面就有 started/finished 事件负责收敛界面。
+                if let Some(tx) = start_tx.take() {
+                    let _ = tx.send(Ok(total));
+                }
+            })
+            .await;
+        if let Some(err) = batch.blocked {
+            if let Some(tx) = start_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+        }
+    });
+    let _ = abort_tx.send(handle.abort_handle());
+    start_rx
+}
+
 #[tauri::command(async)]
 pub fn start_deploy(
     app: AppHandle,
@@ -89,35 +148,69 @@ pub fn delete_deploy_config(state: State<AppState>, config_id: String) -> Result
     Store::delete_deploy_config(&state.store, &config_id)
 }
 
-/// 按保存的部署配置发起部署：参数完全取自配置，避免前端传参与保存内容不一致。
+/// 按保存的部署配置发起一批部署：参数完全取自配置，`server_ids` 指定本批要发到哪些服务器
+/// （必须是配置里已登记的）。串行执行、一台失败即停止，返回本批覆盖的台数。
 #[tauri::command(async)]
-pub fn start_deploy_config(
+pub async fn deploy_config_targets(
     app: AppHandle,
-    state: State<AppState>,
+    state: State<'_, AppState>,
     config_id: String,
-) -> Result<String> {
-    // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
+    server_ids: Vec<String>,
+) -> Result<usize> {
+    // 先抢占名额（进程内原子标记 + 跨进程文件锁）再校验，避免并发命令同时通过检查。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Deploy)? {
         Some(claim) => claim,
         None => return Err(CoreError::busy("已有部署正在进行，请等待完成后再试")),
     };
-    let engine = state.engine();
     let config = {
         let app_config = state.store.load_config()?;
         Store::find_deploy_config(&app_config, &config_id)?.clone()
     };
-    let request = DeployRequest {
+    let selected = select_targets(&config, server_ids)?;
+    let base = DeployRequest {
         repo_id: config.repo_id,
         rev: config.rev,
-        server_id: config.server_id,
+        // 逐台部署时由 run_targets 覆盖，这里留空即可。
+        server_id: String::new(),
         target_dir: config.target_dir,
         run_scripts: config.run_scripts,
         script_dir: config.script_dir,
         scripts: config.scripts,
         upload_env: config.upload_env,
     };
-    let record = engine.prepare(&request)?;
-    Ok(spawn_deploy(app, engine, record, request, claim))
+    let started = spawn_deploy_batch(app, state.engine(), base, selected, claim);
+    // 等首台登记完成再返回：prepare 不通过时整批既没有记录也没有 started/finished 事件，
+    // 提前返回就等于把界面永久留在「部署中」（recordId 还是空，连取消都点不动）。
+    // 单台部署的 prepare 失败是同步报错的，批次沿用同一约定。
+    started
+        .await
+        .map_err(|_| CoreError::deploy("部署任务意外结束"))?
+}
+
+/// 只接受配置内已登记的目标，并按配置里的顺序执行：勾选顺序不影响结果，
+/// 配置外的服务器也不能借这条命令绕过配置约束。
+fn select_targets(config: &DeployConfig, requested: Vec<String>) -> Result<Vec<String>> {
+    let requested: Vec<String> = requested
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if requested.is_empty() {
+        return Err(CoreError::config("请至少勾选一台部署服务器"));
+    }
+    for id in &requested {
+        if !config.server_ids.iter().any(|allowed| allowed == id) {
+            return Err(CoreError::config(format!(
+                "该服务器不在这条部署配置里: {id}"
+            )));
+        }
+    }
+    Ok(config
+        .server_ids
+        .iter()
+        .filter(|id| requested.contains(id))
+        .cloned()
+        .collect())
 }
 
 /// 按历史记录重新部署（使用记录中的提交号，保证版本一致）。

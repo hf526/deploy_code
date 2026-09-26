@@ -19,6 +19,7 @@ import { useNavigate, useSearchParams } from "react-router-dom";
 import { BindRemoteModal } from "../components/BindRemoteModal";
 import { LogConsole } from "../components/LogConsole";
 import { ExpandableRecordRow, RecordLog } from "../components/RecordRows";
+import { ServerCheckList } from "../components/ServerCheckList";
 import {
   Badge,
   Button,
@@ -29,8 +30,10 @@ import {
   Modal,
   Page,
   SectionTitle,
+  SelectBox,
 } from "../components/ui";
 import { api } from "../lib/api";
+import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
 import { useApp } from "../lib/store";
 import type {
   DeployConfig,
@@ -61,7 +64,7 @@ type EditingState =
 
 type DeletingState =
   | { kind: "server"; id: string; name: string }
-  | { kind: "pages"; repoId: string; name: string };
+  | { kind: "pages"; id: string; name: string };
 
 /** 统一列表项：服务器部署配置与 Pages 配置（按仓库一份）合并展示。 */
 type ConfigRow =
@@ -90,7 +93,7 @@ export default function DeployPage() {
   const deployConfigs = useApp((state) => state.deployConfigs);
   const pagesConfigs = useApp((state) => state.pagesConfigs);
   const pagesRecords = useApp((state) => state.pagesRecords);
-  const startDeployConfig = useApp((state) => state.startDeployConfig);
+  const deployConfigTargets = useApp((state) => state.deployConfigTargets);
   const redeploy = useApp((state) => state.redeploy);
   const cancelDeploy = useApp((state) => state.cancelDeploy);
   const startPagesDeploy = useApp((state) => state.startPagesDeploy);
@@ -108,6 +111,13 @@ export default function DeployPage() {
   const [recordsTab, setRecordsTab] = useState<"server" | "pages">("server");
   const [expandedRecord, setExpandedRecord] = useState<string | null>(null);
   const [confirmClearPages, setConfirmClearPages] = useState(false);
+  // 本批目标选择框：配置可以带多台，部署时再勾选这一次要发到哪几台。
+  const [pickerConfig, setPickerConfig] = useState<DeployConfig | null>(null);
+  const [pickerTargets, setPickerTargets] = useState<string[]>([]);
+  const [pickerBusy, setPickerBusy] = useState(false);
+  const [selectedPages, setSelectedPages] = useState<Set<string>>(() => new Set());
+  const [bulkRemovingPages, setBulkRemovingPages] = useState(false);
+  const [bulkPagesBusy, setBulkPagesBusy] = useState(false);
   const [bindRepo, setBindRepo] = useState<RepoInfo | null>(null);
   const [cancelling, setCancelling] = useState(false);
   const [viewKind, setViewKind] = useState<"server" | "pages">("server");
@@ -167,7 +177,8 @@ export default function DeployPage() {
     const pagesRows: ConfigRow[] = pagesConfigs
       .map((entry) => ({
         kind: "pages" as const,
-        key: entry.repoId,
+        // key 用条目 id：一个仓库允许留有多条配置，用仓库 id 会撞 key。
+        key: entry.id,
         name: entry.repoName,
         repoName: repoName(entry.repoId),
         entry,
@@ -179,17 +190,49 @@ export default function DeployPage() {
   const activeKind = viewKind;
   const activeLive = activeKind === "pages" ? livePages : live;
   const activeRunning = activeKind === "pages" ? pagesRunning : serverRunning;
-  const recentDeploys = history.slice(0, 8);
-  const recentPagesDeploys = pagesRecords.slice(0, 8);
+  // 勾选集要跟着列表稳定，否则每次渲染都会触发下面的清理副作用。
+  const recentDeploys = useMemo(() => history.slice(0, 8), [history]);
+  const recentPagesDeploys = useMemo(() => pagesRecords.slice(0, 8), [pagesRecords]);
 
-  async function handleDeployServer(config: DeployConfig) {
+  // 进行中的记录不参与多选：删掉正在写入的条目，下一个事件又会把它写回来。
+  // 候选只取列表里真正显示出来的那几条（本页面只展示最近 8 条），全选才不会选中看不见的记录。
+  const selectablePagesIds = useMemo(
+    () =>
+      recentPagesDeploys
+        .filter((record) => record.status !== "running")
+        .map((record) => record.id),
+    [recentPagesDeploys],
+  );
+
+  // 后台刷新或 CLI 改过列表后，丢掉已经不存在的勾选。
+  useEffect(() => {
+    setSelectedPages((current) => {
+      const pruned = pruneSelection(current, selectablePagesIds);
+      return pruned.size === current.size ? current : pruned;
+    });
+  }, [selectablePagesIds]);
+
+  /** 打开本批目标选择框：默认全选配置里的服务器，不额外点一次就能发到全部机器。 */
+  function openTargetPicker(config: DeployConfig) {
     if (running) return;
     setViewKind("server");
     setRecordsTab("server");
+    setPickerConfig(config);
+    setPickerTargets(config.serverIds);
+  }
+
+  async function handleDeployTargets() {
+    if (!pickerConfig) return;
+    setPickerBusy(true);
     try {
-      await startDeployConfig(config.id);
+      // 只提交仍在配置里的目标：弹窗打开期间配置被改过也不该整批失败。
+      const targets = pickerTargets.filter((id) => pickerConfig.serverIds.includes(id));
+      await deployConfigTargets(pickerConfig.id, targets);
+      setPickerConfig(null);
     } catch {
       // store 已提示错误
+    } finally {
+      setPickerBusy(false);
     }
   }
 
@@ -207,7 +250,7 @@ export default function DeployPage() {
     setPagesRun(null);
     // 不在这里清空 livePages：startPagesDeploy 会写入新的 running 状态并替换旧记录。
     try {
-      await startPagesDeploy({ repoId: entry.repoId, skipBuild });
+      await startPagesDeploy({ repoId: entry.repoId, configId: entry.id, skipBuild });
     } catch {
       // store 已提示错误
     }
@@ -220,7 +263,7 @@ export default function DeployPage() {
       const removed =
         deleting.kind === "server"
           ? await api.deleteDeployConfig(deleting.id)
-          : await api.deletePagesConfig(deleting.repoId);
+          : await api.deletePagesConfig(deleting.id);
       if (deleting.kind === "server") {
         await refreshDeployConfigs();
       } else {
@@ -249,6 +292,23 @@ export default function DeployPage() {
     }
   }
 
+  async function handleBulkDeletePages() {
+    const ids = [...selectedPages];
+    if (ids.length === 0) return;
+    setBulkPagesBusy(true);
+    try {
+      const removed = await api.deletePagesRecords(ids);
+      toast("success", t("common.bulkDeleted", { count: removed }));
+      setSelectedPages(new Set());
+      setBulkRemovingPages(false);
+      await refreshPagesRecords();
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBulkPagesBusy(false);
+    }
+  }
+
   async function handleClearPagesRecords() {
     try {
       await api.clearPagesRecords();
@@ -270,15 +330,29 @@ export default function DeployPage() {
     }
   }
 
+  /** 配置行摘要：多台时显示台数与名称，避免只看到第一台误以为只发到那一台。 */
   function configSummary(row: ConfigRow): string {
     if (row.kind === "server") {
-      const server = servers.find((item) => item.id === row.config.serverId);
+      const names = row.config.serverIds.map(
+        (id) => servers.find((item) => item.id === id)?.name ?? t("deploy.unknownServer"),
+      );
+      const scope =
+        names.length === 0
+          ? t("deploy.noTargetServers")
+          : names.length === 1
+            ? names[0]
+            : t("deploy.targetsCount", { count: names.length, names: names.join("、") });
       const rev = row.config.rev.trim() || t("deploy.worktree");
-      return `${server?.name ?? t("deploy.unknownServer")} → ${
-        row.config.targetDir || t("deploy.targetDirEmpty")
-      } · ${rev}`;
+      return `${scope} → ${row.config.targetDir || t("deploy.targetDirEmpty")} · ${rev}`;
     }
     return pagesSummary(row.entry, t("pages.projectNameEmpty"));
+  }
+
+  /** 选择框里的候选：只列配置已登记的服务器，顺序也按配置。 */
+  function pickerCandidates(config: DeployConfig) {
+    return config.serverIds
+      .map((id) => servers.find((item) => item.id === id))
+      .filter((server): server is NonNullable<typeof server> => server !== undefined);
   }
 
   return (
@@ -371,7 +445,10 @@ export default function DeployPage() {
                             : t("deploy.kindPages")}
                         </span>
                       </p>
-                      <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+                      <p
+                        className="mt-0.5 truncate text-[11px] text-ink-faint"
+                        title={`${row.repoName} · ${configSummary(row)}`}
+                      >
                         {row.repoName} · {configSummary(row)}
                       </p>
                     </div>
@@ -381,7 +458,7 @@ export default function DeployPage() {
                       icon={<Rocket className="size-3.5" />}
                       onClick={() =>
                         row.kind === "server"
-                          ? void handleDeployServer(row.config)
+                          ? openTargetPicker(row.config)
                           : openPagesRun(row.entry)
                       }
                     >
@@ -434,7 +511,7 @@ export default function DeployPage() {
                         setDeleting(
                           row.kind === "server"
                             ? { kind: "server", id: row.config.id, name: row.config.name }
-                            : { kind: "pages", repoId: row.entry.repoId, name: row.name },
+                            : { kind: "pages", id: row.entry.id, name: row.name },
                         )
                       }
                     >
@@ -474,13 +551,34 @@ export default function DeployPage() {
                     ))}
                   </div>
                   {recordsTab === "pages" && pagesRecords.length > 0 && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setConfirmClearPages(true)}
-                    >
-                      {t("backup.clearRecords")}
-                    </Button>
+                    <div className="flex items-center gap-2">
+                      <SelectBox
+                        label={t("common.selectAll")}
+                        checked={selectionState(selectedPages, selectablePagesIds) === "all"}
+                        indeterminate={
+                          selectionState(selectedPages, selectablePagesIds) === "some"
+                        }
+                        disabled={selectablePagesIds.length === 0}
+                        onChange={() =>
+                          setSelectedPages((current) => toggleAll(current, selectablePagesIds))
+                        }
+                      />
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        disabled={selectedPages.size === 0}
+                        onClick={() => setBulkRemovingPages(true)}
+                      >
+                        {t("common.deleteSelected", { count: selectedPages.size })}
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => setConfirmClearPages(true)}
+                      >
+                        {t("backup.clearRecords")}
+                      </Button>
+                    </div>
                   )}
                 </div>
               }
@@ -527,6 +625,16 @@ export default function DeployPage() {
                     }
                     onCopy={() => void copyUrl(record.url ?? "")}
                     onDelete={() => void handleDeletePagesRecord(record.id)}
+                    selected={selectedPages.has(record.id)}
+                    selectionDisabled={record.status === "running"}
+                    selectionLabel={
+                      record.status === "running"
+                        ? t("common.runningNotDeletable")
+                        : t("common.select")
+                    }
+                    onSelect={(on) =>
+                      setSelectedPages((current) => toggleId(current, record.id, on))
+                    }
                   />
                 ))}
               </Card>
@@ -670,11 +778,10 @@ export default function DeployPage() {
           entry={editing.entry}
           prefillRepoId={editing.prefillRepoId}
           onClose={() => setEditing(null)}
-          onSaved={(repoId) => {
+          onSaved={(saved) => {
             setEditing(null);
             void refreshPagesConfigs();
-            const name = repos.find((repo) => repo.id === repoId)?.name ?? "";
-            toast("success", t("pages.configSaved", { name }));
+            toast("success", t("pages.configSaved", { name: saved.name }));
           }}
           onRequestBindRemote={(repo) => setBindRepo(repo)}
         />
@@ -725,6 +832,79 @@ export default function DeployPage() {
         }
         onCancel={() => setDeleting(null)}
         onConfirm={() => void handleDelete()}
+      />
+
+      {pickerConfig && (
+        <Modal
+          open
+          onClose={() => setPickerConfig(null)}
+          title={t("deploy.targetsTitle")}
+          subtitle={`${pickerConfig.name} · ${pickerConfig.targetDir || t("deploy.targetDirEmpty")}`}
+          width="max-w-md"
+          footer={
+            <>
+              <Button
+                variant="secondary"
+                disabled={pickerBusy}
+                onClick={() => setPickerConfig(null)}
+              >
+                {t("common.cancel")}
+              </Button>
+              <Button
+                icon={<Rocket className="size-4" />}
+                loading={pickerBusy}
+                disabled={pickerTargets.length === 0}
+                onClick={() => void handleDeployTargets()}
+              >
+                {t("deploy.startDeployTargets", { count: pickerTargets.length })}
+              </Button>
+            </>
+          }
+        >
+          <div className="flex flex-col gap-3">
+            <p className="text-[11px] leading-relaxed text-ink-faint">
+              {t("deploy.targetsHint")}
+            </p>
+            <ServerCheckList
+              servers={pickerCandidates(pickerConfig)}
+              checkedIds={pickerTargets}
+              onChange={setPickerTargets}
+            />
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-[11px] text-ink-faint">
+                {t("deploy.targetsSelected", {
+                  count: pickerTargets.length,
+                  total: pickerCandidates(pickerConfig).length,
+                })}
+              </span>
+              <div className="flex gap-1">
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() =>
+                    setPickerTargets(pickerCandidates(pickerConfig).map((item) => item.id))
+                  }
+                >
+                  {t("deploy.selectAllServers")}
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => setPickerTargets([])}>
+                  {t("deploy.clearSelectedServers")}
+                </Button>
+              </div>
+            </div>
+          </div>
+        </Modal>
+      )}
+
+      <ConfirmModal
+        open={bulkRemovingPages}
+        danger
+        loading={bulkPagesBusy}
+        title={t("pages.bulkDeleteTitle")}
+        confirmText={t("common.delete")}
+        description={t("pages.bulkDeleteDescription", { count: selectedPages.size })}
+        onCancel={() => setBulkRemovingPages(false)}
+        onConfirm={() => void handleBulkDeletePages()}
       />
 
       <ConfirmModal
@@ -796,12 +976,20 @@ function PagesRecordRow({
   onToggle,
   onCopy,
   onDelete,
+  selected,
+  onSelect,
+  selectionLabel,
+  selectionDisabled,
 }: {
   record: PagesDeployRecord;
   expanded: boolean;
   onToggle: () => void;
   onCopy: () => void;
   onDelete: () => void;
+  selected: boolean;
+  onSelect: (on: boolean) => void;
+  selectionLabel: string;
+  selectionDisabled: boolean;
 }) {
   const { t } = useTranslation();
   return (
@@ -820,6 +1008,10 @@ function PagesRecordRow({
       }
       deleteTitle={t("backup.deleteRecord")}
       onDelete={onDelete}
+      selected={selected}
+      onSelect={onSelect}
+      selectionLabel={selectionLabel}
+      selectionDisabled={selectionDisabled}
       title={
         <>
           {record.repoName} → {record.projectName}

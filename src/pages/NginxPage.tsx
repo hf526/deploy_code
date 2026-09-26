@@ -49,8 +49,15 @@ export default function NginxPage() {
   const [deletingBusy, setDeletingBusy] = useState(false);
   const [reloading, setReloading] = useState(false);
 
-  // 查询序号：切换服务器/容器/目录后，旧请求返回时直接丢弃，避免串数据。
+  // 上下文序号：切换服务器/容器时递增，在途的单文件读取与删除返回时据此作废。
   const querySeq = useRef(0);
+  // 容器列表与配置文件列表各自计数：共用一个序号时，「刷新容器」会让在途的配置文件
+  // 查询被判为过期，而 loadingFiles 只在序号仍是最新时才复位，编辑/删除按钮就永久禁着。
+  const containersSeq = useRef(0);
+  const filesSeq = useRef(0);
+  // 单文件读取序号：读配置比刷新列表慢，弹窗可能在读取返回前被「新建」重开或被关闭，
+  // 作废在途读取，旧文件内容才不会顶掉刚打开的新建草稿。
+  const readSeq = useRef(0);
   const dirRef = useRef(dir);
   const containerRef = useRef(container);
   // 最新上下文快照：异步回调里不能用闭包捕获的 state 比较（保存/删除期间可能已切换）。
@@ -80,19 +87,19 @@ export default function NginxPage() {
 
   const loadFiles = useCallback(
     async (targetServer: string, targetContainer: string, targetDir: string) => {
-      const seq = ++querySeq.current;
+      const seq = ++filesSeq.current;
       setLoadingFiles(true);
       try {
         const list = await api.listNginxConfigs(targetServer, targetContainer, targetDir);
-        if (seq !== querySeq.current) return;
+        if (seq !== filesSeq.current) return;
         setFiles(list);
         setFilesDir(targetDir);
       } catch (error) {
-        if (seq !== querySeq.current) return;
+        if (seq !== filesSeq.current) return;
         setFiles([]);
         toast("error", String(error));
       } finally {
-        if (seq === querySeq.current) setLoadingFiles(false);
+        if (seq === filesSeq.current) setLoadingFiles(false);
       }
     },
     [toast],
@@ -100,11 +107,11 @@ export default function NginxPage() {
 
   const loadContainers = useCallback(
     async (targetServer: string): Promise<string> => {
-      const seq = ++querySeq.current;
+      const seq = ++containersSeq.current;
       setLoadingContainers(true);
       try {
         const list = await api.listNginxContainers(targetServer);
-        if (seq !== querySeq.current) return "";
+        if (seq !== containersSeq.current) return "";
         setContainers(list);
         // 保留用户当前选择；否则优先 nginx 容器。不自动选非 nginx 容器，
         // 避免首次进入页面就对着 postgres 之类容器查询 conf.d 弹出错误。
@@ -116,13 +123,13 @@ export default function NginxPage() {
         setContainer(preferred?.name ?? "");
         return preferred?.name ?? "";
       } catch (error) {
-        if (seq !== querySeq.current) return "";
+        if (seq !== containersSeq.current) return "";
         setContainers([]);
         setContainer("");
         toast("error", String(error));
         return "";
       } finally {
-        if (seq === querySeq.current) setLoadingContainers(false);
+        if (seq === containersSeq.current) setLoadingContainers(false);
       }
     },
     [toast],
@@ -168,6 +175,7 @@ export default function NginxPage() {
     if (!serverId || !container || loadingName) return;
     const target = { serverId, container, dir: filesDir };
     const seq = querySeq.current;
+    const read = ++readSeq.current;
     setLoadingName(file.name);
     try {
       const detail = await api.readNginxConfig(
@@ -177,7 +185,8 @@ export default function NginxPage() {
         file.name,
       );
       // 读取期间切换了服务器/容器：丢弃结果，避免旧内容被保存到新目标。
-      if (seq !== querySeq.current) return;
+      // 读取期间重开了弹窗（新建）或已关闭：同样丢弃，否则会顶掉当前的编辑内容。
+      if (seq !== querySeq.current || read !== readSeq.current) return;
       setEditing({ name: detail.name, content: detail.content, isNew: false, ...target });
     } catch (error) {
       toast("error", String(error));
@@ -188,6 +197,8 @@ export default function NginxPage() {
 
   function handleNew() {
     if (!serverId || !container) return;
+    // 作废在途的单文件读取，否则它返回时会把「新建」弹窗换成旧文件内容。
+    readSeq.current += 1;
     setEditing({
       name: "",
       content: defaultNginxTemplate(),

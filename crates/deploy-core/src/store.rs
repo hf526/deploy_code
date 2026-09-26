@@ -7,8 +7,9 @@ use directories::ProjectDirs;
 use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, new_id, AppConfig, BackupConfig, BackupRecord, DeployConfig, DeployRecord,
-    DeployStatus, ExportData, ImportSummary, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig, SshAuth,
+    now_string, new_id, AppConfig, BackupConfig, BackupRecord, ContainerRecord, DbBackupSource,
+    DeployConfig, DeployRecord, DeployStatus, EnvFileConfig, ExportData, ImportCounts,
+    ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig, SshAuth,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -112,6 +113,17 @@ impl Store {
 
     pub fn pages_path(&self) -> PathBuf {
         self.base_dir.join("pages.json")
+    }
+
+    pub fn containers_path(&self) -> PathBuf {
+        self.base_dir.join("containers.json")
+    }
+
+    /// 容器备份包的本机存放目录（`<数据目录>/containers`）。
+    ///
+    /// 免设置可跑：不需要用户先选目录，备份一律落在这里，界面只负责把它显示出来。
+    pub fn container_bundle_dir(&self) -> PathBuf {
+        self.base_dir.join("containers")
     }
 
     pub fn temp_dir(&self) -> PathBuf {
@@ -319,11 +331,6 @@ impl Store {
         load_records(&self.history_path(), HISTORY_LABEL)
     }
 
-    pub fn save_history(&self, records: &[DeployRecord]) -> Result<()> {
-        let _guard = self.write_guard()?;
-        write_records(&self.history_path(), records)
-    }
-
     /// 新增或更新一条部署记录（按 id 匹配），并自动裁剪历史长度。
     pub fn upsert_history(&self, record: &DeployRecord, limit: usize) -> Result<()> {
         let _guard = self.write_guard()?;
@@ -333,6 +340,11 @@ impl Store {
     pub fn remove_history(&self, id: &str) -> Result<bool> {
         let _guard = self.write_guard()?;
         remove_record::<DeployRecord>(&self.history_path(), id, HISTORY_LABEL)
+    }
+
+    pub fn remove_history_many(&self, ids: &[String]) -> Result<usize> {
+        let _guard = self.write_guard()?;
+        remove_records_by_id::<DeployRecord>(&self.history_path(), ids, HISTORY_LABEL)
     }
 
     pub fn clear_history(&self) -> Result<()> {
@@ -351,11 +363,6 @@ impl Store {
         load_records(&self.backups_path(), BACKUP_LABEL)
     }
 
-    pub fn save_backups(&self, records: &[BackupRecord]) -> Result<()> {
-        let _guard = self.write_guard()?;
-        write_records(&self.backups_path(), records)
-    }
-
     /// 新增或更新一条备份记录（按 id 匹配），并自动裁剪历史长度。
     pub fn upsert_backup(&self, record: &BackupRecord, limit: usize) -> Result<()> {
         let _guard = self.write_guard()?;
@@ -371,6 +378,11 @@ impl Store {
         remove_record::<BackupRecord>(&self.backups_path(), id, BACKUP_LABEL)
     }
 
+    pub fn remove_backups_many(&self, ids: &[String]) -> Result<usize> {
+        let _guard = self.write_guard()?;
+        remove_records_by_id::<BackupRecord>(&self.backups_path(), ids, BACKUP_LABEL)
+    }
+
     pub fn clear_backups(&self) -> Result<()> {
         let _guard = self.write_guard()?;
         write_records::<BackupRecord>(&self.backups_path(), &[])
@@ -378,11 +390,6 @@ impl Store {
 
     pub fn load_pages_records(&self) -> Result<Vec<PagesDeployRecord>> {
         load_records(&self.pages_path(), PAGES_LABEL)
-    }
-
-    pub fn save_pages_records(&self, records: &[PagesDeployRecord]) -> Result<()> {
-        let _guard = self.write_guard()?;
-        write_records(&self.pages_path(), records)
     }
 
     /// 新增或更新一条 Pages 部署记录（按 id 匹配），并自动裁剪历史长度。
@@ -400,9 +407,39 @@ impl Store {
         remove_record::<PagesDeployRecord>(&self.pages_path(), id, PAGES_LABEL)
     }
 
+    pub fn remove_pages_records_many(&self, ids: &[String]) -> Result<usize> {
+        let _guard = self.write_guard()?;
+        remove_records_by_id::<PagesDeployRecord>(&self.pages_path(), ids, PAGES_LABEL)
+    }
+
     pub fn clear_pages_records(&self) -> Result<()> {
         let _guard = self.write_guard()?;
         write_records::<PagesDeployRecord>(&self.pages_path(), &[])
+    }
+
+    pub fn load_containers(&self) -> Result<Vec<ContainerRecord>> {
+        load_records(&self.containers_path(), CONTAINER_LABEL)
+    }
+
+    /// 新增或更新一条容器任务记录（按 id 匹配），并自动裁剪历史长度。
+    pub fn upsert_container(&self, record: &ContainerRecord, limit: usize) -> Result<()> {
+        let _guard = self.write_guard()?;
+        upsert_record(&self.containers_path(), record, limit, CONTAINER_LABEL)
+    }
+
+    pub fn find_container_record(&self, id: &str) -> Result<ContainerRecord> {
+        find_record_by_prefix(&self.containers_path(), id, CONTAINER_LABEL, CONTAINER_LABEL)
+    }
+
+    pub fn remove_container_record(&self, id: &str) -> Result<bool> {
+        let _guard = self.write_guard()?;
+        remove_record::<ContainerRecord>(&self.containers_path(), id, CONTAINER_LABEL)
+    }
+
+    /// 清空记录只删本地的任务历史，备份包文件留在原处（删记录不该带走数据）。
+    pub fn clear_container_records(&self) -> Result<()> {
+        let _guard = self.write_guard()?;
+        write_records::<ContainerRecord>(&self.containers_path(), &[])
     }
 
     /// 导出配置（JSON 格式，敏感字段已脱敏）。
@@ -412,104 +449,18 @@ impl Store {
         serde_json::to_string_pretty(&export_data).map_err(CoreError::Serde)
     }
 
-    /// 导入配置（合并模式：同 ID 覆盖，新 ID 追加）。
-    pub fn import_config(&self, json_str: &str) -> Result<ImportSummary> {
-        let export_data: ExportData = serde_json::from_str(json_str)
-            .map_err(|e| CoreError::config(format!("配置文件格式错误：{}", e)))?;
+    /// 导入前的只读比对：解析文件并演练一遍合并语义，不写盘。
+    /// 导出文件必然已脱敏，所以调用方必须先把结果给用户确认，再调 `import_config`。
+    pub fn preview_import(&self, json_str: &str) -> Result<ImportPreview> {
+        let export_data = parse_export(json_str)?;
+        let mut config = self.load_config()?;
+        Ok(merge_export(&mut config, &export_data))
+    }
 
-        // 版本检查
-        if export_data.version != "1.0" {
-            return Err(CoreError::config(format!(
-                "不支持的配置文件版本：{}",
-                export_data.version
-            )));
-        }
-
-        // 记录导入前的数量
-        let config_before = self.load_config()?;
-        let initial_count = (
-            config_before.servers.len(),
-            config_before.repos.len(),
-            config_before.backup_targets.len(),
-            config_before.deploy_configs.len(),
-            config_before.backup_configs.len(),
-            config_before.pages_configs.len(),
-        );
-
-        self.mutate_config(|config| {
-            // 服务器
-            for server in &export_data.servers {
-                match config.servers.iter_mut().find(|s| s.id == server.id) {
-                    Some(existing) => *existing = server.clone(),
-                    None => config.servers.push(server.clone()),
-                }
-            }
-
-            // 仓库
-            for repo in &export_data.repos {
-                match config.repos.iter_mut().find(|r| r.id == repo.id) {
-                    Some(existing) => *existing = repo.clone(),
-                    None => config.repos.push(repo.clone()),
-                }
-            }
-
-            // 备份目标
-            for target in &export_data.backup_targets {
-                match config.backup_targets.iter_mut().find(|t| t.id == target.id) {
-                    Some(existing) => *existing = target.clone(),
-                    None => config.backup_targets.push(target.clone()),
-                }
-            }
-
-            // 部署配置
-            for deploy_config in &export_data.deploy_configs {
-                match config.deploy_configs.iter_mut().find(|c| c.id == deploy_config.id) {
-                    Some(existing) => *existing = deploy_config.clone(),
-                    None => config.deploy_configs.push(deploy_config.clone()),
-                }
-            }
-
-            // 备份配置
-            for backup_config in &export_data.backup_configs {
-                match config.backup_configs.iter_mut().find(|c| c.id == backup_config.id) {
-                    Some(existing) => *existing = backup_config.clone(),
-                    None => config.backup_configs.push(backup_config.clone()),
-                }
-            }
-
-            // Pages 配置
-            for pages_config in &export_data.pages_configs {
-                match config.pages_configs.iter_mut().find(|c| c.id == pages_config.id) {
-                    Some(existing) => *existing = pages_config.clone(),
-                    None => config.pages_configs.push(pages_config.clone()),
-                }
-            }
-
-            // 设置（直接覆盖）
-            config.settings = export_data.settings.clone();
-
-            Ok(())
-        })?;
-
-        // 计算新增数量（导入后 - 导入前）
-        let config_after = self.load_config()?;
-        let final_count = (
-            config_after.servers.len(),
-            config_after.repos.len(),
-            config_after.backup_targets.len(),
-            config_after.deploy_configs.len(),
-            config_after.backup_configs.len(),
-            config_after.pages_configs.len(),
-        );
-
-        Ok(ImportSummary {
-            servers_imported: final_count.0.saturating_sub(initial_count.0),
-            repos_imported: final_count.1.saturating_sub(initial_count.1),
-            backup_targets_imported: final_count.2.saturating_sub(initial_count.2),
-            deploy_configs_imported: final_count.3.saturating_sub(initial_count.3),
-            backup_configs_imported: final_count.4.saturating_sub(initial_count.4),
-            pages_configs_imported: final_count.5.saturating_sub(initial_count.5),
-        })
+    /// 导入配置（合并模式：同 ID 覆盖，新 ID 追加，被脱敏清空的凭据保留本机值）。
+    pub fn import_config(&self, json_str: &str) -> Result<ImportPreview> {
+        let export_data = parse_export(json_str)?;
+        self.mutate_config(|config| Ok(merge_export(config, &export_data)))
     }
 
     /// 启动时把上次异常退出（崩溃/强杀）遗留的 Running 记录收敛为失败，
@@ -533,16 +484,22 @@ impl Store {
             PAGES_LABEL,
             message,
         )?;
+        converted += mark_running_as_interrupted::<ContainerRecord>(
+            &self.containers_path(),
+            CONTAINER_LABEL,
+            message,
+        )?;
         Ok(converted)
     }
 
-    /// 仅当没有其他进程正在执行部署 / 备份 / Pages 任务时，才收敛遗留的 Running 记录。
+    /// 仅当没有其他进程正在执行部署 / 备份 / Pages / 容器任务时，才收敛遗留的 Running 记录。
     /// GUI 启动和 CLI 启动共用，避免误伤正在运行的任务。
     pub fn reconcile_interrupted(&self) -> Result<usize> {
         let deploy = self.try_task_lock("deploy")?;
         let backup = self.try_task_lock("backup")?;
         let pages = self.try_task_lock("pages")?;
-        if deploy.is_none() || backup.is_none() || pages.is_none() {
+        let container = self.try_task_lock("container")?;
+        if deploy.is_none() || backup.is_none() || pages.is_none() || container.is_none() {
             return Ok(0);
         }
         self.mark_interrupted()
@@ -567,6 +524,17 @@ impl Store {
     }
 
     /// 按 id / 名称查找部署配置；id 精确命中优先，避免与名称歧义。
+    /// 服务器被删除后收敛部署配置：从目标列表里摘掉这一台，没有剩余目标的配置整条删除。
+    /// GUI 与 CLI 共用，避免两条清理路径的语义分叉。
+    pub fn detach_server_from_deploy_configs(config: &mut AppConfig, server_id: &str) {
+        for saved in config.deploy_configs.iter_mut() {
+            saved.server_ids.retain(|id| id != server_id);
+        }
+        config
+            .deploy_configs
+            .retain(|saved| !saved.server_ids.is_empty());
+    }
+
     pub fn find_deploy_config<'a>(config: &'a AppConfig, key: &str) -> Result<&'a DeployConfig> {
         let key = key.trim();
         if let Some(item) = config.deploy_configs.iter().find(|item| item.id == key) {
@@ -601,7 +569,18 @@ impl Store {
         config.rev = config.rev.trim().to_string();
         config.id = config.id.trim().to_string();
         config.repo_id = config.repo_id.trim().to_string();
-        config.server_id = config.server_id.trim().to_string();
+        // 服务器列表：去空与去重，保留顺序（顺序即批量部署的执行顺序）。
+        let mut server_keys = Vec::new();
+        for key in &config.server_ids {
+            let key = key.trim().to_string();
+            if !key.is_empty() && !server_keys.contains(&key) {
+                server_keys.push(key);
+            }
+        }
+        config.server_ids = server_keys;
+        if config.server_ids.is_empty() {
+            return Err(CoreError::config("部署配置至少要选择一台服务器"));
+        }
         config.script_dir = config.script_dir.trim().to_string();
         if config.script_dir.is_empty() {
             config.script_dir = "docker".to_string();
@@ -617,8 +596,15 @@ impl Store {
             // 仓库 / 服务器必须存在；名称与 host 也允许（兼容 CLI 习惯）。
             let repo = Store::find_repo(app, &config.repo_id)?.clone();
             config.repo_id = repo.id.clone();
-            let server = Store::find_server(app, &config.server_id)?.clone();
-            config.server_id = server.id.clone();
+            // 逐台解析成真实 id：按名称 / host 写进来的、以及解析后撞同一台的都在这里收敛。
+            let mut resolved_servers = Vec::with_capacity(config.server_ids.len());
+            for key in &config.server_ids {
+                let id = Store::find_server(app, key)?.id.clone();
+                if !resolved_servers.contains(&id) {
+                    resolved_servers.push(id);
+                }
+            }
+            config.server_ids = resolved_servers;
 
             let by_id = app.deploy_configs.iter().find(|item| item.id == config.id);
             if config.id.is_empty() {
@@ -689,42 +675,79 @@ impl Store {
         config.pages_configs.iter().collect()
     }
 
-    /// 保存一条 Pages 配置（新增或更新）。
-    pub fn save_pages_config(config: &mut AppConfig, entry: PagesConfigEntry) -> Result<()> {
+    /// 新建或更新一条 Pages 配置：仓库必须存在，同一仓库内名称唯一。
+    /// id 留空表示新建（补 uuid），携带不存在的 id 则报错而不是静默新建。
+    /// GUI 与 CLI 共用，保证两端保存行为一致。
+    pub fn save_pages_config(store: &Store, entry: PagesConfigEntry) -> Result<PagesConfigEntry> {
         let mut entry = entry;
         entry.name = entry.name.trim().to_string();
-        if entry.name.is_empty() {
-            return Err(CoreError::config("Pages 配置名称不能为空"));
-        }
         entry.repo_id = entry.repo_id.trim().to_string();
-        entry.repo_name = entry.repo_name.trim().to_string();
+        entry.id = entry.id.trim().to_string();
         entry.config = entry.config.normalize();
-
-        // 校验仓库存在
-        if config.repos.iter().all(|r| r.id != entry.repo_id) {
-            return Err(CoreError::not_found(format!(
-                "仓库不存在：{}",
-                entry.repo_id
-            )));
+        if entry.config.provider != "cloudflare" && entry.config.provider != "github" {
+            return Err(CoreError::config(
+                "不支持的 Pages 平台（可选 cloudflare / github）",
+            ));
         }
+        // GitHub 的远端地址要到部署时才验证得动，保存时只保证平台与分支齐备（normalize 已补默认值）。
 
-        // 名称唯一性校验（同一仓库内）
-        if config
-            .pages_configs
-            .iter()
-            .any(|item| item.id != entry.id && item.repo_id == entry.repo_id && item.name == entry.name)
-        {
-            return Err(CoreError::config(format!(
-                "该仓库下已存在同名 Pages 配置：{}",
-                entry.name
-            )));
-        }
+        store.mutate_config(|app| {
+            let repo = Store::find_repo(app, &entry.repo_id)?.clone();
+            entry.repo_id = repo.id.clone();
+            entry.repo_name = repo.name.clone();
+            if entry.name.is_empty() {
+                // 配置按仓库一份保存，界面没有单独的名称输入，沿用仓库名。
+                entry.name = repo.name.clone();
+            }
 
-        match config.pages_configs.iter_mut().find(|e| e.id == entry.id) {
-            Some(existing) => *existing = entry,
-            None => config.pages_configs.push(entry),
-        }
-        Ok(())
+            let by_id = app.pages_configs.iter().find(|item| item.id == entry.id);
+            if entry.id.is_empty() {
+                entry.id = new_id();
+            } else if by_id.is_none() {
+                // 明确携带 id 却不存在（已被 CLI / 其它窗口删除）：报错而不是静默新建。
+                return Err(CoreError::not_found(format!(
+                    "Pages 配置不存在（可能已被删除）: {}",
+                    entry.id
+                )));
+            }
+            // 更新已有配置时以存储中的创建时间为准，避免调用方传入的旧快照覆盖。
+            match by_id {
+                Some(existing) if !existing.created_at.trim().is_empty() => {
+                    entry.created_at = existing.created_at.clone();
+                }
+                _ => {
+                    if entry.created_at.trim().is_empty() {
+                        entry.created_at = now_string();
+                    }
+                }
+            }
+            if app
+                .pages_configs
+                .iter()
+                .any(|item| {
+                    item.id != entry.id && item.repo_id == entry.repo_id && item.name == entry.name
+                })
+            {
+                return Err(CoreError::config(format!(
+                    "该仓库下已存在同名 Pages 配置：{}",
+                    entry.name
+                )));
+            }
+            match app
+                .pages_configs
+                .iter_mut()
+                .find(|item| item.id == entry.id)
+            {
+                Some(existing) => *existing = entry.clone(),
+                None => app.pages_configs.push(entry.clone()),
+            }
+            // 保存即绑定：Pages 部署按仓库解析默认配置（`get_repo_default_pages`），
+            // 不写这条引用的话，界面上保存成功的配置对部署永远是透明的。
+            if let Some(repo) = app.repos.iter_mut().find(|item| item.id == entry.repo_id) {
+                repo.default_pages_config_id = Some(entry.id.clone());
+            }
+            Ok(entry.clone())
+        })
     }
 
     /// 删除一条 Pages 配置（按 id 精确删除）。
@@ -874,7 +897,9 @@ impl Store {
     }
 }
 
-fn paths_equal(a: &str, b: &str) -> bool {
+/// 判断两个本地路径是否指向同一处：统一分隔符、忽略结尾斜杠。
+/// GUI 与 CLI 的仓库查重都走这里，避免各处自己写一套归一化而宽严不一。
+pub fn paths_equal(a: &str, b: &str) -> bool {
     let normalize = |p: &str| {
         let normalized = p.replace('\\', "/");
         // 大小写不敏感只适用于 Windows；Linux 上 /srv/App 与 /srv/app 是两个不同仓库。
@@ -947,10 +972,227 @@ impl TaskRecord for PagesDeployRecord {
     }
 }
 
+impl TaskRecord for ContainerRecord {
+    fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn status_mut(&mut self) -> &mut DeployStatus {
+        &mut self.status
+    }
+
+    fn error_mut(&mut self) -> &mut Option<String> {
+        &mut self.error
+    }
+
+    fn finished_at_mut(&mut self) -> &mut Option<String> {
+        &mut self.finished_at
+    }
+}
+
 const HISTORY_LABEL: &str = "部署记录";
 const BACKUP_LABEL: &str = "备份记录";
 const PAGES_LABEL: &str = "Pages 记录";
 const PAGES_MISSING_LABEL: &str = "Pages 部署记录";
+const CONTAINER_LABEL: &str = "容器记录";
+
+/// 解析导出文件并校验版本。
+fn parse_export(json_str: &str) -> Result<ExportData> {
+    let data: ExportData = serde_json::from_str(json_str)
+        .map_err(|e| CoreError::config(format!("配置文件格式错误：{}", e)))?;
+    if data.version != "1.0" {
+        return Err(CoreError::config(format!(
+            "不支持的配置文件版本：{}",
+            data.version
+        )));
+    }
+    Ok(data)
+}
+
+/// 导出必然把敏感字段写成空串，所以「空」在这里的语义是「本次没有提供」，保留本机值。
+fn keep_when_blank(incoming: &mut String, current: &str, kept: &mut usize) {
+    if incoming.trim().is_empty() && !current.trim().is_empty() {
+        *incoming = current.to_string();
+        *kept += 1;
+    }
+}
+
+/// 合并服务器凭据。逐字段判断，避免把导出的空值写进本机真实凭据。
+fn merge_auth(incoming: &mut SshAuth, current: &SshAuth, kept: &mut usize) {
+    // 本机用密钥、导入文件里却是一个空密码认证：整套保留本机，否则导入后必然连不上。
+    let downgrade_to_blank_password = matches!(
+        (&*incoming, current),
+        (SshAuth::Password { password }, SshAuth::PrivateKey { .. }) if password.trim().is_empty()
+    );
+    if downgrade_to_blank_password {
+        *incoming = current.clone();
+        *kept += 1;
+        return;
+    }
+    match (incoming, current) {
+        (SshAuth::Password { password }, SshAuth::Password { password: saved }) => {
+            keep_when_blank(password, saved, kept);
+        }
+        // 私钥口令在导出时统一被抹成 None，与「本来就没有口令」无法区分，只能按空值处理。
+        (
+            SshAuth::PrivateKey { passphrase, .. },
+            SshAuth::PrivateKey { passphrase: Some(saved), .. },
+        ) if passphrase.is_none() => {
+            *passphrase = Some(saved.clone());
+            *kept += 1;
+        }
+        _ => {}
+    }
+}
+
+/// 数据库口令：导出时必然被抹成空串，空即「本次没有提供」，保留本机值。
+/// 采集方式 / 容器名 / 库名 / schema 不是凭据，照文件走。
+fn merge_db_source(incoming: &mut DbBackupSource, current: &DbBackupSource, kept: &mut usize) {
+    keep_when_blank(&mut incoming.password, &current.password, kept);
+}
+
+/// 可空连接串：导出时统一抹成 `None`，与「本机没有这项」无法区分（同私钥口令）。
+/// 本机存过就继续用本机的；换机导入时本机没有，留空让用户自己填，
+/// 绝不能把 `Some("")` 落盘——那会被下游当成一条可用的连接串。
+fn keep_option_when_absent(
+    incoming: &mut Option<String>,
+    current: &Option<String>,
+    kept: &mut usize,
+) {
+    if incoming.is_none() && current.is_some() {
+        *incoming = current.clone();
+        *kept += 1;
+    }
+}
+
+/// env 文件按数组下标对齐：导出保留了顺序与条数，脱敏后只剩空串，只能按序回填。
+fn merge_env_files(incoming: &mut Vec<EnvFileConfig>, current: &[EnvFileConfig], kept: &mut usize) {
+    for (index, file) in incoming.iter_mut().enumerate() {
+        let Some(saved) = current.get(index) else { break };
+        keep_when_blank(&mut file.local_path, &saved.local_path, kept);
+        keep_when_blank(&mut file.remote_path, &saved.remote_path, kept);
+    }
+}
+
+/// 按 id 合并一类配置：同 ID 覆盖（覆盖前用 `preserve` 把导出的空值换回本机值），新 ID 追加。
+fn merge_by_id<T, K, P>(target: &mut Vec<T>, incoming: &[T], key: K, mut preserve: P) -> ImportCounts
+where
+    T: Clone,
+    K: Fn(&T) -> &str,
+    P: FnMut(&mut T, &T),
+{
+    let mut counts = ImportCounts::default();
+    for item in incoming {
+        match target.iter().position(|existing| key(existing) == key(item)) {
+            Some(index) => {
+                let mut merged = item.clone();
+                preserve(&mut merged, &target[index]);
+                target[index] = merged;
+                counts.overwritten += 1;
+            }
+            None => {
+                target.push(item.clone());
+                counts.added += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// 把导出内容合并进本机配置，返回本次的去向统计。
+///
+/// 预览与实际导入共用这一个函数，因此「确认框里看到的」与「真正落盘的」必然一致。
+fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
+    let mut kept = 0usize;
+    let mut preview = ImportPreview {
+        exported_at: data.exported_at.clone(),
+        ..Default::default()
+    };
+
+    preview.servers = merge_by_id(
+        &mut config.servers,
+        &data.servers,
+        |item| item.id.as_str(),
+        |incoming: &mut ServerConfig, current: &ServerConfig| {
+            merge_auth(&mut incoming.auth, &current.auth, &mut kept);
+            if let (Some(incoming), Some(current)) =
+                (incoming.db_backup.as_mut(), current.db_backup.as_ref())
+            {
+                merge_db_source(incoming, current, &mut kept);
+            }
+            keep_option_when_absent(
+                &mut incoming.supabase_url,
+                &current.supabase_url,
+                &mut kept,
+            );
+        },
+    );
+    preview.repos = merge_by_id(
+        &mut config.repos,
+        &data.repos,
+        |item| item.id.as_str(),
+        |incoming, current| merge_env_files(&mut incoming.env_files, &current.env_files, &mut kept),
+    );
+    preview.backup_targets = merge_by_id(
+        &mut config.backup_targets,
+        &data.backup_targets,
+        |item| item.id.as_str(),
+        // 目标连接串带口令，导出时整条抹空：本机有值就继续用本机的。
+        |incoming, current| keep_when_blank(&mut incoming.url, &current.url, &mut kept),
+    );
+    preview.deploy_configs = merge_by_id(
+        &mut config.deploy_configs,
+        &data.deploy_configs,
+        |item| item.id.as_str(),
+        |_, _| {},
+    );
+    preview.backup_configs = merge_by_id(
+        &mut config.backup_configs,
+        &data.backup_configs,
+        |item| item.id.as_str(),
+        |incoming: &mut BackupConfig, current: &BackupConfig| {
+            merge_db_source(&mut incoming.source, &current.source, &mut kept);
+            keep_option_when_absent(
+                &mut incoming.supabase_url,
+                &current.supabase_url,
+                &mut kept,
+            );
+        },
+    );
+    preview.pages_configs = merge_by_id(
+        &mut config.pages_configs,
+        &data.pages_configs,
+        |item| item.id.as_str(),
+        |_, _| {},
+    );
+
+    // 设置整体跟随导入文件（换机迁移主要靠它），但导出的空凭据一律保留本机值。
+    let mut settings = data.settings.clone();
+    keep_when_blank(
+        &mut settings.cloudflare_api_token,
+        &config.settings.cloudflare_api_token,
+        &mut kept,
+    );
+    keep_when_blank(
+        &mut settings.cloudflare_account_id,
+        &config.settings.cloudflare_account_id,
+        &mut kept,
+    );
+    keep_when_blank(&mut settings.github_token, &config.settings.github_token, &mut kept);
+    keep_when_blank(
+        &mut settings.cronjob_api_key,
+        &config.settings.cronjob_api_key,
+        &mut kept,
+    );
+    if settings.master_password_hash.is_none() && config.settings.master_password_hash.is_some() {
+        settings.master_password_hash = config.settings.master_password_hash.clone();
+        kept += 1;
+    }
+    config.settings = settings;
+
+    preview.kept_local_secrets = kept;
+    preview
+}
 
 fn write_config(path: &Path, config: &AppConfig) -> Result<()> {
     let text = serde_json::to_string_pretty(config)?;
@@ -1017,11 +1259,22 @@ fn remove_record<T>(path: &Path, id: &str, label: &str) -> Result<bool>
 where
     T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
 {
+    Ok(remove_records_by_id::<T>(path, &[id.to_string()], label)? > 0)
+}
+
+/// 批量删除记录：一次加锁、一次写回，比逐条删除少掉 N-1 次读写。返回真正删掉的条数。
+fn remove_records_by_id<T>(path: &Path, ids: &[String], label: &str) -> Result<usize>
+where
+    T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    if ids.is_empty() {
+        return Ok(0);
+    }
     let mut records = load_records::<T>(path, label)?;
     let before = records.len();
-    records.retain(|r| r.id() != id);
-    let removed = records.len() != before;
-    if removed {
+    records.retain(|r| !ids.iter().any(|id| id.as_str() == r.id()));
+    let removed = before - records.len();
+    if removed > 0 {
         write_records(path, &records)?;
     }
     Ok(removed)
@@ -1110,6 +1363,312 @@ fn atomic_write(path: &Path, contents: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Settings;
+
+    fn temp_store() -> (Store, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-import-{}",
+            uuid::Uuid::new_v4()
+        ));
+        (Store::new(&dir), dir)
+    }
+
+    /// 带真实凭据的配置：密码认证服务器 + env 文件仓库 + 两个 API Token。
+    fn config_with_secrets() -> AppConfig {
+        let mut server = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.1".to_string(),
+            "root".to_string(),
+            SshAuth::Password {
+                password: "s3cret".to_string(),
+            },
+        );
+        server.id = "s1".to_string();
+        let mut repo = RepoConfig::new("web".to_string(), "D:/web".to_string());
+        repo.id = "r1".to_string();
+        repo.env_files.push(EnvFileConfig {
+            local_path: "D:/web/.env".to_string(),
+            remote_path: ".env".to_string(),
+        });
+        let mut settings = Settings::default();
+        settings.github_token = "gh_secret".to_string();
+        settings.cronjob_api_key = "cj_secret".to_string();
+        AppConfig {
+            servers: vec![server],
+            repos: vec![repo],
+            settings,
+            ..Default::default()
+        }
+    }
+
+    /// 只替换认证信息的导出文件，其它字段用来验证「非敏感字段跟随文件」。
+    fn export_with_server(server: ServerConfig) -> String {
+        let data = ExportData {
+            version: "1.0".to_string(),
+            exported_at: "2026-01-01 00:00:00".to_string(),
+            servers: vec![server],
+            repos: Vec::new(),
+            backup_targets: Vec::new(),
+            deploy_configs: Vec::new(),
+            backup_configs: Vec::new(),
+            pages_configs: Vec::new(),
+            settings: Settings::default(),
+        };
+        serde_json::to_string(&data).unwrap()
+    }
+
+    #[test]
+    fn export_then_import_preserves_local_credentials() {
+        let (store, dir) = temp_store();
+        store.save_config(&config_with_secrets()).unwrap();
+        let exported = store.export_config().unwrap();
+
+        // 导出之后本机改过主机名：非敏感字段应跟随文件，凭据不能被导出的空值冲掉。
+        let mut current = store.load_config().unwrap();
+        current.servers[0].host = "10.0.0.9".to_string();
+        store.save_config(&current).unwrap();
+
+        let preview = store.import_config(&exported).unwrap();
+        let after = store.load_config().unwrap();
+
+        assert_eq!(after.servers[0].host, "10.0.0.1");
+        assert!(
+            matches!(&after.servers[0].auth, SshAuth::Password { password } if password == "s3cret"),
+            "导出的空密码覆盖了本机密码"
+        );
+        assert_eq!(after.repos[0].env_files[0].local_path, "D:/web/.env");
+        assert_eq!(after.settings.github_token, "gh_secret");
+        assert_eq!(after.settings.cronjob_api_key, "cj_secret");
+        assert_eq!(preview.servers.overwritten, 1);
+        // 密码 1 + env 本地/远端路径 2 + Token 2
+        assert_eq!(preview.kept_local_secrets, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn export_blankout_does_not_erase_local_db_credentials() {
+        let (store, dir) = temp_store();
+        let mut server = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.1".to_string(),
+            "root".to_string(),
+            SshAuth::PrivateKey {
+                key_path: "D:/id_ed25519".to_string(),
+                passphrase: None,
+            },
+        );
+        server.id = "s1".to_string();
+        server.db_backup = Some(DbBackupSource {
+            container: "pg".to_string(),
+            database: "appdb".to_string(),
+            username: "postgres".to_string(),
+            password: "db_local".to_string(),
+            ..DbBackupSource::default()
+        });
+        server.supabase_url = Some("postgres://u:db_local@h/db".to_string());
+        let mut target =
+            crate::models::BackupTarget::new("目标库".to_string(), "postgres://u:tgt_local@h:5432/db".to_string());
+        target.id = "t1".to_string();
+        let mut backup = BackupConfig::new(
+            "每晚".to_string(),
+            "s1".to_string(),
+            DbBackupSource {
+                database: "appdb".to_string(),
+                password: "src_local".to_string(),
+                ..DbBackupSource::default()
+            },
+        );
+        backup.id = "b1".to_string();
+        backup.supabase_url = Some("postgres://u:cfg_local@h/db".to_string());
+        store
+            .save_config(&AppConfig {
+                servers: vec![server],
+                backup_targets: vec![target],
+                backup_configs: vec![backup],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let exported = store.export_config().unwrap();
+        for secret in ["db_local", "tgt_local", "src_local", "cfg_local"] {
+            assert!(!exported.contains(secret), "导出内容泄露了 {secret}");
+        }
+
+        // 导回本机：被抹掉的凭据必须原样留着，否则一次导入就把备份功能打废。
+        let preview = store.import_config(&exported).unwrap();
+        let after = store.load_config().unwrap();
+        assert_eq!(after.servers[0].db_backup.as_ref().unwrap().password, "db_local");
+        assert_eq!(
+            after.servers[0].supabase_url.as_deref(),
+            Some("postgres://u:db_local@h/db")
+        );
+        assert_eq!(after.backup_targets[0].url, "postgres://u:tgt_local@h:5432/db");
+        assert_eq!(after.backup_configs[0].source.password, "src_local");
+        assert_eq!(
+            after.backup_configs[0].supabase_url.as_deref(),
+            Some("postgres://u:cfg_local@h/db")
+        );
+        // 服务器 2 + 目标 1 + 备份配置 2
+        assert_eq!(preview.kept_local_secrets, 5);
+
+        // 换机导入（本机没有对应值）：不能落进 Some("")，那会被下游当成一条可用连接串。
+        let (fresh, fresh_dir) = temp_store();
+        fresh.import_config(&exported).unwrap();
+        let moved = fresh.load_config().unwrap();
+        assert_eq!(moved.servers[0].supabase_url, None);
+        assert!(moved.backup_targets[0].url.is_empty());
+        assert_eq!(moved.servers[0].db_backup.as_ref().unwrap().database, "appdb");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&fresh_dir);
+    }
+
+    #[test]
+    fn preview_import_counts_added_and_overwritten_without_writing() {
+        let (src, src_dir) = temp_store();
+        src.save_config(&config_with_secrets()).unwrap();
+        let mut two = src.load_config().unwrap();
+        let mut extra = ServerConfig::new(
+            "stage".to_string(),
+            "10.0.0.2".to_string(),
+            "deploy".to_string(),
+            SshAuth::Password {
+                password: "p2".to_string(),
+            },
+        );
+        extra.id = "s2".to_string();
+        two.servers.push(extra);
+        src.save_config(&two).unwrap();
+        let exported = src.export_config().unwrap();
+
+        let (store, dir) = temp_store();
+        store.save_config(&config_with_secrets()).unwrap();
+
+        let preview = store.preview_import(&exported).unwrap();
+        assert_eq!(preview.servers.added, 1);
+        assert_eq!(preview.servers.overwritten, 1);
+        assert_eq!(
+            store.load_config().unwrap().servers.len(),
+            1,
+            "预览不得写盘"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&src_dir);
+    }
+
+    #[test]
+    fn import_keeps_passphrase_but_follows_file_for_key_path() {
+        let (store, dir) = temp_store();
+        let mut server = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.1".to_string(),
+            "root".to_string(),
+            SshAuth::PrivateKey {
+                key_path: "C:/keys/id_ed25519".to_string(),
+                passphrase: Some("pp".to_string()),
+            },
+        );
+        server.id = "s1".to_string();
+        store
+            .save_config(&AppConfig {
+                servers: vec![server],
+                ..Default::default()
+            })
+            .unwrap();
+
+        // 导出把口令抹成 None，这与「本来就没有口令」无法区分，只能按未提供处理。
+        let mut incoming = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.8".to_string(),
+            "root".to_string(),
+            SshAuth::PrivateKey {
+                key_path: "C:/keys/new_path".to_string(),
+                passphrase: None,
+            },
+        );
+        incoming.id = "s1".to_string();
+        store.import_config(&export_with_server(incoming)).unwrap();
+
+        let after = store.load_config().unwrap();
+        match &after.servers[0].auth {
+            SshAuth::PrivateKey { key_path, passphrase } => {
+                assert_eq!(key_path, "C:/keys/new_path");
+                assert_eq!(passphrase.as_deref(), Some("pp"));
+            }
+            other => panic!("认证方式被改写: {other:?}"),
+        }
+        assert_eq!(after.servers[0].host, "10.0.0.8");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_does_not_downgrade_key_auth_to_blank_password() {
+        let (store, dir) = temp_store();
+        let mut server = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.1".to_string(),
+            "root".to_string(),
+            SshAuth::PrivateKey {
+                key_path: "C:/keys/id_ed25519".to_string(),
+                passphrase: None,
+            },
+        );
+        server.id = "s1".to_string();
+        store
+            .save_config(&AppConfig {
+                servers: vec![server],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let mut incoming = ServerConfig::new(
+            "prod".to_string(),
+            "10.0.0.8".to_string(),
+            "root".to_string(),
+            SshAuth::Password {
+                password: String::new(),
+            },
+        );
+        incoming.id = "s1".to_string();
+        let preview = store.import_config(&export_with_server(incoming)).unwrap();
+
+        let after = store.load_config().unwrap();
+        assert!(
+            matches!(&after.servers[0].auth, SshAuth::PrivateKey { key_path, .. } if key_path == "C:/keys/id_ed25519"),
+            "空密码导入把密钥认证降级了"
+        );
+        assert_eq!(preview.kept_local_secrets, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn remove_history_many_drops_only_selected_ids() {
+        let (store, dir) = temp_store();
+        for id in ["a", "b", "c"] {
+            let record: DeployRecord = serde_json::from_str(&format!(
+                r#"{{
+                    "id":"{id}","repoId":"repo","repoName":"demo","rev":"main","branch":"main",
+                    "commit":"abc","commitShort":"abc","commitSubject":"init","serverId":"srv",
+                    "serverName":"prod","targetDir":"/srv/app","scriptDir":"docker","scripts":[],
+                    "runScripts":false,"envFiles":[],"status":"success","error":null,"log":"",
+                    "startedAt":"2026-01-01 00:00:00","finishedAt":null,"durationMs":0
+                }}"#
+            ))
+            .unwrap();
+            store.upsert_history(&record, 0).unwrap();
+        }
+
+        // 混入不存在的 id：返回值只计真正删掉的条数。
+        let removed = store
+            .remove_history_many(&["a".to_string(), "c".to_string(), "gone".to_string()])
+            .unwrap();
+        assert_eq!(removed, 2);
+        let left = store.load_history().unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].id, "b");
+        assert_eq!(store.remove_history_many(&[]).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn reconcile_interrupted_skips_when_task_lock_held() {
@@ -1137,12 +1696,83 @@ mod tests {
         );
         drop(held);
 
-        // 三种任务锁都空闲时才把遗留的 Running 记录收敛为失败。
+        // 四类任务锁（部署 / 备份 / Pages / 容器）都空闲时，才把遗留的 Running 记录收敛为失败。
         assert_eq!(store.reconcile_interrupted().unwrap(), 1);
         assert_eq!(
             store.load_history().unwrap()[0].status,
             DeployStatus::Failed
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 容器记录走同一套 CRUD：按 id 覆盖、超限裁剪，崩溃后一起收敛为失败。
+    #[test]
+    fn container_records_upsert_trim_and_mark_interrupted() {
+        let dir = std::env::temp_dir()
+            .join(format!("deploycode-store-containers-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        let record = |id: &str, status: DeployStatus| ContainerRecord {
+            id: id.to_string(),
+            kind: crate::models::ContainerRecordKind::Backup,
+            project: "blog".to_string(),
+            server_id: "s1".to_string(),
+            server_name: "prod".to_string(),
+            target_server_id: String::new(),
+            target_server_name: String::new(),
+            target_dir: String::new(),
+            bundle_path: format!("/tmp/{id}.tar"),
+            bundle_size: 10,
+            services: vec!["web".to_string()],
+            volumes: vec!["blog_data".to_string()],
+            images: Vec::new(),
+            include_volumes: true,
+            include_images: true,
+            status,
+            error: None,
+            log: String::new(),
+            started_at: "2026-01-01 00:00:00".to_string(),
+            finished_at: None,
+            duration_ms: 0,
+        };
+
+        store
+            .upsert_container(&record("c1", DeployStatus::Running), 5)
+            .unwrap();
+        store
+            .upsert_container(&record("c2", DeployStatus::Success), 5)
+            .unwrap();
+        // 同 id 再写一次是覆盖而不是追加。
+        store
+            .upsert_container(&record("c1", DeployStatus::Success), 5)
+            .unwrap();
+        assert_eq!(store.load_containers().unwrap().len(), 2);
+        assert_eq!(
+            store.find_container_record("c1").unwrap().status,
+            DeployStatus::Success
+        );
+
+        // 超出保留条数时丢最旧的。
+        store
+            .upsert_container(&record("c3", DeployStatus::Success), 2)
+            .unwrap();
+        assert_eq!(store.load_containers().unwrap().len(), 2);
+
+        store
+            .upsert_container(&record("c4", DeployStatus::Running), 5)
+            .unwrap();
+        assert_eq!(store.mark_interrupted().unwrap(), 1);
+        let running_left = store
+            .load_containers()
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.status == DeployStatus::Running)
+            .count();
+        assert_eq!(running_left, 0);
+
+        store.remove_container_record("c3").unwrap();
+        assert!(store.find_container_record("c3").is_err());
+        store.clear_container_records().unwrap();
+        assert!(store.load_containers().unwrap().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1211,7 +1841,7 @@ mod tests {
                 id: String::new(),
                 name: " 生产部署 ".to_string(),
                 repo_id: "demo".to_string(),
-                server_id: "prod".to_string(),
+                server_ids: vec!["prod".to_string()],
                 target_dir: " /opt/app ".to_string(),
                 rev: " main ".to_string(),
                 run_scripts: true,
@@ -1223,7 +1853,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(saved.repo_id, repo_id);
-        assert_eq!(saved.server_id, server_id);
+        assert_eq!(saved.server_ids, vec![server_id.clone()]);
         assert_eq!(saved.name, "生产部署");
         assert_eq!(saved.target_dir, "/opt/app");
         assert_eq!(saved.rev, "main");
@@ -1236,10 +1866,39 @@ mod tests {
         duplicate.id = String::new();
         assert!(Store::save_deploy_config(&store, duplicate).is_err());
 
-        // 引用不存在的服务器拒绝。
+        // 任意一台服务器不存在就整条拒绝。
         let mut missing = saved.clone();
-        missing.server_id = "nope".to_string();
+        missing.server_ids = vec![server_id.clone(), "nope".to_string()];
         assert!(Store::save_deploy_config(&store, missing).is_err());
+
+        // 一台都没选时拒绝，避免留下永远发不出去的配置。
+        let mut empty = saved.clone();
+        empty.server_ids = Vec::new();
+        assert!(Store::save_deploy_config(&store, empty).is_err());
+
+        // 多台可以按名称 / host 传入：统一换成 id、保持执行顺序，指向同一台的重复项收敛成一条。
+        let second = ServerConfig::new(
+            "stage".to_string(),
+            "h2".to_string(),
+            "u".to_string(),
+            SshAuth::Password {
+                password: "x".to_string(),
+            },
+        );
+        let second_id = second.id.clone();
+        store
+            .mutate_config(|app| {
+                app.servers.push(second);
+                Ok(())
+            })
+            .unwrap();
+        let mut many = saved.clone();
+        // 新建走空 id：带未知 id 会被「配置不存在」守卫拒绝。
+        many.id = String::new();
+        many.name = "多机部署".to_string();
+        many.server_ids = vec!["stage".to_string(), "prod".to_string(), "h2".to_string()];
+        let many = Store::save_deploy_config(&store, many).unwrap();
+        assert_eq!(many.server_ids, vec![second_id, server_id.clone()]);
 
         // 更新同一条配置不会重复插入，且保留原创建时间。
         let created_at = saved.created_at.clone();
@@ -1248,7 +1907,8 @@ mod tests {
         renamed.created_at = String::new();
         let renamed = Store::save_deploy_config(&store, renamed).unwrap();
         assert_eq!(renamed.created_at, created_at);
-        assert_eq!(store.load_config().unwrap().deploy_configs.len(), 1);
+        // 只有「多机部署」那一条是新增的：更新原配置没有产生重复条目。
+        assert_eq!(store.load_config().unwrap().deploy_configs.len(), 2);
 
         // id 前后空白会被规范掉。
         let mut padded = saved.clone();
@@ -1271,8 +1931,105 @@ mod tests {
         assert!(Store::save_deploy_config(&store, relative).is_err());
 
         assert!(Store::delete_deploy_config(&store, &saved.id).unwrap());
-        assert!(store.load_config().unwrap().deploy_configs.is_empty());
+        // 只剩「多机部署」那一条：删除按 id 精确命中，不牵连其它配置。
+        let left = store.load_config().unwrap().deploy_configs;
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].name, "多机部署");
         assert!(!Store::delete_deploy_config(&store, &saved.id).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_pages_config_resolves_repo_and_keeps_one_entry_per_id() {
+        use crate::models::PagesConfig;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-store-pagescfg-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::new(&dir);
+        let mut config = AppConfig::default();
+        let repo = RepoConfig::new("demo".to_string(), "/tmp/demo".to_string());
+        let repo_id = repo.id.clone();
+        config.repos.push(repo);
+        store.save_config(&config).unwrap();
+
+        let draft = PagesConfigEntry {
+            id: String::new(),
+            name: String::new(),
+            repo_id: "demo".to_string(),
+            repo_name: String::new(),
+            config: PagesConfig {
+                provider: " Cloudflare ".to_string(),
+                project_name: " site ".to_string(),
+                build_command: String::new(),
+                output_dir: String::new(),
+                branch: String::new(),
+                publish_branch: String::new(),
+            },
+            created_at: String::new(),
+        };
+
+        // 新建：id / 创建时间由后端补齐，仓库按名称解析成 id 并回填名称与 repo_name。
+        let saved = Store::save_pages_config(&store, draft).unwrap();
+        assert!(!saved.id.is_empty());
+        assert_eq!(saved.repo_id, repo_id);
+        assert_eq!(saved.repo_name, "demo");
+        assert_eq!(saved.name, "demo");
+        assert!(!saved.created_at.is_empty());
+        assert_eq!(saved.config.provider, "cloudflare");
+        assert_eq!(saved.config.project_name, "site");
+        // normalize 补的回填默认值：输出目录与两个分支名不能留空。
+        assert_eq!(saved.config.output_dir, "dist");
+        assert_eq!(saved.config.branch, "main");
+        assert_eq!(saved.config.publish_branch, "gh-pages");
+        assert_eq!(store.load_config().unwrap().pages_configs.len(), 1);
+        // 保存会把这个仓库的默认 Pages 配置指过来，否则部署侧永远读不到这条配置。
+        assert_eq!(
+            store.load_config().unwrap().repos[0].default_pages_config_id,
+            Some(saved.id.clone())
+        );
+
+        // 同一 id 再保存是覆盖，不产生第二条，创建时间以存储里的为准。
+        let mut edited = saved.clone();
+        edited.name = "官网".to_string();
+        edited.created_at = "旧快照".to_string();
+        let edited = Store::save_pages_config(&store, edited).unwrap();
+        assert_eq!(edited.id, saved.id);
+        assert_eq!(edited.name, "官网");
+        assert_eq!(edited.created_at, saved.created_at);
+        assert_eq!(store.load_config().unwrap().pages_configs.len(), 1);
+
+        // 明确携带不存在的 id 拒绝；未列出的平台也拒绝。
+        let mut unknown = saved.clone();
+        unknown.id = "no-such-id".to_string();
+        assert!(Store::save_pages_config(&store, unknown).is_err());
+        let mut bad_provider = saved.clone();
+        bad_provider.id = String::new();
+        bad_provider.name = "其它平台".to_string();
+        bad_provider.config.provider = "vercel".to_string();
+        assert!(Store::save_pages_config(&store, bad_provider).is_err());
+        // 仓库不存在时不会留下半条配置。
+        let mut no_repo = saved.clone();
+        no_repo.id = String::new();
+        no_repo.repo_id = "missing".to_string();
+        assert!(Store::save_pages_config(&store, no_repo).is_err());
+        assert_eq!(store.load_config().unwrap().pages_configs.len(), 1);
+
+        // 删除按 id 命中，并清掉指向它的默认配置引用。
+        store
+            .mutate_config(|app| {
+                app.repos[0].default_pages_config_id = Some(saved.id.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(store
+            .mutate_config(|app| Store::delete_pages_config(app, &saved.id))
+            .unwrap());
+        let after = store.load_config().unwrap();
+        assert!(after.pages_configs.is_empty());
+        assert_eq!(after.repos[0].default_pages_config_id, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

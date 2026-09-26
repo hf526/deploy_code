@@ -13,8 +13,10 @@ import {
   Modal,
   Page,
   Select,
+  SelectBox,
 } from "../components/ui";
 import { api } from "../lib/api";
+import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
 import { useApp } from "../lib/store";
 import type { DeployRecord, RemoteRelease } from "../lib/types";
 import {
@@ -41,6 +43,8 @@ export default function HistoryPage() {
   const [removing, setRemoving] = useState<DeployRecord | null>(null);
   const [rollingBack, setRollingBack] = useState<DeployRecord | null>(null);
   const [clearing, setClearing] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(() => new Set());
+  const [bulkRemoving, setBulkRemoving] = useState(false);
   const [busy, setBusy] = useState(false);
   const [releaseRecord, setReleaseRecord] = useState<DeployRecord | null>(null);
   const [releases, setReleases] = useState<RemoteRelease[] | null>(null);
@@ -69,6 +73,20 @@ export default function HistoryPage() {
     () => (repoFilter ? history.filter((record) => record.repoId === repoFilter) : history),
     [history, repoFilter],
   );
+
+  // 进行中的记录不参与多选：删掉正在写入的条目，下一个事件又会把它写回来。
+  const selectableIds = useMemo(
+    () => filtered.filter((record) => record.status !== "running").map((record) => record.id),
+    [filtered],
+  );
+
+  // 后台刷新或另一个窗口改过列表后，丢掉已经不存在的勾选。
+  useEffect(() => {
+    setSelected((current) => {
+      const pruned = pruneSelection(current, selectableIds);
+      return pruned.size === current.size ? current : pruned;
+    });
+  }, [selectableIds]);
 
   useEffect(() => {
     void refreshHistory();
@@ -122,6 +140,23 @@ export default function HistoryPage() {
       await api.deleteRecord(removing.id);
       toast("success", t("history.deleted"));
       setRemoving(null);
+      await refreshHistory();
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleBulkDelete() {
+    const ids = [...selected];
+    if (ids.length === 0) return;
+    setBusy(true);
+    try {
+      const removed = await api.deleteRecords(ids);
+      toast("success", t("common.bulkDeleted", { count: removed }));
+      setSelected(new Set());
+      setBulkRemoving(false);
       await refreshHistory();
     } catch (error) {
       toast("error", String(error));
@@ -192,6 +227,8 @@ export default function HistoryPage() {
     }
   }
 
+  const selectAll = selectionState(selected, selectableIds);
+
   return (
     <Page
       title={t("history.title")}
@@ -220,6 +257,14 @@ export default function HistoryPage() {
           </Button>
           <Button
             variant="secondary"
+            icon={<Trash2 className="size-4" />}
+            disabled={selected.size === 0}
+            onClick={() => setBulkRemoving(true)}
+          >
+            {t("common.deleteSelected", { count: selected.size })}
+          </Button>
+          <Button
+            variant="secondary"
             icon={<Eraser className="size-4" />}
             disabled={history.length === 0}
             onClick={() => setClearing(true)}
@@ -245,6 +290,17 @@ export default function HistoryPage() {
           <table className="w-full text-left text-xs">
             <thead>
               <tr className="border-b border-line bg-field/60 text-[11px] uppercase tracking-wide text-ink-faint">
+                <th className="w-9 px-4 py-2.5">
+                  <SelectBox
+                    label={t("common.selectAll")}
+                    checked={selectAll === "all"}
+                    indeterminate={selectAll === "some"}
+                    disabled={selectableIds.length === 0}
+                    onChange={() =>
+                      setSelected((current) => toggleAll(current, selectableIds))
+                    }
+                  />
+                </th>
                 <th className="px-4 py-2.5 font-medium">{t("history.columns.status")}</th>
                 <th className="px-4 py-2.5 font-medium">{t("history.columns.time")}</th>
                 <th className="px-4 py-2.5 font-medium">{t("history.columns.repo")}</th>
@@ -259,6 +315,20 @@ export default function HistoryPage() {
             <tbody className="divide-y divide-line">
               {filtered.map((record) => (
                 <tr key={record.id} className="group transition-colors hover:bg-field">
+                  <td className="px-4 py-2.5">
+                    <SelectBox
+                      label={
+                        record.status === "running"
+                          ? t("common.runningNotDeletable")
+                          : t("common.select")
+                      }
+                      checked={selected.has(record.id)}
+                      disabled={record.status === "running"}
+                      onChange={(on) =>
+                        setSelected((current) => toggleId(current, record.id, on))
+                      }
+                    />
+                  </td>
                   <td className="px-4 py-2.5">
                     <Badge className={cn("border", deployStatusClass(record.status))}>
                       {deployStatusLabel(record.status)}
@@ -339,6 +409,12 @@ export default function HistoryPage() {
                         variant="ghost"
                         className="text-neg hover:bg-neg-soft hover:text-neg"
                         icon={<Trash2 className="size-3.5" />}
+                        title={
+                          record.status === "running"
+                            ? t("common.runningNotDeletable")
+                            : t("history.deleteTitle")
+                        }
+                        disabled={record.status === "running"}
                         onClick={() => setRemoving(record)}
                       />
                     </div>
@@ -515,6 +591,17 @@ export default function HistoryPage() {
         }
         onCancel={() => setRollingBack(null)}
         onConfirm={() => void handleRollback()}
+      />
+
+      <ConfirmModal
+        open={bulkRemoving}
+        danger
+        loading={busy}
+        title={t("history.bulkDeleteTitle")}
+        confirmText={t("common.delete")}
+        description={t("history.bulkDeleteDescription", { count: selected.size })}
+        onCancel={() => setBulkRemoving(false)}
+        onConfirm={() => void handleBulkDelete()}
       />
 
       <ConfirmModal

@@ -11,7 +11,9 @@ fn resolve_server(state: &AppState, server_id: &str) -> Result<ServerConfig> {
     Ok(Store::find_server(&config, server_id)?.clone())
 }
 
-/// Nginx 操作需要独占锁，避免并发修改配置导致冲突。
+/// 改动配置的 Nginx 操作需要独占，避免两处同时 `nginx -t` + 回滚互相踩。
+/// 只读查询（列容器 / 列文件 / 读文件）不占这个名额：一台连不上的机器会把
+/// 独占握到 SSH 超时为止，那样整个面板都点不动，与「短操作不占任务锁」的约定相反。
 macro_rules! nginx_lock_guard {
     ($app:expr) => {
         match ClaimGuard::acquire(&$app, ClaimKind::Nginx)? {
@@ -27,12 +29,9 @@ macro_rules! nginx_lock_guard {
 
 #[tauri::command(async)]
 pub async fn list_nginx_containers(
-    app: AppHandle,
     state: State<'_, AppState>,
     server_id: String,
 ) -> Result<Vec<NginxContainerInfo>> {
-    // 获取 Nginx 独占锁
-    let _guard = nginx_lock_guard!(app);
     let server = resolve_server(&state, &server_id)?;
     NginxEngine::new(state.store.clone())
         .list_containers(&server)
@@ -41,14 +40,11 @@ pub async fn list_nginx_containers(
 
 #[tauri::command(async)]
 pub async fn list_nginx_configs(
-    app: AppHandle,
     state: State<'_, AppState>,
     server_id: String,
     container: String,
     dir: String,
 ) -> Result<Vec<NginxConfigFile>> {
-    // 获取 Nginx 独占锁
-    let _guard = nginx_lock_guard!(app);
     let server = resolve_server(&state, &server_id)?;
     NginxEngine::new(state.store.clone())
         .list_configs(&server, &container, &dir)
@@ -57,15 +53,12 @@ pub async fn list_nginx_configs(
 
 #[tauri::command(async)]
 pub async fn read_nginx_config(
-    app: AppHandle,
     state: State<'_, AppState>,
     server_id: String,
     container: String,
     dir: String,
     name: String,
 ) -> Result<NginxConfigContent> {
-    // 获取 Nginx 独占锁
-    let _guard = nginx_lock_guard!(app);
     let server = resolve_server(&state, &server_id)?;
     NginxEngine::new(state.store.clone())
         .read_config(&server, &container, &dir, &name)

@@ -1,7 +1,10 @@
 //! 敏感数据加密模块
 //! 
 //! 使用 AES-256-GCM 加密 + HKDF 主密码派生密钥
-//! 所有 password 字段在保存前自动加密，读取后自动解密
+//!
+//! ⚠️ 目前未接入任何读写路径：`Store::save_config` / `load_config` 仍按明文存取 `config.json`
+//! （README 与 AGENTS.md 记录的就是明文），`Store` 里的 encrypt_/decrypt_sensitive_fields
+//! 与 set/verify_master_password 没有调用方。接通前不要按「密文」理解磁盘上的字段。
 
 use aes_gcm::{
     aead::{Aead, KeyInit},

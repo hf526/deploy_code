@@ -12,6 +12,7 @@ import {
   GitCommitHorizontal,
   Inbox,
   Loader2,
+  Network,
   Plus,
   RefreshCw,
   Rocket,
@@ -27,10 +28,11 @@ import { EditRepoModal } from "../components/EditRepoModal";
 import { SearchSelect } from "../components/SearchSelect";
 import { ConfirmModal } from "../components/ui";
 import { Button, Input } from "../components/ui";
+import { CommitGraph } from "../components/CommitGraph";
 import { FileExplorer } from "../components/FileExplorer";
 import { api } from "../lib/api";
 import { useApp } from "../lib/store";
-import type { Branch, RepoDetail } from "../lib/types";
+import type { Branch, GraphCommit, RepoDetail } from "../lib/types";
 import { registerUnsavedGuard, runGuarded } from "../lib/unsavedGuard";
 import { useTauriEvent } from "../lib/useTauriEvent";
 import { cn } from "../lib/utils";
@@ -41,6 +43,9 @@ import type { EditorView, Reveal } from "./repoDetail/editor";
 import { useFileFilter } from "./repoDetail/useFileFilter";
 
 type LeftView = "explorer" | "search" | "scm";
+
+// 提交图一次读多少条：与后端 commit_graph 的默认值一致，够看几条分支的分叉。
+const GRAPH_LIMIT = 200;
 
 export default function RepoDetailPage() {
   const { t } = useTranslation();
@@ -71,6 +76,11 @@ export default function RepoDetailPage() {
   const [remoteOpen, setRemoteOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
   const [sensitiveFiles, setSensitiveFiles] = useState<string[] | null>(null);
+  const [graphOpen, setGraphOpen] = useState(false);
+  const [graph, setGraph] = useState<GraphCommit[]>([]);
+  const [graphLoading, setGraphLoading] = useState(false);
+  // 只在用户主动刷新（提交 / 切分支 / 拉取）后重读提交图；文件监听的静默刷新不重读。
+  const [graphTick, setGraphTick] = useState(0);
   const branchMenuRef = useRef<HTMLDivElement>(null);
 
   const [pendingBranch, setPendingBranch] = useState<string | null>(null);
@@ -85,6 +95,7 @@ export default function RepoDetailPage() {
   useEffect(() => {
     setDetail(null);
     setBranches([]);
+    setGraph([]);
     setEditor({ kind: "none" });
     setReveal(null);
     setRemoteOpen(false);
@@ -108,6 +119,7 @@ export default function RepoDetailPage() {
       setDetail(nextDetail);
       setBranches(nextBranches);
       if (!silent) setTreeKey((key) => key + 1);
+      if (!silent) setGraphTick((tick) => tick + 1);
     } catch (error) {
       if (targetRepoId === repoIdRef.current && !silent) toast("error", String(error));
     } finally {
@@ -146,6 +158,31 @@ export default function RepoDetailPage() {
     } finally {
       setBusy(false);
     }
+  }
+
+  // 提交图按需读：读全分支（head 传 null），失败只提示不拦其它操作。
+  const loadGraph = useCallback(async () => {
+    if (!repoId) return;
+    const targetRepoId = repoId;
+    setGraphLoading(true);
+    try {
+      const next = await api.commitGraph(repoId, null, GRAPH_LIMIT);
+      if (targetRepoId === repoIdRef.current) setGraph(next);
+    } catch (error) {
+      if (targetRepoId === repoIdRef.current) toast("error", String(error));
+    } finally {
+      if (targetRepoId === repoIdRef.current) setGraphLoading(false);
+    }
+  }, [repoId, toast]);
+
+  useEffect(() => {
+    if (graphOpen) void loadGraph();
+  }, [graphOpen, graphTick, loadGraph]);
+
+  function handleGraphCheckout(name: string) {
+    // 带命名空间的是远端引用：切到（或建立）同名本地分支，其余直接切。
+    if (name.includes("/")) handleCheckoutRemote(name);
+    else handleCheckout(name);
   }
 
   // —— 外部文件变化实时刷新 ——
@@ -764,6 +801,14 @@ export default function RepoDetailPage() {
             badge={status?.changes.length ?? 0}
             onClick={() => setLeftView("scm")}
           />
+          {/* 提交图开的是底部停靠面板，不是左面板的第三种视图，所以用开关语义。 */}
+          <RailButton
+            icon={<Network className="size-5" />}
+            label={t("repoDetail.railGraph")}
+            active={graphOpen}
+            disabled={!repo.isRepo}
+            onClick={() => setGraphOpen((open) => !open)}
+          />
         </nav>
         <aside className="ui-sidebar flex w-[300px] shrink-0 flex-col overflow-hidden border-r border-line">
           {leftView === "scm" ? (
@@ -880,7 +925,11 @@ export default function RepoDetailPage() {
                   placeholder={t("repoDetail.newBranchPlaceholder")}
                   onKeyDown={(event) => {
                     if (event.key === "Enter") void handleCreateBranch();
-                    if (event.key === "Escape") setShowNewBranch(false);
+                    if (event.key === "Escape") {
+                      // 阻止冒泡到 Modal 的 Esc，否则收起新建分支输入框会连带关掉整个弹窗。
+                      event.preventDefault();
+                      setShowNewBranch(false);
+                    }
                   }}
                 />
                 <div className="flex items-center gap-2">
@@ -1086,6 +1135,48 @@ export default function RepoDetailPage() {
             onKeepDraft={keepDraft}
             onRevealDone={() => setReveal(null)}
           />
+          {graphOpen && (
+            <div className="flex h-[42%] min-h-52 shrink-0 flex-col border-t border-line">
+              <div className="flex h-8 shrink-0 items-center gap-2 px-2.5">
+                <Network className="size-3.5 shrink-0 text-ink-dim" />
+                <span className="text-xs font-semibold text-ink">
+                  {t("repoDetail.graphTitle")}
+                </span>
+                <span className="text-[11px] text-ink-faint">{graph.length}</span>
+                {graphLoading && <Loader2 className="size-3.5 shrink-0 animate-spin text-ink-dim" />}
+                <button
+                  type="button"
+                  onClick={() => void loadGraph()}
+                  className="ml-auto rounded p-0.5 text-ink-dim hover:bg-hover hover:text-ink"
+                  title={t("common.refresh")}
+                >
+                  <RefreshCw className="size-3.5" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setGraphOpen(false)}
+                  className="rounded p-0.5 text-ink-dim hover:bg-hover hover:text-ink"
+                  title={t("common.close")}
+                >
+                  <X className="size-3.5" />
+                </button>
+              </div>
+              <div className="min-h-0 flex-1 overflow-auto py-1">
+                {graph.length === 0 && !graphLoading ? (
+                  <p className="px-3 py-3 text-xs text-ink-faint">
+                    {t("repoDetail.graphEmpty", { limit: GRAPH_LIMIT })}
+                  </p>
+                ) : (
+                  <CommitGraph
+                    commits={graph}
+                    busy={busy}
+                    currentBranch={currentBranch}
+                    onCheckout={handleGraphCheckout}
+                  />
+                )}
+              </div>
+            </div>
+          )}
         </section>
       </div>
 
@@ -1138,16 +1229,24 @@ export default function RepoDetailPage() {
         onConfirm={() => void commitNow(true)}
       />
 
+      {/* 改名 / 重指向后要连全局 repos 一起刷：标签栏和部署、Pages 弹窗读的都是它，
+          只刷本页 detail 会让环境文件路径推导这类下游逻辑继续用旧目录。 */}
       <BindRemoteModal
         repo={remoteOpen ? repo : null}
         onClose={() => setRemoteOpen(false)}
-        onSaved={() => void reload()}
+        onSaved={() => {
+          void reload();
+          void refreshRepos();
+        }}
       />
 
       <EditRepoModal
         repo={editOpen ? repo : null}
         onClose={() => setEditOpen(false)}
-        onSaved={() => void reload()}
+        onSaved={() => {
+          void reload();
+          void refreshRepos();
+        }}
       />
     </div>
   );

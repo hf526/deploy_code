@@ -401,6 +401,9 @@ export default function ReposPage() {
         title={t("repos.cloneTitle")}
         subtitle={t("repos.cloneSubtitle")}
         width="max-w-lg"
+        onEnter={() => {
+          if (!cloning) void handleClone();
+        }}
         footer={
           <>
             <Button variant="secondary" disabled={cloning} onClick={() => setCloneOpen(false)}>

@@ -22,7 +22,8 @@ const EMPTY_CONFIG: PagesConfig = {
 
 /**
  * Pages 配置的新增 / 编辑弹窗。
- * Pages 配置按仓库保存（一仓库一份），编辑时不能更换仓库。
+ * Pages 配置按仓库保存（一仓库一份），编辑时不能更换仓库；
+ * 新建没有可加载的历史配置，草稿直接以默认值开始。
  */
 export function PagesConfigModal({
   entry,
@@ -34,7 +35,7 @@ export function PagesConfigModal({
   entry: PagesConfigEntry | null;
   prefillRepoId?: string;
   onClose: () => void;
-  onSaved: (repoId: string) => void;
+  onSaved: (entry: PagesConfigEntry) => void;
   onRequestBindRemote: (repo: RepoInfo) => void;
 }) {
   const { t } = useTranslation();
@@ -46,9 +47,6 @@ export function PagesConfigModal({
     () => entry?.repoId ?? prefillRepoId ?? repos[0]?.id ?? "",
   );
   const [draft, setDraft] = useState<PagesConfig>(() => entry?.config ?? EMPTY_CONFIG);
-  const [loaded, setLoaded] = useState(() => entry !== null);
-  const [loadError, setLoadError] = useState(false);
-  const [reloadKey, setReloadKey] = useState(0);
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
@@ -64,34 +62,9 @@ export function PagesConfigModal({
       setRepoId(prefillRepoId ?? repos[0].id);
       return;
     }
-    // 深链指向的仓库已被删除：回退到第一个仓库，避免表单永久停留在加载失败状态。
+    // 深链指向的仓库已被删除：回退到第一个仓库，避免表单停留在无效选择上。
     if (!repos.some((repo) => repo.id === repoId)) setRepoId(repos[0].id);
   }, [entry, repoId, repos, prefillRepoId]);
-
-  useEffect(() => {
-    if (entry || !repoId) return;
-    let cancelled = false;
-    setLoaded(false);
-    setLoadError(false);
-    void api
-      .getPagesConfig(repoId)
-      .then((config) => {
-        if (!cancelled) {
-          setDraft(config);
-          setLoaded(true);
-        }
-      })
-      .catch((error) => {
-        // 加载失败时保留当前草稿，避免保存把已保存配置覆盖成空白；同时提供重试。
-        if (!cancelled) {
-          setLoadError(true);
-          toast("error", String(error));
-        }
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [entry, repoId, reloadKey, toast]);
 
   const isGitHub = draft.provider === "github";
   const githubPreview = useMemo(
@@ -105,43 +78,45 @@ export function PagesConfigModal({
     setDraft((current) => ({ ...current, ...patch }));
   }
 
-  /** 校验并保存；通过时返回是否成功。 */
-  async function save(): Promise<boolean> {
+  async function handleSave() {
     if (!repoId) {
       toast("error", t("pages.errorRepo"));
-      return false;
+      return;
     }
     if (isGitHub) {
       if (!draft.publishBranch.trim()) {
         toast("error", t("pages.errorPublishBranch"));
-        return false;
+        return;
       }
     } else if (!draft.projectName.trim()) {
       toast("error", t("pages.errorProjectName"));
-      return false;
+      return;
     }
     if (!draft.outputDir.trim()) {
       toast("error", t("pages.errorOutputDir"));
-      return false;
+      return;
     }
     setSaving(true);
     try {
-      await api.savePagesConfig(repoId, draft);
-      return true;
+      // id / 创建时间留空交给后端补齐：新建与更新走同一条命令，两端行为一致。
+      const saved = await api.savePagesConfig({
+        id: entry?.id ?? "",
+        name: entry?.name ?? "",
+        repoId,
+        repoName: selected?.name ?? entry?.repoName ?? "",
+        config: draft,
+        createdAt: entry?.createdAt ?? "",
+      });
+      onSaved(saved);
     } catch (error) {
       toast("error", String(error));
-      return false;
     } finally {
       setSaving(false);
     }
   }
 
-  async function handleSave() {
-    if (await save()) onSaved(repoId);
-  }
-
   async function handleTest() {
-    if (!repoId || !loaded) return;
+    if (!repoId) return;
     setTesting(true);
     try {
       const message = await api.testPages(repoId, draft);
@@ -167,8 +142,8 @@ export function PagesConfigModal({
           onTest={() => void handleTest()}
           saving={saving}
           testing={testing}
-          testDisabled={!loaded || !repoId}
-          saveDisabled={!loaded}
+          testDisabled={!repoId}
+          saveDisabled={!repoId}
         />
       }
     >
@@ -188,24 +163,11 @@ export function PagesConfigModal({
           </Select>
         </Field>
 
-        {loadError && (
-          <div className="flex items-center justify-between gap-3 rounded-md border border-warn/40 bg-warn-soft px-3 py-2 text-[11px] text-warn">
-            <span>{t("pages.configLoadFailed")}</span>
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => setReloadKey((value) => value + 1)}
-            >
-              {t("common.retry")}
-            </Button>
-          </div>
-        )}
-
         <Field label={t("pages.provider")} required>
           <Select
             value={draft.provider}
             onChange={(event) => update({ provider: event.target.value as PagesConfig["provider"] })}
-            disabled={saving || !loaded}
+            disabled={saving}
           >
             <option value="cloudflare">Cloudflare Pages</option>
             <option value="github">GitHub Pages</option>
@@ -221,7 +183,7 @@ export function PagesConfigModal({
                 options={branchChoices}
                 allowCustom
                 placeholder="gh-pages"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -282,7 +244,7 @@ export function PagesConfigModal({
                 value={draft.buildCommand}
                 onChange={(event) => update({ buildCommand: event.target.value })}
                 placeholder="npm run build"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -291,7 +253,7 @@ export function PagesConfigModal({
                 value={draft.outputDir}
                 onChange={(event) => update({ outputDir: event.target.value })}
                 placeholder="dist"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -305,7 +267,7 @@ export function PagesConfigModal({
                 onChange={(value) => update({ branch: value })}
                 options={branchChoices}
                 placeholder={t("deploy.branchPlaceholder")}
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -314,7 +276,7 @@ export function PagesConfigModal({
                 value={draft.projectName}
                 onChange={(event) => update({ projectName: event.target.value })}
                 placeholder="my-site"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -323,7 +285,7 @@ export function PagesConfigModal({
                 value={draft.buildCommand}
                 onChange={(event) => update({ buildCommand: event.target.value })}
                 placeholder="npm run build"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 
@@ -332,7 +294,7 @@ export function PagesConfigModal({
                 value={draft.outputDir}
                 onChange={(event) => update({ outputDir: event.target.value })}
                 placeholder="dist"
-                disabled={saving || !loaded}
+                disabled={saving}
               />
             </Field>
 

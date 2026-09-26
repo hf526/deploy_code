@@ -5,6 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use deploy_core::store::TaskLock;
 use deploy_core::{DeployEngine, Result, Store};
+use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
 /// 已登记的仓库文件监听：记录被监听目录，仓库路径变化时可替换 watcher。
@@ -33,6 +34,35 @@ pub struct ActiveBackup {
     pub abort: tokio::task::AbortHandle,
 }
 
+/// 正在进行的容器备份 / 迁移。
+///
+/// 一台任务同时碰两台服务器（来源打包、目标恢复），所以清理要按服务器列表逐个做。
+#[derive(Clone)]
+pub struct ActiveContainer {
+    pub server_ids: Vec<String>,
+    pub record_id: String,
+    pub abort: tokio::task::AbortHandle,
+}
+
+/// 关机计划的来源。
+#[derive(Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ShutdownSource {
+    /// 「每天定时关机」到点排的那一次。
+    Scheduled,
+    /// 用户在设置页手动按下的倒计时。
+    Manual,
+}
+
+/// 已排定的关机计划：仍在应用内倒计时阶段，尚未下发系统关机请求。
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PendingShutdown {
+    /// 下发系统关机请求的时刻（epoch 毫秒）。前端按秒自己走表，不占 IPC。
+    pub at_ms: i64,
+    pub source: ShutdownSource,
+}
+
 /// 可抢占的任务类型。
 #[derive(Clone, Copy)]
 pub enum ClaimKind {
@@ -40,6 +70,7 @@ pub enum ClaimKind {
     Backup,
     Pages,
     Nginx,
+    Container,
 }
 
 impl ClaimKind {
@@ -49,6 +80,7 @@ impl ClaimKind {
             ClaimKind::Backup => state.try_claim_backup(),
             ClaimKind::Pages => state.try_claim_pages(),
             ClaimKind::Nginx => state.try_claim_nginx(),
+            ClaimKind::Container => state.try_claim_container(),
         }
     }
 
@@ -58,6 +90,7 @@ impl ClaimKind {
             ClaimKind::Backup => state.release_backup_claim(),
             ClaimKind::Pages => state.release_pages_claim(),
             ClaimKind::Nginx => state.release_nginx_claim(),
+            ClaimKind::Container => state.release_container_claim(),
         }
     }
 }
@@ -119,6 +152,50 @@ impl Drop for DeployTaskGuard {
     }
 }
 
+/// 批量部署的登记守卫：整批共用一次抢占，登记项随每台开始而推进。
+///
+/// 取消时命令层按「当前这一台」的 recordId 取句柄，句柄是整个批次任务的，
+/// abort 会让循环连同本守卫一起析构，因此剩余登记不会残留。
+pub struct DeployBatchTracking {
+    app: AppHandle,
+    abort: tokio::task::AbortHandle,
+    current: Option<String>,
+}
+
+impl DeployBatchTracking {
+    pub fn new(app: AppHandle, abort: tokio::task::AbortHandle) -> Self {
+        Self {
+            app,
+            abort,
+            current: None,
+        }
+    }
+
+    /// 开始一台：先摘掉上一台的登记，再按批次任务的句柄登记这一台。
+    pub fn begin(&mut self, record: &deploy_core::models::DeployRecord) {
+        if let Some(previous) = self.current.take() {
+            self.app.state::<AppState>().untrack_deploy(&previous);
+        }
+        self.app.state::<AppState>().track_deploy(
+            &record.id,
+            ActiveDeploy {
+                server_id: record.server_id.clone(),
+                target_dir: record.target_dir.clone(),
+                abort: self.abort.clone(),
+            },
+        );
+        self.current = Some(record.id.clone());
+    }
+}
+
+impl Drop for DeployBatchTracking {
+    fn drop(&mut self) {
+        if let Some(current) = self.current.take() {
+            self.app.state::<AppState>().untrack_deploy(&current);
+        }
+    }
+}
+
 /// 备份任务守卫：事件转发结束（含任务 panic / 取消）后释放抢占标记并清理登记项。
 pub struct BackupTaskGuard {
     app: AppHandle,
@@ -147,6 +224,31 @@ pub struct PagesTaskGuard {
     _claim: ClaimGuard,
 }
 
+/// 容器任务守卫：事件转发结束后释放抢占标记并清理登记项。
+pub struct ContainerTaskGuard {
+    app: AppHandle,
+    record_id: String,
+    _claim: ClaimGuard,
+}
+
+impl ContainerTaskGuard {
+    pub fn new(app: AppHandle, record_id: String, claim: ClaimGuard) -> Self {
+        Self {
+            app,
+            record_id,
+            _claim: claim,
+        }
+    }
+}
+
+impl Drop for ContainerTaskGuard {
+    fn drop(&mut self) {
+        self.app
+            .state::<AppState>()
+            .untrack_container(&self.record_id);
+    }
+}
+
 impl PagesTaskGuard {
     pub fn new(claim: ClaimGuard) -> Self {
         Self { _claim: claim }
@@ -162,9 +264,16 @@ pub struct AppState {
     pub active_deploys: Mutex<HashMap<String, ActiveDeploy>>,
     /// 进行中的备份（record_id -> 服务器/记录/任务句柄），退出时用于终止远端脚本。
     pub active_backups: Mutex<HashMap<String, ActiveBackup>>,
+    /// 进行中的容器备份 / 迁移（record_id -> 涉及的服务器/任务句柄）。
+    pub active_containers: Mutex<HashMap<String, ActiveContainer>>,
     /// 取消部署后正在做远端清理的任务；此时任务守卫已摘除 active_deploys，
     /// 单独登记保证清理期间退出应用仍会终止远端脚本。
     pub pending_cleanups: Mutex<Vec<(String, ActiveDeploy)>>,
+    /// 取消容器任务后正在做远端清理的那些：`take_container` 已经把登记项摘掉，
+    /// 不另记一份的话清理期间退出应用会把备份包留在来源与目标两台服务器上。
+    pub pending_container_cleanups: Mutex<Vec<(String, ActiveContainer)>>,
+    /// 排定中的关机计划（倒计时阶段）；到点由调度器取出并下发系统关机请求。
+    pending_shutdown: Mutex<Option<PendingShutdown>>,
     /// 部署抢占标记：在 prepare 之前原子占位，避免两个并发命令同时通过检查。
     deploy_claim: AtomicBool,
     /// 备份抢占标记：同一时间只允许一个数据库备份。
@@ -173,6 +282,8 @@ pub struct AppState {
     pages_claim: AtomicBool,
     /// Nginx 操作抢占标记：同一时间只允许一个 Nginx 操作（避免并发修改配置）。
     nginx_claim: AtomicBool,
+    /// 容器任务抢占标记：同一时间只允许一个容器备份 / 迁移。
+    container_claim: AtomicBool,
     /// 部署跨进程任务锁（持有时禁止 CLI 等其他进程执行部署）。
     deploy_lock: Mutex<Option<TaskLock>>,
     /// 备份跨进程任务锁。
@@ -181,6 +292,8 @@ pub struct AppState {
     pages_lock: Mutex<Option<TaskLock>>,
     /// Nginx 跨进程任务锁。
     nginx_lock: Mutex<Option<TaskLock>>,
+    /// 容器任务跨进程锁。
+    container_lock: Mutex<Option<TaskLock>>,
 }
 
 impl AppState {
@@ -190,15 +303,20 @@ impl AppState {
             watchers: Mutex::new(HashMap::new()),
             active_deploys: Mutex::new(HashMap::new()),
             active_backups: Mutex::new(HashMap::new()),
+            active_containers: Mutex::new(HashMap::new()),
             pending_cleanups: Mutex::new(Vec::new()),
+            pending_container_cleanups: Mutex::new(Vec::new()),
+            pending_shutdown: Mutex::new(None),
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),
             nginx_claim: AtomicBool::new(false),
+            container_claim: AtomicBool::new(false),
             deploy_lock: Mutex::new(None),
             backup_lock: Mutex::new(None),
             pages_lock: Mutex::new(None),
             nginx_lock: Mutex::new(None),
+            container_lock: Mutex::new(None),
         }
     }
 
@@ -289,6 +407,20 @@ impl AppState {
         self.try_claim(&self.nginx_claim, &self.nginx_lock, "nginx")
     }
 
+    /// 尝试占用容器任务名额（备份 / 迁移 / 恢复共用一个）。
+    pub fn try_claim_container(&self) -> Result<bool> {
+        self.try_claim(&self.container_claim, &self.container_lock, "container")
+    }
+
+    pub fn release_container_claim(&self) {
+        self.release_claim(&self.container_claim, &self.container_lock);
+    }
+
+    /// 容器任务是否仍在进行（退出时用于判断是否需要推迟退出）。
+    pub fn has_active_container(&self) -> bool {
+        self.container_claim.load(Ordering::SeqCst)
+    }
+
     pub fn release_nginx_claim(&self) {
         self.release_claim(&self.nginx_claim, &self.nginx_lock);
     }
@@ -301,6 +433,51 @@ impl AppState {
     /// Pages 任务是否仍在进行（退出时用于判断是否需要推迟退出并清理子进程）。
     pub fn has_active_pages(&self) -> bool {
         self.pages_claim.load(Ordering::SeqCst)
+    }
+
+    fn shutdown_slot(&self) -> std::sync::MutexGuard<'_, Option<PendingShutdown>> {
+        self.pending_shutdown
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// 当前排定的关机计划（仍在可取消的倒计时阶段）。
+    pub fn pending_shutdown(&self) -> Option<PendingShutdown> {
+        *self.shutdown_slot()
+    }
+
+    /// 排定关机计划；已有计划时覆盖（用户重新选时长就是要改时间）。
+    pub fn arm_shutdown(&self, plan: PendingShutdown) {
+        *self.shutdown_slot() = Some(plan);
+    }
+
+    /// 取消尚未下发的关机计划。
+    pub fn cancel_shutdown(&self) -> Option<PendingShutdown> {
+        self.shutdown_slot().take()
+    }
+
+    /// 只取消「每天定时关机」排的那一次：关掉开关后不该还留着一次待执行的关机，
+    /// 但用户刚手动按下的倒计时不算被这次开关管着。
+    pub fn cancel_scheduled_shutdown(&self) -> Option<PendingShutdown> {
+        let mut slot = self.shutdown_slot();
+        let scheduled = matches!(*slot, Some(plan) if plan.source == ShutdownSource::Scheduled);
+        if scheduled {
+            slot.take()
+        } else {
+            None
+        }
+    }
+
+    /// 取出已到点的关机计划。与「取消」共用一把锁：用户同一刻点取消时，
+    /// 要么取消成功（计划已被摘走，不会再下发），要么关机已经排上，不会两头落空。
+    pub fn take_due_shutdown(&self, now_ms: i64) -> Option<PendingShutdown> {
+        let mut slot = self.shutdown_slot();
+        let due = matches!(*slot, Some(plan) if plan.at_ms <= now_ms);
+        if due {
+            slot.take()
+        } else {
+            None
+        }
     }
 
     pub fn engine(&self) -> DeployEngine {
@@ -368,6 +545,34 @@ impl AppState {
             .collect()
     }
 
+    /// 登记一条「取消后正在远端清理」的容器任务，重复登记时保留先登记的项。
+    pub fn add_pending_container_cleanup(&self, record_id: &str, task: ActiveContainer) {
+        let mut pending = self
+            .pending_container_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !pending.iter().any(|(id, _)| id == record_id) {
+            pending.push((record_id.to_string(), task));
+        }
+    }
+
+    /// 取消流程自身的远端清理结束后移除登记；若已被退出流程取走则为空操作。
+    pub fn remove_pending_container_cleanup(&self, record_id: &str) {
+        self.pending_container_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .retain(|(id, _)| id != record_id);
+    }
+
+    /// 取出并清空「取消清理中」的容器任务列表（退出时与 active_containers 一起清理）。
+    pub fn take_pending_container_cleanups(&self) -> Vec<(String, ActiveContainer)> {
+        self.pending_container_cleanups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain(..)
+            .collect()
+    }
+
     pub fn track_backup(&self, record_id: &str, backup: ActiveBackup) {
         self.active_backups
             .lock()
@@ -385,6 +590,37 @@ impl AppState {
     /// 取出并清空当前进行中的备份列表。
     pub fn take_backups(&self) -> Vec<(String, ActiveBackup)> {
         self.active_backups
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .drain()
+            .collect()
+    }
+
+    pub fn track_container(&self, record_id: &str, task: ActiveContainer) {
+        self.active_containers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(record_id.to_string(), task);
+    }
+
+    pub fn untrack_container(&self, record_id: &str) {
+        self.active_containers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(record_id);
+    }
+
+    /// 取出指定记录的容器登记项（取消时取出后退出清理不会再处理它）。
+    pub fn take_container(&self, record_id: &str) -> Option<ActiveContainer> {
+        self.active_containers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(record_id)
+    }
+
+    /// 取出并清空当前进行中的容器任务列表。
+    pub fn take_containers(&self) -> Vec<(String, ActiveContainer)> {
+        self.active_containers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .drain()

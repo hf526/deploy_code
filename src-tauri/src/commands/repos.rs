@@ -213,17 +213,11 @@ fn normalize_repo_path(raw: &str) -> Result<String> {
 
 /// 把仓库重新指向另一个本地目录时，拒绝与其他仓库指向同一位置（路径按规范化后比较）。
 fn path_owner(config: &AppConfig, repo_id: &str, next_path: &str) -> Option<String> {
-    let normalized = next_path.replace('\\', "/");
-    let normalized = normalized.trim_end_matches('/');
     config
         .repos
         .iter()
         .find(|item| {
-            item.id != repo_id
-                && {
-                    let existing = item.path.replace('\\', "/");
-                    existing.trim_end_matches('/') == normalized
-                }
+            item.id != repo_id && deploy_core::store::paths_equal(&item.path, next_path)
         })
         .map(|item| item.name.clone())
 }
@@ -270,8 +264,10 @@ pub fn update_repo(
             repo.name = name;
         }
         // 路径同样遵循「None = 本次不修改」：旧目录已失效时前端只提交改动过的路径，改名才不会被存在性校验误挡。
-        if let Some(next_path) = next_path {
-            repo.path = next_path;
+        if let Some(next_path) = &next_path {
+            let previous_path = repo.path.clone();
+            repo.path = next_path.clone();
+            repo.rebase_env_files(&previous_path, next_path);
         }
         // None 表示“本次不修改”，空串才表示清空，避免重命名等局部更新把默认配置抹掉。
         if let Some(value) = default_server_id {
@@ -545,5 +541,21 @@ mod tests {
         assert_eq!(path_owner(&config, "a", r"E:\code\alpha").as_deref(), None);
         assert_eq!(path_owner(&config, "b", "/srv/beta").as_deref(), None);
         assert_eq!(path_owner(&config, "a", r"E:\code\gamma").as_deref(), None);
+    }
+
+    #[test]
+    fn path_owner_treats_case_by_platform() {
+        let config = AppConfig {
+            repos: vec![repo("a", "甲", r"E:\Code\Alpha")],
+            ..Default::default()
+        };
+        // 只有大小写差异的同一目录：Windows 上磁盘改名（App→app）或导入来的路径大小写过期，
+        // 严格比较会漏判成两个仓库指向同一处；POSIX 上大小写敏感，它们确实是两个仓库。
+        let conflict = path_owner(&config, "b", r"e:\code\alpha");
+        if cfg!(windows) {
+            assert_eq!(conflict.as_deref(), Some("甲"));
+        } else {
+            assert_eq!(conflict, None);
+        }
     }
 }

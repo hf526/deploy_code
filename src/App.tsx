@@ -10,10 +10,18 @@ import { Toasts } from "./components/ui";
 import i18n, { applyLanguage } from "./lib/i18n";
 import { useApp } from "./lib/store";
 import { useTauriEvent } from "./lib/useTauriEvent";
-import type { BackupEvent, DeployEvent, PagesEvent, SchedulerNotice } from "./lib/types";
+import type {
+  BackupEvent,
+  ContainerEvent,
+  DeployEvent,
+  PagesEvent,
+  SchedulerNotice,
+  ShutdownStatus,
+} from "./lib/types";
 
 // 按页面分包：启动只加载首屏，其余页面首次访问时按需加载。
 const BackupsPage = lazy(() => import("./pages/BackupsPage"));
+const ContainersPage = lazy(() => import("./pages/ContainersPage"));
 const CronJobsPage = lazy(() => import("./pages/CronJobsPage"));
 const DeployPage = lazy(() => import("./pages/DeployPage"));
 const HistoryPage = lazy(() => import("./pages/HistoryPage"));
@@ -58,6 +66,7 @@ function TabsAndRoutes() {
             <Route path="/deploy" element={<DeployPage />} />
             <Route path="/servers" element={<ServersPage />} />
             <Route path="/nginx" element={<NginxPage />} />
+            <Route path="/containers" element={<ContainersPage />} />
             <Route path="/cron-jobs" element={<CronJobsPage />} />
             <Route path="/backups" element={<BackupsPage />} />
             <Route path="/history" element={<HistoryPage />} />
@@ -76,6 +85,8 @@ export default function App() {
   const handleDeployEvent = useApp((state) => state.handleDeployEvent);
   const handleBackupEvent = useApp((state) => state.handleBackupEvent);
   const handlePagesEvent = useApp((state) => state.handlePagesEvent);
+  const handleContainerEvent = useApp((state) => state.handleContainerEvent);
+  const setShutdownStatus = useApp((state) => state.setShutdownStatus);
   const toast = useApp((state) => state.toast);
 
   useEffect(() => {
@@ -89,13 +100,25 @@ export default function App() {
   useTauriEvent<DeployEvent>("deploy://event", handleDeployEvent);
   useTauriEvent<BackupEvent>("backup://event", handleBackupEvent);
   useTauriEvent<PagesEvent>("pages://event", handlePagesEvent);
+  useTauriEvent<ContainerEvent>("container://event", handleContainerEvent);
+  // 关机计划变化（排定 / 取消 / 已下发）：底部状态栏据此显示倒计时与取消入口。
+  useTauriEvent<ShutdownStatus>("shutdown://status", setShutdownStatus);
   useTauriEvent<SchedulerNotice>("scheduler://notice", (notice) => {
-    if (notice.kind === "started") {
-      toast("success", i18n.t("backup.schedule.started"));
-    } else if (notice.kind === "noConfig") {
-      toast("error", i18n.t("backup.schedule.noConfig"));
-    } else {
-      toast("error", i18n.t("backup.schedule.failed", { error: notice.message ?? "" }));
+    switch (notice.kind) {
+      case "started":
+        toast("success", i18n.t("backup.schedule.started"));
+        break;
+      case "noConfig":
+        toast("error", i18n.t("backup.schedule.noConfig"));
+        break;
+      case "shutdownFired":
+        toast("info", i18n.t("settings.shutdown.fired"));
+        break;
+      case "shutdownFailed":
+        toast("error", i18n.t("settings.shutdown.failed", { error: notice.message ?? "" }));
+        break;
+      default:
+        toast("error", i18n.t("backup.schedule.failed", { error: notice.message ?? "" }));
     }
   });
 

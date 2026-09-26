@@ -53,6 +53,8 @@ export default function CronJobsPage() {
 
   // cron-job.org 的 API 默认只有 100 次/天：进入页面拉一次 + 手动刷新，绝不轮询。
   const requestSeq = useRef(0);
+  // StrictMode 在开发期会把挂载跑两遍，配额按天计，所以首拉只放行一次。
+  const bootstrapped = useRef(false);
   const reload = useCallback(async () => {
     const seq = requestSeq.current + 1;
     requestSeq.current = seq;
@@ -74,7 +76,9 @@ export default function CronJobsPage() {
   }, []);
 
   useEffect(() => {
-    if (apiKey) void reload();
+    if (!apiKey || bootstrapped.current) return;
+    bootstrapped.current = true;
+    void reload();
   }, [apiKey, reload]);
 
   async function handleToggle(job: CronJob, enabled: boolean) {

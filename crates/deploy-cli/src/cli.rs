@@ -50,6 +50,10 @@ pub enum Command {
     #[command(subcommand)]
     Backup(BackupCommand),
 
+    /// 容器备份与迁移（docker-compose 项目经本机中转到另一台服务器）
+    #[command(subcommand)]
+    Container(ContainerCommand),
+
     /// Cloudflare Pages 部署（wrangler）
     #[command(subcommand)]
     Pages(PagesCommand),
@@ -477,4 +481,108 @@ pub enum HistoryCommand {
         #[arg(long)]
         yes: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ContainerCommand {
+    /// 打印本机容器备份包的存放目录
+    Dir,
+    /// 列出某台服务器上由 docker compose 管理的项目
+    Ls {
+        /// 服务器 id / 名称 / host
+        #[arg(short, long)]
+        server: String,
+    },
+    /// 查看一个 compose 项目的服务、数据卷与镜像
+    Inspect {
+        /// 服务器 id / 名称 / host
+        #[arg(short, long)]
+        server: String,
+        /// compose 项目名
+        #[arg(short, long)]
+        project: String,
+    },
+    /// 打包一个 compose 项目到本机（配置 + 数据卷 + 镜像）
+    Backup(ContainerBackupArgs),
+    /// 打包并迁移到另一台服务器（来源服务器上的服务保持不变）
+    Migrate(ContainerMigrateArgs),
+    /// 用本机已有的备份包恢复到一台服务器
+    Restore(ContainerRestoreArgs),
+    /// 列出容器备份 / 迁移记录
+    List {
+        /// 条数
+        #[arg(short = 'n', long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 查看某条记录详情（含日志）
+    Show { record: String },
+    /// 清空全部容器记录（不删除本机备份包文件）
+    Clear {
+        /// 确认执行
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Args, Debug)]
+pub struct ContainerBackupArgs {
+    /// 服务器 id / 名称 / host
+    #[arg(short, long)]
+    pub server: String,
+    /// compose 项目名
+    #[arg(short, long)]
+    pub project: String,
+    /// 不打包数据卷（只带配置与镜像）
+    #[arg(long)]
+    pub no_volumes: bool,
+    /// 不打包镜像（目标机自行 pull）
+    #[arg(long)]
+    pub no_images: bool,
+    /// 导出数据卷前暂停源服务，完成后自动恢复（数据库类服务建议开启）
+    #[arg(long)]
+    pub pause: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ContainerMigrateArgs {
+    /// 来源服务器 id / 名称 / host
+    #[arg(short, long)]
+    pub server: String,
+    /// compose 项目名
+    #[arg(short, long)]
+    pub project: String,
+    /// 目标服务器 id / 名称 / host
+    #[arg(short, long)]
+    pub to: String,
+    /// 目标机上的项目目录（默认照抄来源机的项目目录）
+    #[arg(long)]
+    pub dir: Option<String>,
+    /// 恢复后不自动启动服务
+    #[arg(long)]
+    pub no_start: bool,
+    /// 不打包数据卷
+    #[arg(long)]
+    pub no_volumes: bool,
+    /// 不打包镜像
+    #[arg(long)]
+    pub no_images: bool,
+    /// 导出数据卷前暂停源服务，完成后自动恢复
+    #[arg(long)]
+    pub pause: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct ContainerRestoreArgs {
+    /// 本机备份包路径（`container dir` 目录下的 .tar）
+    #[arg(short, long)]
+    pub bundle: String,
+    /// 目标服务器 id / 名称 / host
+    #[arg(short, long)]
+    pub to: String,
+    /// 目标机上的项目目录（默认沿用备份包里记录的原目录）
+    #[arg(long)]
+    pub dir: Option<String>,
+    /// 恢复后不自动启动服务
+    #[arg(long)]
+    pub no_start: bool,
 }

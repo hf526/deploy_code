@@ -13,6 +13,7 @@ use crate::output;
 
 mod backup;
 mod branch;
+mod container;
 mod deploy;
 mod pages;
 mod repo;
@@ -27,6 +28,7 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Release(command) => deploy::release_command(cli, command).await,
         Command::History(command) => deploy::history_command(cli, command).await,
         Command::Backup(command) => backup::backup_command(cli, command).await,
+        Command::Container(command) => container::container_command(cli, command).await,
         Command::Pages(command) => pages::pages_command(cli, command).await,
         Command::Where => {
             let store = open_store(cli)?;
@@ -37,10 +39,14 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
 }
 
 pub fn open_store(cli: &Cli) -> Result<Store> {
-    match &cli.data_dir {
-        Some(dir) => Ok(Store::new(dir)),
-        None => Store::default_store(),
-    }
+    let store = match &cli.data_dir {
+        Some(dir) => Store::new(dir),
+        None => Store::default_store()?,
+    };
+    // 旧版每仓库一份的 repo.pages 是 skip_serializing 字段（只读不写），任何一次写配置
+    // 都会把它冲掉；命令行入口先迁移成 pages_configs 列表，与 GUI 启动时同一套规则。
+    let _ = store.migrate_pages_configs();
+    Ok(store)
 }
 
 fn print_json<T: serde::Serialize>(value: &T) -> Result<()> {
@@ -98,6 +104,62 @@ fn claim_task_lock(store: &Store, name: &str) -> Result<deploy_core::store::Task
     })
 }
 
+/// 把部署事件转发到终端；`--json` 时每个事件一行，便于脚本消费。
+/// 返回的任务在事件发送端全部 drop 之后才结束。
+fn spawn_deploy_printer(
+    mut receiver: mpsc::UnboundedReceiver<DeployEvent>,
+    json: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            if json {
+                // --json：每个事件一行 JSON，便于脚本消费。
+                if let Ok(line) = serde_json::to_string(&event) {
+                    println!("{line}");
+                }
+                continue;
+            }
+            match event {
+                DeployEvent::Log { level, message } => output::deploy_log(level, &message),
+                DeployEvent::Progress { message, .. } => output::progress(&message),
+                _ => {}
+            }
+        }
+    })
+}
+
+/// 串行部署到多台服务器：与 GUI 走同一个 `DeployEngine::run_targets`，
+/// 所以「一台失败即停止、剩余不部署」和批次日志在两边完全一致。整批共用一把任务锁。
+async fn run_deploy_batch(
+    store: &Arc<Store>,
+    base: DeployRequest,
+    server_ids: Vec<String>,
+    json: bool,
+) -> Result<Vec<DeployRecord>> {
+    let _lock = claim_task_lock(store, "deploy")?;
+    let engine = DeployEngine::new(store.clone());
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let printer = spawn_deploy_printer(receiver, json);
+    let batch = engine
+        .run_targets(&base, &server_ids, Some(sender), |_| {})
+        .await;
+    let _ = printer.await;
+
+    if json {
+        for record in &batch.records {
+            println!("{}", serde_json::to_string(record)?);
+        }
+    } else {
+        output::progress_done();
+    }
+    // 首台连准备都没通过时不会有记录、也不会有一行「失败」输出，
+    // 只返回空列表会让脚本调用方误读成成功（退出码 0），错误必须原样带回。
+    if let Some(err) = batch.blocked {
+        return Err(err);
+    }
+    Ok(batch.records)
+}
+
 /// 执行部署并把事件实时打印到终端。
 async fn run_deploy(store: &Arc<Store>, request: DeployRequest, json: bool) -> Result<DeployRecord> {
     // 与 GUI / 其他命令行进程互斥，避免并发执行破坏性操作。
@@ -116,23 +178,8 @@ async fn run_deploy(store: &Arc<Store>, request: DeployRequest, json: bool) -> R
         output::info(format!("部署记录: {}", record.id));
     }
 
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let printer = tokio::spawn(async move {
-        while let Some(event) = receiver.recv().await {
-            if json {
-                // --json：每个事件一行 JSON，便于脚本消费。
-                if let Ok(line) = serde_json::to_string(&event) {
-                    println!("{line}");
-                }
-                continue;
-            }
-            match event {
-                DeployEvent::Log { level, message } => output::deploy_log(level, &message),
-                DeployEvent::Progress { message, .. } => output::progress(&message),
-                _ => {}
-            }
-        }
-    });
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let printer = spawn_deploy_printer(receiver, json);
 
     let final_record = engine.run(record, request, Some(sender)).await;
     let _ = printer.await;

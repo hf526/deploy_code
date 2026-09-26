@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClock,
   Copy,
@@ -25,8 +25,10 @@ import {
   Page,
   SectionTitle,
   Select,
+  SelectBox,
 } from "../components/ui";
 import { api } from "../lib/api";
+import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
 import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
@@ -70,6 +72,9 @@ export default function BackupsPage() {
   } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
+  const [selectedRecords, setSelectedRecords] = useState<Set<string>>(() => new Set());
+  const [bulkRemoving, setBulkRemoving] = useState(false);
+  const [bulkBusy, setBulkBusy] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [runningConfigId, setRunningConfigId] = useState("");
@@ -95,6 +100,20 @@ export default function BackupsPage() {
   useEffect(() => {
     if (liveBackup?.status !== "running") setRunningConfigId("");
   }, [liveBackup?.status]);
+
+  // 进行中的记录不参与多选：删掉正在写入的条目，下一个事件又会把它写回来。
+  const selectableRecordIds = useMemo(
+    () => backups.filter((record) => record.status !== "running").map((record) => record.id),
+    [backups],
+  );
+
+  // 后台刷新或 CLI 改过列表后，丢掉已经不存在的勾选。
+  useEffect(() => {
+    setSelectedRecords((current) => {
+      const pruned = pruneSelection(current, selectableRecordIds);
+      return pruned.size === current.size ? current : pruned;
+    });
+  }, [selectableRecordIds]);
 
   /** 定时备份设置即时保存（开关 / 时间 / 配置选择）。 */
   async function handleSaveSchedule(patch: Partial<Settings>) {
@@ -178,6 +197,23 @@ export default function BackupsPage() {
     }
   }
 
+  async function handleBulkDeleteRecords() {
+    const ids = [...selectedRecords];
+    if (ids.length === 0) return;
+    setBulkBusy(true);
+    try {
+      const removed = await api.deleteBackups(ids);
+      toast("success", t("common.bulkDeleted", { count: removed }));
+      setSelectedRecords(new Set());
+      setBulkRemoving(false);
+      await refreshBackups();
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBulkBusy(false);
+    }
+  }
+
   async function handleClear() {
     try {
       await api.clearBackups();
@@ -189,6 +225,8 @@ export default function BackupsPage() {
       setConfirmClear(false);
     }
   }
+
+  const selectAllRecords = selectionState(selectedRecords, selectableRecordIds);
 
   return (
     <Page
@@ -399,9 +437,30 @@ export default function BackupsPage() {
               description={t("backup.recordsCount", { count: backups.length })}
               actions={
                 backups.length > 0 ? (
-                  <Button variant="ghost" size="sm" onClick={() => setConfirmClear(true)}>
-                    {t("backup.clearRecords")}
-                  </Button>
+                  <div className="flex items-center gap-2">
+                    <SelectBox
+                      label={t("common.selectAll")}
+                      checked={selectAllRecords === "all"}
+                      indeterminate={selectAllRecords === "some"}
+                      disabled={selectableRecordIds.length === 0}
+                      onChange={() =>
+                        setSelectedRecords((current) =>
+                          toggleAll(current, selectableRecordIds),
+                        )
+                      }
+                    />
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      disabled={selectedRecords.size === 0}
+                      onClick={() => setBulkRemoving(true)}
+                    >
+                      {t("common.deleteSelected", { count: selectedRecords.size })}
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => setConfirmClear(true)}>
+                      {t("backup.clearRecords")}
+                    </Button>
+                  </div>
                 ) : undefined
               }
             />
@@ -421,6 +480,16 @@ export default function BackupsPage() {
                     badge={statusBadge(record)}
                     deleteTitle={t("backup.deleteRecord")}
                     onDelete={() => void handleDelete(record.id)}
+                    selected={selectedRecords.has(record.id)}
+                    selectionDisabled={record.status === "running"}
+                    selectionLabel={
+                      record.status === "running"
+                        ? t("common.runningNotDeletable")
+                        : t("common.select")
+                    }
+                    onSelect={(on) =>
+                      setSelectedRecords((current) => toggleId(current, record.id, on))
+                    }
                     title={
                       <>
                         {record.serverName} · {record.database}
@@ -464,6 +533,17 @@ export default function BackupsPage() {
           }}
         />
       )}
+
+      <ConfirmModal
+        open={bulkRemoving}
+        danger
+        loading={bulkBusy}
+        title={t("backup.bulkDeleteTitle")}
+        confirmText={t("common.delete")}
+        description={t("backup.bulkDeleteDescription", { count: selectedRecords.size })}
+        onCancel={() => setBulkRemoving(false)}
+        onConfirm={() => void handleBulkDeleteRecords()}
+      />
 
       <ConfirmModal
         open={confirmClear}

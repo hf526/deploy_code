@@ -78,7 +78,6 @@ export interface RepoInfo {
   changeCount: number;
   defaultServerId: string | null;
   defaultTargetDir: string;
-  defaultPagesConfigId: string | null;
   envFiles: EnvFileConfig[];
 }
 
@@ -217,7 +216,8 @@ export interface DeployConfig {
   id: string;
   name: string;
   repoId: string;
-  serverId: string;
+  /** 目标服务器 id 列表：一条配置可以带多台，顺序即批量部署的执行顺序。 */
+  serverIds: string[];
   targetDir: string;
   /** 部署版本（分支 / 标签 / 提交）；为空表示打包当前工作区。 */
   rev: string;
@@ -247,27 +247,60 @@ export interface Settings {
   /** cron-job.org 的 API Key（控制台生成）；未填写时定时请求页会引导去设置。 */
   cronjobApiKey: string;
   pagesHistoryLimit: number;
+  /** 容器备份/迁移记录的保留条数。 */
+  containerHistoryLimit: number;
+  /** 单次容器快照 / 迁移的超时秒数（含两台服务器之间的中转）。 */
+  containerTimeoutSecs: number;
   language: string;
   atomicRelease: boolean;
   releaseKeep: number;
   scheduledBackupEnabled: boolean;
   scheduledBackupTime: string;
   scheduledBackupConfigId: string | null;
+  scheduledShutdownEnabled: boolean;
+  scheduledShutdownTime: string;
 }
 
-/** 导入配置的统计信息。 */
-export interface ImportSummary {
-  serversImported: number;
-  reposImported: number;
-  backupTargetsImported: number;
-  deployConfigsImported: number;
-  backupConfigsImported: number;
-  pagesConfigsImported: number;
+/** 关机计划的来源：每天定时排的那一次，或用户手动按下的倒计时。 */
+export type ShutdownSource = "scheduled" | "manual";
+
+/** 已排定的关机计划（仍在可取消的倒计时阶段，尚未下发系统关机请求）。 */
+export interface PendingShutdown {
+  /** 下发系统关机请求的时刻（epoch 毫秒），与 Date.now() 同基准。 */
+  atMs: number;
+  source: ShutdownSource;
 }
 
-/** 定时任务通知（如定时备份启动/失败）。 */
+/** 定时关机状态（对应 src-tauri/src/commands/shutdown.rs）。 */
+export interface ShutdownStatus {
+  /** 待执行的关机计划；null 表示当前没有排定的关机。 */
+  pending: PendingShutdown | null;
+  /** 可取消窗口（秒）：剩余时间少于它时倒计时转为醒目样式。 */
+  cancelWindowSecs: number;
+}
+
+/** 一类配置在导入时的去向计数。 */
+export interface ImportCounts {
+  added: number;
+  overwritten: number;
+}
+
+/** 导入配置的比对结果。预览与实际导入共用同一套合并语义，因此两边数字必然一致。 */
+export interface ImportPreview {
+  exportedAt: string;
+  servers: ImportCounts;
+  repos: ImportCounts;
+  backupTargets: ImportCounts;
+  deployConfigs: ImportCounts;
+  backupConfigs: ImportCounts;
+  pagesConfigs: ImportCounts;
+  /** 导出文件里被脱敏清空、因而保留本机值的敏感字段条数。 */
+  keptLocalSecrets: number;
+}
+
+/** 定时任务通知（如定时备份启动/失败、定时关机已执行/失败）。 */
 export interface SchedulerNotice {
-  kind: "started" | "noConfig" | "failed";
+  kind: "started" | "noConfig" | "failed" | "shutdownFired" | "shutdownFailed";
   message?: string;
 }
 
@@ -287,6 +320,8 @@ export interface LiveTask<TRecord> {
   recordId: string;
   lines: LogLine[];
   progress: number;
+  /** 后端进度事件带的当前步骤文案（如「上传压缩包」），没有则为空串。 */
+  progressMessage: string;
   status: DeployStatus;
   record: TRecord | null;
 }
@@ -369,6 +404,8 @@ export interface PagesDeployRecord {
 
 export interface PagesRequest {
   repoId: string;
+  /** 用列表里哪一条 Pages 配置部署；留空则沿用仓库绑定的默认配置。 */
+  configId?: string | null;
   provider?: PagesProvider | null;
   projectName?: string | null;
   buildCommand?: string | null;
@@ -494,3 +531,127 @@ export interface CronJobRun {
   duration: number;
   url: string;
 }
+
+// ---------------------------------------------------------------------------
+// 容器备份与迁移（镜像 deploy-core src/container.rs）
+// ---------------------------------------------------------------------------
+
+/** 服务器上发现到的一个 docker-compose 项目。 */
+export interface ComposeStack {
+  /** compose 项目名（`-p` 参数，也是数据卷名前缀）。 */
+  name: string;
+  /** 服务数量。 */
+  services: number;
+  /** 当前处于运行中的容器数。 */
+  running: number;
+  /** compose 给出的状态摘要，如 `running (3)`。 */
+  status: string;
+  /** 项目目录下找到的 compose 配置文件（绝对路径）。 */
+  files: string[];
+  /** 项目工作目录。 */
+  workingDir: string;
+}
+
+/** 项目挂载的一个数据卷。 */
+export interface ComposeVolume {
+  name: string;
+  /** 宿主机上的卷目录（非 root 连接时可能读不到）。 */
+  mountpoint: string;
+  sizeBytes: number;
+  /** 导出失败时用来挂载卷的镜像（取当前使用该卷的容器镜像，本机已有）。 */
+  image: string;
+  /** 宿主机路径可直接读取。 */
+  readable: boolean;
+}
+
+/** 项目里的一个服务（按容器解析）。 */
+export interface ComposeService {
+  name: string;
+  container: string;
+  image: string;
+  state: string;
+  /** 已发布的端口映射，如 `0.0.0.0:80->80/tcp`。 */
+  ports: string;
+}
+
+/** 快照前的项目详情与预检结果。 */
+export interface ComposeStackDetail {
+  stack: ComposeStack;
+  services: ComposeService[];
+  volumes: ComposeVolume[];
+  /** 需要 `docker save` 的镜像（已去重）。 */
+  images: string[];
+  /** 项目目录下一起带走的 env 文件。 */
+  envFiles: string[];
+  /** 目标机上使用的 compose 命令（`docker compose` 或 `docker-compose`）。 */
+  composeCommand: string;
+  volumeBytes: number;
+  imageBytes: number;
+  /** 项目目录（compose 文件与 env）体积：打包时总会带上，不受卷/镜像开关影响。 */
+  projectBytes: number;
+  /** 预检提示（不阻断，界面上原样展示）。 */
+  warnings: string[];
+}
+
+/** 迁移目标。 */
+export interface ContainerTarget {
+  serverId: string;
+  /** 目标服务器上的项目目录。 */
+  targetDir: string;
+  /** 恢复后自动 `docker compose up -d`。 */
+  startServices: boolean;
+}
+
+/** 发起一次容器快照 / 迁移的参数。 */
+export interface ContainerRequest {
+  serverId: string;
+  project: string;
+  /** 打包数据卷前先 `compose stop`、结束后 `compose start`，保证数据一致。 */
+  pauseSource: boolean;
+  includeVolumes: boolean;
+  includeImages: boolean;
+  /** 为空表示只备份到本机。 */
+  target: ContainerTarget | null;
+}
+
+/** 从本机已有备份包再恢复一次到服务器。 */
+export interface ContainerRestoreRequest {
+  bundlePath: string;
+  target: ContainerTarget;
+}
+
+export type ContainerRecordKind = "backup" | "migrate" | "restore";
+
+/** 一次容器备份 / 迁移记录。 */
+export interface ContainerRecord {
+  id: string;
+  kind: ContainerRecordKind;
+  project: string;
+  serverId: string;
+  serverName: string;
+  targetServerId: string;
+  targetServerName: string;
+  targetDir: string;
+  /** 本机备份包路径；`restore` 记录里是被恢复的来源包。 */
+  bundlePath: string;
+  bundleSize: number;
+  services: string[];
+  volumes: string[];
+  images: string[];
+  includeVolumes: boolean;
+  includeImages: boolean;
+  status: DeployStatus;
+  error: string | null;
+  log: string;
+  startedAt: string;
+  finishedAt: string | null;
+  durationMs: number;
+}
+
+export type ContainerEvent =
+  | { type: "started"; recordId: string }
+  | { type: "log"; level: LogLevel; message: string }
+  | { type: "progress"; percent: number; message: string }
+  | { type: "finished"; record: ContainerRecord };
+
+export type LiveContainer = LiveTask<ContainerRecord>;

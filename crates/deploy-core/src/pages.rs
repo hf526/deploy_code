@@ -51,11 +51,29 @@ impl PagesEngine {
         let app_config = self.store.load_config()?;
         let repo = Store::find_repo(&app_config, &req.repo_id)?.clone();
 
-        // 优先从 pages_configs 列表获取默认配置，兼容旧版 repo.pages
-        let mut config = if let Some(entry) = Store::get_repo_default_pages(&app_config, &repo.id) {
-            entry.config.clone()
-        } else {
-            PagesConfig::default()
+        // 界面上的部署按钮在列表每一行：指定了 config_id 就用那一条，不能受「默认配置」指针
+        // 影响（保存哪条就把哪条绑成默认，见 Store::save_pages_config），否则会发错项目。
+        // 没指定时才回落到仓库默认；一条都没有才用平台默认值，再由请求参数覆盖。
+        let requested = req
+            .config_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let mut config = match requested {
+            Some(id) => app_config
+                .pages_configs
+                .iter()
+                .find(|entry| entry.id == id)
+                .filter(|entry| entry.repo_id == repo.id)
+                .ok_or_else(|| {
+                    CoreError::not_found(format!("Pages 配置不存在，或不属于该仓库: {id}"))
+                })?
+                .config
+                .clone(),
+            None => match Store::get_repo_default_pages(&app_config, &repo.id) {
+                Some(entry) => entry.config.clone(),
+                None => PagesConfig::default(),
+            },
         };
         
         // 允许请求参数覆盖
@@ -1210,7 +1228,7 @@ mod tests {
             created_at: crate::models::now_string(),
         };
         
-        let mut config = crate::models::AppConfig {
+        let config = crate::models::AppConfig {
             repos: vec![crate::models::RepoConfig {
                 id: "r1".to_string(),
                 name: "app".to_string(),
@@ -1226,6 +1244,7 @@ mod tests {
         let engine = PagesEngine::new(store.clone());
         let request = PagesRequest {
             repo_id: "r1".to_string(),
+            config_id: None,
             provider: None,
             project_name: None,
             build_command: None,
@@ -1247,6 +1266,68 @@ mod tests {
         assert!(engine.prepare(&request).is_ok());
 
         // 清理临时目录
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prepare_uses_the_requested_config_not_the_default_pointer() {
+        let dir = std::env::temp_dir().join(format!("deploycode-pages-row-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(Store::new(&dir));
+        let entry = |id: &str, project: &str| crate::models::PagesConfigEntry {
+            id: id.to_string(),
+            name: id.to_string(),
+            repo_id: "r1".to_string(),
+            repo_name: "app".to_string(),
+            config: crate::models::PagesConfig {
+                project_name: project.to_string(),
+                output_dir: "dist".to_string(),
+                ..crate::models::PagesConfig::default()
+            },
+            created_at: crate::models::now_string(),
+        };
+        store
+            .mutate_config(|config| {
+                config.repos.push(crate::models::RepoConfig {
+                    id: "r1".to_string(),
+                    // 默认指针停在 p1：点 p2 那行部署时不能被它带偏。
+                    default_pages_config_id: Some("p1".to_string()),
+                    ..crate::models::RepoConfig::new("app".to_string(), dir.display().to_string())
+                });
+                config.pages_configs = vec![entry("p1", "site-a"), entry("p2", "site-b")];
+                config.settings.cloudflare_api_token = "t".to_string();
+                config.settings.cloudflare_account_id = "a".to_string();
+                Ok(())
+            })
+            .unwrap();
+        let engine = PagesEngine::new(store.clone());
+        let request = |config_id: Option<&str>| PagesRequest {
+            repo_id: "r1".to_string(),
+            config_id: config_id.map(str::to_string),
+            provider: None,
+            project_name: None,
+            build_command: None,
+            output_dir: None,
+            branch: None,
+            publish_branch: None,
+            skip_build: false,
+        };
+
+        assert_eq!(
+            engine.prepare(&request(Some("p2"))).unwrap().config.project_name,
+            "site-b"
+        );
+        // 不带 config_id 时照旧按仓库默认解析（CLI 与旧数据走这条路）。
+        assert_eq!(
+            engine.prepare(&request(None)).unwrap().config.project_name,
+            "site-a"
+        );
+        // 不存在的行要报错，不能悄悄退回默认配置发错项目。
+        assert!(matches!(
+            engine.prepare(&request(Some("p9"))),
+            Err(CoreError::NotFound(_))
+        ));
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,4 +1,4 @@
-import React from "react";
+import React, { useEffect, useRef } from "react";
 import { AlertTriangle, CheckCircle2, Inbox, Info, Loader2, X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
@@ -140,10 +140,45 @@ export function Checkbox({
   );
 }
 
+/**
+ * 行 / 表头勾选框：不带文案，表头还需要「部分选中」第三态，
+ * 所以和 Checkbox（标签式、只有两态）分开。
+ */
+export function SelectBox({
+  checked,
+  indeterminate = false,
+  disabled,
+  label,
+  onChange,
+}: {
+  checked: boolean;
+  indeterminate?: boolean;
+  disabled?: boolean;
+  label: string;
+  onChange: (checked: boolean) => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  useEffect(() => {
+    // indeterminate 没有属性写法，只能直接写 DOM。
+    if (ref.current) ref.current.indeterminate = indeterminate && !checked;
+  }, [indeterminate, checked]);
+  return (
+    <input
+      ref={ref}
+      type="checkbox"
+      checked={checked}
+      disabled={disabled}
+      aria-label={label}
+      title={label}
+      onChange={(event) => onChange(event.target.checked)}
+      className="size-3.5 shrink-0 cursor-pointer accent-primary disabled:cursor-default"
+    />
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Badge / Card / EmptyState
 // ---------------------------------------------------------------------------
-
 type BadgeKind = "gray" | "green" | "red" | "amber" | "brand";
 
 const badgeKinds: Record<BadgeKind, string> = {
@@ -266,6 +301,12 @@ export function Page({
 // Modal / Confirm
 // ---------------------------------------------------------------------------
 
+/**
+ * 打开中的弹窗栈。Esc 只交给最上层那个处理，嵌套弹窗不会被一起关掉。
+ * 用栈而不是 depth 计数：页面里的弹窗数量多且开关顺序不可预测。
+ */
+const modalStack: symbol[] = [];
+
 export function Modal({
   open,
   onClose,
@@ -274,6 +315,7 @@ export function Modal({
   footer,
   width = "max-w-lg",
   children,
+  onEnter,
 }: {
   open: boolean;
   onClose: () => void;
@@ -282,7 +324,44 @@ export function Modal({
   footer?: React.ReactNode;
   width?: string;
   children: React.ReactNode;
+  /** Enter 的语义，通常是「确认」。不传则 Enter 无操作。 */
+  onEnter?: () => void;
 }) {
+  const idRef = useRef<symbol>(Symbol("modal"));
+  // 回调放 ref 里，effect 就只依赖 open：调用方每次渲染换新箭头函数不会让弹窗反复出入栈。
+  const closeRef = useRef(onClose);
+  const enterRef = useRef(onEnter);
+  useEffect(() => {
+    closeRef.current = onClose;
+    enterRef.current = onEnter;
+  });
+  useEffect(() => {
+    if (!open) return;
+    const id = idRef.current;
+    modalStack.push(id);
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (modalStack[modalStack.length - 1] !== id) return;
+      // 输入框自己已经处理过这两个键（如 SearchSelect 收起下拉、查找框退出），就不再冒泡成关窗。
+      if (event.defaultPrevented) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeRef.current();
+      } else if (event.key === "Enter" && enterRef.current) {
+        const target = event.target as HTMLElement | null;
+        // 这些元素上的 Enter 有自己的含义（按下按钮 / 换行 / 提交下拉选项），不抢成默认动作。
+        if (target?.closest("button, a, textarea, select") || target?.isContentEditable) return;
+        event.preventDefault();
+        enterRef.current();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      const index = modalStack.indexOf(id);
+      if (index >= 0) modalStack.splice(index, 1);
+    };
+  }, [open]);
+
   if (!open) return null;
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-6">
@@ -342,6 +421,8 @@ export function ConfirmModal({
       onClose={loading ? () => undefined : onCancel}
       title={title}
       width="max-w-md"
+      // 危险操作不给 Enter：回车一键确认一个「删掉/关机」的弹窗，误触代价太高。
+      onEnter={danger || loading ? undefined : onConfirm}
       footer={
         <>
           <Button variant="secondary" disabled={loading} onClick={onCancel}>

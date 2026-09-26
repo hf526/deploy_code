@@ -10,7 +10,7 @@ use crate::error::{CoreError, Result};
 use crate::git::Git;
 use crate::models::{
     elapsed_ms_since, now_string, DeployEvent, DeployRecord, DeployRequest, DeployStatus,
-    EnvFileConfig, RepoConfig, RepoInfo, ServerConfig, Settings,
+    EnvFileConfig, LogLevel, RepoConfig, RepoInfo, ServerConfig, Settings,
 };
 use crate::process::{sha256_file, shell_quote};
 use crate::release;
@@ -51,6 +51,15 @@ impl Drop for TempArchiveGuard {
 /// 部署事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
 pub type EventSender = UnboundedSender<DeployEvent>;
 
+/// 一次批量的结果：每台一条记录，按执行顺序排列。
+///
+/// `blocked` 只在「第一台连准备都没通过」时有值：此时没有任何记录写盘、也没有
+/// started/finished 事件发出，界面等不到收敛信号，必须由调用方把错误带回给请求方。
+pub struct DeployBatch {
+    pub records: Vec<DeployRecord>,
+    pub blocked: Option<CoreError>,
+}
+
 /// 部署引擎：组织“打包 -> 上传 -> 解压 -> 执行脚本”的完整流程。
 pub struct DeployEngine {
     store: Arc<Store>,
@@ -71,10 +80,13 @@ impl DeployEngine {
         let repo = Store::find_repo(&config, &req.repo_id)?.clone();
         let server = Store::find_server(&config, &req.server_id)?.clone();
 
-        let target_dir = req.target_dir.trim().to_string();
-        if target_dir.is_empty() {
+        if req.target_dir.trim().is_empty() {
             return Err(CoreError::deploy("请选择部署目录"));
         }
+        // 必须是服务器上的绝对路径：相对路径会落进 SSH 登录目录，而 `~` 经 shell_quote
+        // 是字面量（会在登录目录下建一个叫 ~ 的目录），装错位置比当场报错难查得多。
+        // 保存部署配置与原子发布目录早就这么要求，这里补齐手填和服务器默认值那条路。
+        let target_dir = release::normalize_target(&req.target_dir)?;
 
         let git = Git::open(&repo.path)?;
         if !git.is_repo() {
@@ -151,6 +163,88 @@ impl DeployEngine {
         self.store
             .upsert_history(&record, config.settings.history_limit)?;
         Ok(record)
+    }
+
+    /// 按同一份配置串行部署到多台服务器：任意一台失败即停止，剩余机器不再部署。
+    ///
+    /// 每台仍是一条独立记录（复用 `prepare` + `run`），事件按 recordId 分流，界面沿用现有单任务归约。
+    /// `on_begin` 在每台真正开始前回调一次，供调用方登记这一台的取消句柄。
+    /// 整个批次共用一个发送端并持有到最后一台结束，接收端才不会在中途认为任务已收尾。
+    pub async fn run_targets(
+        &self,
+        base: &DeployRequest,
+        server_ids: &[String],
+        events: Option<EventSender>,
+        mut on_begin: impl FnMut(&DeployRecord),
+    ) -> DeployBatch {
+        let total = server_ids.len();
+        let mut results = Vec::with_capacity(total);
+        let mut blocked = None;
+        for (index, server_id) in server_ids.iter().enumerate() {
+            let request = DeployRequest {
+                server_id: server_id.clone(),
+                ..base.clone()
+            };
+            let record = match self.prepare(&request) {
+                Ok(record) => record,
+                Err(err) => {
+                    // 准备阶段失败说明这台连开始条件都不满足（服务器已被删除等）：
+                    // 不写记录、也不继续，避免把同一个故障推到剩余机器上。
+                    send_batch_log(
+                        &events,
+                        LogLevel::Error,
+                        format!(
+                            "[批次 {}/{}] 准备部署失败：{err}；已停止，剩余机器未部署",
+                            index + 1,
+                            total
+                        ),
+                    );
+                    // 一台都没跑起来时批次不会发出任何 started/finished 事件，调用方无从知道
+                    // 它已经结束：把首台的准备错误带出去，由命令层像单台部署那样同步报错。
+                    if results.is_empty() {
+                        blocked = Some(err);
+                    }
+                    break;
+                }
+            };
+            send_batch_log(
+                &events,
+                LogLevel::Info,
+                format!(
+                    "[批次 {}/{}] 开始部署到 {}",
+                    index + 1,
+                    total,
+                    record.server_name
+                ),
+            );
+            on_begin(&record);
+            let record = self.run(record, request, events.clone()).await;
+            let failed = record.status != DeployStatus::Success;
+            results.push(record);
+            if failed {
+                let done = results
+                    .iter()
+                    .filter(|item| item.status == DeployStatus::Success)
+                    .count();
+                send_batch_log(
+                    &events,
+                    LogLevel::Warn,
+                    format!("已停止：{done}/{total} 台成功，剩余机器未部署"),
+                );
+                break;
+            }
+        }
+        if total > 0 && results.len() == total {
+            send_batch_log(
+                &events,
+                LogLevel::Success,
+                format!("批量部署完成：{total} 台全部成功"),
+            );
+        }
+        DeployBatch {
+            records: results,
+            blocked,
+        }
     }
 
     /// 执行部署流程。无论成功失败都会返回带有最终状态的记录。
@@ -419,33 +513,28 @@ impl DeployEngine {
                     // 不会截断服务器上原有的环境文件。
                     let temp = format!("{remote}.deploycode-tmp");
                     if let Err(err) = client.upload_file(local, &temp, &mut |_, _| {}).await {
-                        let _ = client
-                            .exec_capture(&format!("rm -f {}", shell_quote(&temp)), 30)
-                            .await;
+                        remove_remote_file(&client, &temp).await;
                         return Err(CoreError::deploy(format!(
                             "上传环境文件失败 {}: {err}",
                             file.remote_path
                         )));
                     }
-                    // mv 会用临时文件的权限覆盖旧文件，先记录原权限再恢复。
-                    let replace = format!(
-                        "p=$(stat -c %a {remote} 2>/dev/null || stat -f %Lp {remote} 2>/dev/null); \
-                         mv -f {temp} {remote}; \
-                         if [ -n \"$p\" ]; then chmod \"$p\" {remote}; fi",
-                        remote = shell_quote(&remote),
-                        temp = shell_quote(&temp)
-                    );
-                    let (code, output) =
-                        client.exec_capture(&replace, 60).await.map_err(|err| {
-                            CoreError::deploy(format!(
+                    let (code, output) = match client
+                        .exec_capture(&env_replace_script(&remote, &temp), 60)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(err) => {
+                            // 超时或断连时临时文件还留在服务器上，里面是 env 的明文内容。
+                            remove_remote_file(&client, &temp).await;
+                            return Err(CoreError::deploy(format!(
                                 "替换环境文件失败 {}: {err}",
                                 file.remote_path
-                            ))
-                        })?;
+                            )));
+                        }
+                    };
                     if code != 0 {
-                        let _ = client
-                            .exec_capture(&format!("rm -f {}", shell_quote(&temp)), 30)
-                            .await;
+                        remove_remote_file(&client, &temp).await;
                         return Err(CoreError::deploy(format!(
                             "替换环境文件失败 {}: {}",
                             file.remote_path,
@@ -873,6 +962,38 @@ pub(crate) fn kill_script(pidfile: &str) -> String {
     )
 }
 
+/// 原子替换远端环境文件：把临时文件 `mv` 到正式路径，并保留原文件权限。
+///
+/// `mv` 之后必须紧跟 `|| exit 1`：整条命令的退出码取自最后一个语句，而以
+/// `if ... ; then ...; fi` 结尾时条件不成立会返回 0，`mv` 的失败（目录不可写、
+/// 磁盘满）就会被当成替换成功，线上 env 还是旧内容而部署却报成功。
+/// `test -f` 兜住另一种静默失败：正式路径已存在且是目录时，`mv` 返回 0 却把文件
+/// 移进了目录里，替换同样没有发生。
+fn env_replace_script(remote: &str, temp: &str) -> String {
+    let remote = shell_quote(remote);
+    let temp = shell_quote(temp);
+    format!(
+        "p=$(stat -c %a {remote} 2>/dev/null || stat -f %Lp {remote} 2>/dev/null || true); \
+         mv -f {temp} {remote} || exit 1; \
+         test -f {remote} || exit 1; \
+         if [ -n \"$p\" ]; then chmod \"$p\" {remote}; fi"
+    )
+}
+
+/// 删除远端临时文件：清理失败不该盖住真正的部署结果。
+async fn remove_remote_file(client: &SshClient, path: &str) {
+    let _ = client
+        .exec_capture(&format!("rm -f {}", shell_quote(path)), 30)
+        .await;
+}
+
+/// 批次级别的日志行：只有多机部署会产生，单机流程的日志由 `TaskLogger` 负责。
+fn send_batch_log(events: &Option<EventSender>, level: LogLevel, message: String) {
+    if let Some(sender) = events {
+        let _ = sender.send(DeployEvent::Log { level, message });
+    }
+}
+
 async fn remove_pidfile(client: &SshClient, pidfile: &str) -> Result<()> {
     client
         .exec_capture(&format!("rm -f {}", shell_quote(pidfile)), 15)
@@ -997,6 +1118,28 @@ mod tests {
         // 无效 pid 分支的 exit 0 必须只退出子 shell，不能中断调用方的后续清理命令。
         assert!(script.starts_with("( f="), "script = {script}");
         assert!(script.ends_with(')'), "script = {script}");
+    }
+
+    #[test]
+    fn env_replace_script_lets_mv_decide_the_exit_code() {
+        let remote = "'/srv/my app/.env'";
+        let temp = "'/srv/my app/.env.deploycode-tmp'";
+        let script = env_replace_script("/srv/my app/.env", "/srv/my app/.env.deploycode-tmp");
+        assert!(
+            script.contains(&format!("mv -f {temp} {remote} || exit 1")),
+            "script = {script}"
+        );
+        // 恢复权限的 if 位于结尾，条件不成立时返回 0：它只能作为最后一个语句，
+        // 前面任何一步失败都必须先 exit 掉。
+        assert!(
+            script.ends_with(&format!("if [ -n \"$p\" ]; then chmod \"$p\" {remote}; fi")),
+            "script = {script}"
+        );
+        // 正式路径是目录时 mv 同样返回 0（文件被移进目录），要靠 test -f 识破。
+        assert!(
+            script.contains(&format!("test -f {remote} || exit 1")),
+            "script = {script}"
+        );
     }
 
     #[test]
@@ -1128,6 +1271,19 @@ mod tests {
         skip.upload_env = false;
         let record = engine.prepare(&skip).unwrap();
         assert!(record.env_files.is_empty());
+
+        // 部署目录必须是服务器上的绝对路径：相对路径和 ~ 都会落进 SSH 登录目录，
+        // 装错位置比当场报错难查得多（~ 经 shell_quote 是字面量）。
+        for bad in ["opt/demo", "~/demo", "./demo"] {
+            let mut relative = request.clone();
+            relative.target_dir = bad.to_string();
+            let err = engine.prepare(&relative).unwrap_err().to_string();
+            assert!(err.contains("绝对路径"), "{bad} 应被拒绝，err = {err}");
+        }
+        // 结尾斜杠按发布目录约定收敛掉，写进记录的已是规范化结果。
+        let mut trailing = request.clone();
+        trailing.target_dir = "/opt/demo/".to_string();
+        assert_eq!(engine.prepare(&trailing).unwrap().target_dir, "/opt/demo");
 
         let _ = std::fs::remove_dir_all(&base);
     }
