@@ -3,6 +3,7 @@ import { Power } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
 import { formatCountdown, isImminent, remainingSecs } from "../lib/shutdown";
+import { api } from "../lib/api";
 import { useApp } from "../lib/store";
 import { cn } from "../lib/utils";
 
@@ -15,6 +16,12 @@ export function StatusBar() {
   const shutdownStatus = useApp((state) => state.shutdownStatus);
   const cancelShutdown = useApp((state) => state.cancelShutdown);
   const pending = shutdownStatus?.pending ?? null;
+  // 版本号由后端取编译期常量：写死在这里，改版本时必定漏改，装的是哪个包只能靠猜。
+  const [version, setVersion] = useState("");
+
+  useEffect(() => {
+    void api.getAppVersion().then(setVersion);
+  }, []);
 
   const running = live?.status === "running";
   // 后端进度事件带的是当前步骤文案（如「上传压缩包」），光留百分比会把它丢掉。
@@ -79,7 +86,9 @@ export function StatusBar() {
           </span>
         </>
       )}
-      <span className="ml-auto text-ink-faint">DeployCode v0.1.0</span>
+      <span className="ml-auto text-ink-faint">
+        {version ? `DeployCode v${version}` : "DeployCode"}
+      </span>
     </footer>
   );
 }

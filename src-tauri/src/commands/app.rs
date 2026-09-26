@@ -33,6 +33,13 @@ pub fn get_data_dir(state: State<AppState>) -> String {
     state.store.base_dir().display().to_string()
 }
 
+/// 界面右下角的版本号：取编译期 workspace 版本，与 tauri.conf.json / package.json 同步递增。
+/// 写死在组件里会让「装的是哪个包」变成靠猜，而且改版本时必定漏改。
+#[tauri::command]
+pub fn get_app_version() -> String {
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
 #[tauri::command(async)]
 pub fn get_settings(state: State<AppState>) -> Result<Settings> {
     Ok(state.store.load_config()?.settings)

@@ -50,6 +50,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::get_data_dir,
+            commands::app::get_app_version,
             commands::app::get_settings,
             commands::app::save_settings,
             commands::app::export_config,

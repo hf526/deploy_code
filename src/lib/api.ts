@@ -47,6 +47,7 @@ import type {
 export const api = {
   // 应用
   getDataDir: () => invoke<string>("get_data_dir"),
+  getAppVersion: () => invoke<string>("get_app_version"),
   getSettings: () => invoke<Settings>("get_settings"),
   saveSettings: (settings: Settings) => invoke<Settings>("save_settings", { settings }),
   exportConfig: () => invoke<string>("export_config"),
