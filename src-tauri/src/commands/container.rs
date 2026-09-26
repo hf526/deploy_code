@@ -1,4 +1,7 @@
-use deploy_core::models::{ContainerEvent, ContainerRecord, ContainerRequest, ContainerRestoreRequest};
+use deploy_core::models::{
+    new_id, ContainerConfig, ContainerEvent, ContainerRecord, ContainerRequest,
+    ContainerRestoreRequest,
+};
 use deploy_core::{ContainerEngine, ContainerJob, ContainerPlan, CoreError, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -102,6 +105,59 @@ pub async fn inspect_compose_stack(
     ContainerEngine::new(state.store.clone())
         .inspect_stack(&server, &project)
         .await
+}
+
+/// 列出保存的容器备份配置。
+#[tauri::command(async)]
+pub fn list_container_configs(state: State<AppState>) -> Result<Vec<ContainerConfig>> {
+    Ok(state.store.load_config()?.container_configs)
+}
+
+/// 新建一条容器备份配置：把当前扫描到的项目与打包选项存成可复用、可定时的条目。
+/// 名称留空时按「项目名」兜底，撞名再补时间后缀——从扫描列表一键保存时不必先起名字。
+#[tauri::command(async)]
+pub fn save_container_config(
+    state: State<AppState>,
+    mut config: ContainerConfig,
+) -> Result<ContainerConfig> {
+    if config.name.trim().is_empty() {
+        let base = config.project.trim().to_string();
+        let names: Vec<String> = state
+            .store
+            .load_config()?
+            .container_configs
+            .iter()
+            .map(|item| item.name.clone())
+            .collect();
+        config.name = if base.is_empty() || !names.iter().any(|n| n == &base) {
+            base
+        } else {
+            format!("{}-{}", base, new_id()[..8].to_string())
+        };
+    }
+    Store::save_container_config(&state.store, config)
+}
+
+/// 删除一条容器备份配置（不影响已有任务记录，本机备份包留在原处）。
+#[tauri::command(async)]
+pub fn delete_container_config(state: State<AppState>, config_id: String) -> Result<bool> {
+    Store::delete_container_config(&state.store, &config_id)
+}
+
+/// 按已保存的配置发起一次容器备份 / 迁移。
+///
+/// 手动点「立即备份」与定时调度器走这一个入口，参数只从配置里取，两条路径不会分叉。
+#[tauri::command(async)]
+pub fn start_container_config_backup(
+    app: AppHandle,
+    state: State<AppState>,
+    config_id: String,
+) -> Result<String> {
+    let request = {
+        let config = state.store.load_config()?;
+        Store::find_container_config(&config, &config_id)?.request()
+    };
+    start_container_transfer(app, state, request)
 }
 
 /// 发起一次容器快照（`request.target` 有值时接着恢复到目标服务器）。

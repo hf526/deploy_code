@@ -1,4 +1,4 @@
-use deploy_core::models::{BackupConfig, BackupTarget, ImportPreview, Settings};
+use deploy_core::models::{BackupConfig, BackupTarget, ContainerConfig, ImportPreview, Settings};
 use deploy_core::{CoreError, Result};
 use tauri::State;
 
@@ -51,6 +51,7 @@ fn sanitize_settings(
     settings: &mut Settings,
     configs: &[BackupConfig],
     targets: &[BackupTarget],
+    container_configs: &[ContainerConfig],
 ) {
     if settings
         .scheduled_backup_config_id
@@ -66,6 +67,11 @@ fn sanitize_settings(
     {
         settings.default_backup_target_id = None;
     }
+    // 容器定时列表逐个筛：整份 Settings 是前端一次性回传的，
+    // 一个悬空 id 混进来就会让那一晚的队列报「配置不存在」。
+    settings
+        .scheduled_container_config_ids
+        .retain(|id| container_configs.iter().any(|item| item.id == *id));
 }
 
 #[tauri::command(async)]
@@ -75,6 +81,7 @@ pub fn save_settings(state: State<AppState>, mut settings: Settings) -> Result<S
             &mut settings,
             &config.backup_configs,
             &config.backup_targets,
+            &config.container_configs,
         );
         config.settings = settings.clone();
         Ok(())
@@ -280,11 +287,25 @@ mod tests {
         config
     }
 
+    fn container_config(id: &str) -> ContainerConfig {
+        ContainerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            server_id: "server".to_string(),
+            project: "lf-blog".to_string(),
+            pause_source: false,
+            include_volumes: true,
+            include_images: true,
+            target: None,
+            created_at: String::new(),
+        }
+    }
+
     #[test]
     fn sanitize_settings_clears_dangling_scheduled_config() {
         let mut settings = Settings::default();
         settings.scheduled_backup_config_id = Some("gone".to_string());
-        sanitize_settings(&mut settings, &[], &[]);
+        sanitize_settings(&mut settings, &[], &[], &[]);
         assert_eq!(settings.scheduled_backup_config_id, None);
     }
 
@@ -292,7 +313,7 @@ mod tests {
     fn sanitize_settings_keeps_existing_scheduled_config() {
         let mut settings = Settings::default();
         settings.scheduled_backup_config_id = Some("keep".to_string());
-        sanitize_settings(&mut settings, &[backup_config("keep")], &[]);
+        sanitize_settings(&mut settings, &[backup_config("keep")], &[], &[]);
         assert_eq!(settings.scheduled_backup_config_id.as_deref(), Some("keep"));
     }
 
@@ -300,14 +321,24 @@ mod tests {
     fn sanitize_settings_clears_dangling_default_target() {
         let mut settings = Settings::default();
         settings.default_backup_target_id = Some("gone".to_string());
-        sanitize_settings(&mut settings, &[], &[]);
+        sanitize_settings(&mut settings, &[], &[], &[]);
         assert_eq!(settings.default_backup_target_id, None);
 
         let mut settings = Settings::default();
         settings.default_backup_target_id = Some("t1".to_string());
         let mut target = BackupTarget::new("t1".to_string(), "postgresql://u@h/db".to_string());
         target.id = "t1".to_string();
-        sanitize_settings(&mut settings, &[], &[target]);
+        sanitize_settings(&mut settings, &[], &[target], &[]);
         assert_eq!(settings.default_backup_target_id.as_deref(), Some("t1"));
+    }
+
+    /// 定时容器备份的列表只筛掉悬空 id：剩下的顺序与条目不能被顺手改掉。
+    #[test]
+    fn sanitize_settings_prunes_dangling_container_schedule() {
+        let mut settings = Settings::default();
+        settings.scheduled_container_config_ids =
+            vec!["gone".to_string(), "keep".to_string()];
+        sanitize_settings(&mut settings, &[], &[], &[container_config("keep")]);
+        assert_eq!(settings.scheduled_container_config_ids, vec!["keep"]);
     }
 }

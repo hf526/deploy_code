@@ -12,9 +12,9 @@
     "deploy": "部署",
     "servers": "服务器",
     "nginx": "Nginx",
-    "containers": "容器",
+    "containers": "容器备份",
     "cronJobs": "定时请求",
-    "backups": "备份",
+    "backups": "数据库备份",
     "history": "记录",
     "settings": "设置"
   },
@@ -573,7 +573,8 @@
         "backupTargets": "备份目标",
         "deployConfigs": "部署配置",
         "backupConfigs": "备份配置",
-        "pagesConfigs": "Pages 配置"
+        "pagesConfigs": "Pages 配置",
+        "containerConfigs": "容器备份配置"
       },
       "preview": {
         "exportedAt": "导出于 {{time}}",
@@ -592,7 +593,9 @@
       "title": "容器备份与迁移",
       "description": "打包 docker-compose 项目时的记录保留与超时设置",
       "historyLimit": "记录保留条数",
-      "timeout": "单次任务超时（秒）"
+      "timeout": "单次任务超时（秒）",
+      "bundleKeep": "每个项目保留的备份包数量",
+      "bundleKeepHint": "定时备份每晚都会在本机落一个 GB 级的包：同一个（服务器 + compose 项目）只保留最近这些个，更早的在任务成功后删掉。填 0 表示不自动清理。"
     }
   },
   "deploy": {
@@ -860,7 +863,7 @@
     "reload": "重载 Nginx"
   },
   "containers": {
-    "subtitle": "打包服务器上的 docker-compose 项目（配置文件 + 数据卷 + 镜像），再无损迁到另一台服务器",
+    "subtitle": "打包服务器上的 docker-compose 项目（配置文件 + 数据卷 + 镜像），支持保存配置、定时备份与无损迁移",
     "rescan": "重新扫描",
     "sourceTitle": "来源项目",
     "sourceDescription": "选择服务器后自动扫描该机上由 docker compose 管理的项目",
@@ -887,7 +890,7 @@
     "includeImages": "打包镜像（docker save）",
     "pauseSource": "打包数据卷前暂停源服务，完成后自动恢复",
     "pauseSourceHint": "不暂停时数据卷是运行中快照：数据库这类服务在写入中途可能拷出不一致的数据，建议低峰期执行或勾选这一项",
-    "targetTitle": "备份与迁移",
+    "targetTitle": "手动备份与迁移",
     "targetDescription": "只备份到本机就不用填目标；开始迁移会用同一份快照接着恢复到目标机",
     "targetServer": "目标服务器",
     "targetServerHint": "不含来源机",
@@ -940,6 +943,47 @@
       "backedUp": "{{name}} 已备份到本机",
       "migrated": "{{name}} 迁移完成",
       "failed": "{{name}} 失败：{{error}}"
+    },
+    "config": {
+      "title": "备份配置",
+      "description": "把常用的项目和打包选项存下来，随时一键执行，也可以挂到定时备份",
+      "subtitle": "配置会存到本机，随时一键执行或挂到定时备份",
+      "new": "新建配置",
+      "edit": "编辑配置",
+      "delete": "删除配置",
+      "deleteTitle": "删除容器备份配置",
+      "deleteDescription": "确定删除 <b>{{name}}</b>？已有的备份记录与本机备份包都会保留，只是不能再一键执行这条配置。",
+      "saved": "已保存配置「{{name}}」",
+      "deleted": "已删除配置「{{name}}」",
+      "name": "配置名称",
+      "nameHint": "留空则按 compose 项目名命名",
+      "namePlaceholder": "例如：博客每日备份",
+      "project": "compose 项目",
+      "serverRequired": "请选择来源服务器",
+      "unknownServer": "未知服务器",
+      "localBundle": "只备份到本机",
+      "scheduled": "定时",
+      "backupOnlyTarget": "不选 = 只备份到本机",
+      "saveAs": "存为配置",
+      "saveAsHint": "把当前选中的项目与打包选项存成一条可复用、可定时的配置",
+      "scheduleNote": "定时备份会照这条配置原样执行：选了目标就备份 + 迁移，没选就只备份到本机。",
+      "empty": "还没有保存的容器备份配置",
+      "emptyDescription": "在下方「来源项目」扫出 compose 项目后点「存为配置」，或者手动新建一条"
+    },
+    "schedule": {
+      "title": "定时备份",
+      "description": "应用运行期间（含最小化到托盘）每天到点自动执行勾选的配置",
+      "enable": "启用容器定时备份",
+      "time": "执行时间",
+      "saved": "定时备份设置已保存",
+      "noConfigs": "还没有可定时的配置：先在上方保存一条容器备份配置",
+      "summary": "已开启：每天 {{time}} 起依次执行 {{count}} 项，一次只跑一个",
+      "disabled": "未开启。开启后需要在设定的时间保持应用运行。",
+      "started": "容器定时备份已开始执行",
+      "noConfig": "容器定时备份未执行：勾选的配置都已删除",
+      "failed": "容器定时备份失败：{{error}}",
+      "retention": "本机每个项目保留最近 {{keep}} 个备份包，更早的会在任务成功后自动删掉",
+      "retentionOff": "自动清理已关闭（保留数填的是 0），备份包会一直累积，注意系统盘剩余空间"
     }
   }
 }

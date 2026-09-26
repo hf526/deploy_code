@@ -63,6 +63,8 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
         config.backup_configs.retain(|saved| saved.server_id != server_id);
         // 服务器已删除：从各部署配置的目标列表里摘掉这一台，没有剩余目标的配置整条删除。
         Store::detach_server_from_deploy_configs(config, &server_id);
+        // 容器备份配置同样跟着收敛：来源被删的整条删除，只当过迁移目标的降级为纯备份。
+        Store::detach_server_from_container_configs(config, &server_id);
         // 定时备份若引用被删配置，清空引用，避免每天到点报错。
         if config
             .settings

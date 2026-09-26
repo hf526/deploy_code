@@ -774,6 +774,7 @@ pub enum PagesEvent {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ContainerTarget {
+    #[serde(default)]
     pub server_id: String,
     /// 目标服务器上的绝对项目目录；恢复时留空表示沿用备份包内记录的目录。
     #[serde(default)]
@@ -788,8 +789,10 @@ pub struct ContainerTarget {
 #[serde(rename_all = "camelCase")]
 pub struct ContainerRequest {
     /// 来源服务器 id。
+    #[serde(default)]
     pub server_id: String,
     /// compose 项目名。
+    #[serde(default)]
     pub project: String,
     /// 打包数据卷前 `compose stop`、结束后 `compose start`，保证卷内数据一致。
     #[serde(default)]
@@ -810,6 +813,48 @@ pub struct ContainerRestoreRequest {
     /// 本机备份包的绝对路径。
     pub bundle_path: String,
     pub target: ContainerTarget,
+}
+
+/// 保存的容器备份配置（名称 + 一次快照 / 迁移的全部参数）。
+/// 各字段都允许缺省：单条坏数据不应导致整份 config.json 解析失败。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContainerConfig {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    /// 来源服务器 id。
+    #[serde(default)]
+    pub server_id: String,
+    /// compose 项目名。
+    #[serde(default)]
+    pub project: String,
+    #[serde(default)]
+    pub pause_source: bool,
+    #[serde(default = "default_true")]
+    pub include_volumes: bool,
+    #[serde(default = "default_true")]
+    pub include_images: bool,
+    /// 迁移目标；为空表示只备份到本机。
+    #[serde(default)]
+    pub target: Option<ContainerTarget>,
+    #[serde(default)]
+    pub created_at: String,
+}
+
+impl ContainerConfig {
+    /// 还原成引擎参数：手动发起与定时执行走同一个 `ContainerEngine::prepare`。
+    pub fn request(&self) -> ContainerRequest {
+        ContainerRequest {
+            server_id: self.server_id.clone(),
+            project: self.project.clone(),
+            pause_source: self.pause_source,
+            include_volumes: self.include_volumes,
+            include_images: self.include_images,
+            target: self.target.clone(),
+        }
+    }
 }
 
 /// 一条容器任务做了什么。
@@ -915,6 +960,10 @@ pub struct Settings {
     /// 单次容器快照 / 迁移的超时（秒）：包含打包、下载、上传与恢复全过程。
     #[serde(default = "default_container_timeout_secs")]
     pub container_timeout_secs: u64,
+    /// 同一个（服务器 + compose 项目）在本机保留几个备份包，0 表示不自动清理。
+    /// 定时备份每晚都会落下一个 GB 级的包，没有轮转会把系统盘写满。
+    #[serde(default = "default_container_bundle_keep")]
+    pub container_bundle_keep: usize,
     /// 界面语言偏好（空字符串表示跟随系统）。
     #[serde(default)]
     pub language: String,
@@ -940,6 +989,20 @@ pub struct Settings {
     /// 默认比定时备份（03:00）晚一小时，避免把当天该跑的备份掐掉。
     #[serde(default = "default_scheduled_shutdown_time")]
     pub scheduled_shutdown_time: String,
+    /// 容器定时备份开关：应用运行期间（含托盘后台）每天到点自动执行勾选的容器备份配置。
+    #[serde(default)]
+    pub scheduled_container_enabled: bool,
+    /// 容器定时备份时间（HH:MM，24 小时制，本机时区）。
+    /// 排在数据库备份（03:00）与关机（04:00）之间：三类任务各用独立名额，但仍错开更稳。
+    #[serde(default = "default_scheduled_container_time")]
+    pub scheduled_container_time: String,
+    /// 参与容器定时备份的配置 id 列表，顺序即当晚的排队执行顺序。
+    #[serde(default)]
+    pub scheduled_container_config_ids: Vec<String>,
+}
+
+fn default_scheduled_container_time() -> String {
+    "03:30".to_string()
 }
 
 fn default_scheduled_backup_time() -> String {
@@ -975,6 +1038,11 @@ fn default_container_timeout_secs() -> u64 {
     7200
 }
 
+/// 保留 3 个：够回滚到前几天，又不至于把 C 盘吃穿（一个包可能就几十 GB）。
+fn default_container_bundle_keep() -> usize {
+    3
+}
+
 impl Default for Settings {
     fn default() -> Self {
         Self {
@@ -996,6 +1064,7 @@ impl Default for Settings {
             pages_history_limit: default_pages_history_limit(),
             container_history_limit: default_container_history_limit(),
             container_timeout_secs: default_container_timeout_secs(),
+            container_bundle_keep: default_container_bundle_keep(),
             language: String::new(),
             atomic_release: false,
             release_keep: default_release_keep(),
@@ -1004,6 +1073,9 @@ impl Default for Settings {
             scheduled_backup_config_id: None,
             scheduled_shutdown_enabled: false,
             scheduled_shutdown_time: default_scheduled_shutdown_time(),
+            scheduled_container_enabled: false,
+            scheduled_container_time: default_scheduled_container_time(),
+            scheduled_container_config_ids: Vec::new(),
         }
     }
 }
@@ -1033,6 +1105,9 @@ pub struct AppConfig {
     /// 是否已将旧版 repo.pages 迁移到 pages_configs（只迁移一次）。
     #[serde(default)]
     pub pages_configs_migrated: bool,
+    /// 保存的容器备份配置列表。
+    #[serde(default)]
+    pub container_configs: Vec<ContainerConfig>,
     #[serde(default)]
     pub settings: Settings,
 }
@@ -1074,6 +1149,9 @@ pub struct ExportData {
     pub backup_configs: Vec<BackupConfig>,
     #[serde(default)]
     pub pages_configs: Vec<PagesConfigEntry>,
+    /// 容器备份配置：只引用服务器 id 与项目名，不含任何凭据，可以原样导出。
+    #[serde(default)]
+    pub container_configs: Vec<ContainerConfig>,
     #[serde(default)]
     pub settings: Settings,
 }
@@ -1099,6 +1177,7 @@ pub struct ImportPreview {
     pub deploy_configs: ImportCounts,
     pub backup_configs: ImportCounts,
     pub pages_configs: ImportCounts,
+    pub container_configs: ImportCounts,
     /// 导出文件里被脱敏清空、因而保留本机值的敏感字段条数
     /// （SSH 凭据 / 数据库口令与连接串 / 备份目标 DSN / env 路径 / API Token / 主密码哈希）。
     pub kept_local_secrets: usize,
@@ -1163,6 +1242,7 @@ impl ExportData {
             deploy_configs: config.deploy_configs.clone(),
             backup_configs,
             pages_configs: config.pages_configs.clone(),
+            container_configs: config.container_configs.clone(),
             settings,
         }
     }

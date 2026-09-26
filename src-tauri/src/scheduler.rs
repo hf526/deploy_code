@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::time::Duration;
 
 use chrono::{Local, NaiveTime, TimeZone};
@@ -8,6 +9,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
 use crate::commands::backup::start_backup;
+use crate::commands::container::start_container_config_backup;
 use crate::commands::shutdown::emit_status;
 use crate::state::{AppState, PendingShutdown, ShutdownSource};
 
@@ -142,6 +144,120 @@ fn tick_interval(app: &AppHandle) -> Duration {
     } else {
         CHECK_INTERVAL
     }
+}
+
+/// 启动容器定时备份调度器：到点把勾选的配置排成队列，一次跑一个。
+///
+/// 与数据库备份的循环分开跑：容器一次任务要几十分钟，两个状态机混在一起
+/// 只会让「等待上一个结束」的逻辑互相缠绕。容器任务有独立的名额，
+/// 所以同一时刻和数据库备份并行也互不干扰。
+pub fn spawn_container(app: AppHandle) {
+    tauri::async_runtime::spawn(async move {
+        let mut last_tick = Local::now();
+        // 待执行的配置队列：一次只下发一条，等前一条结束再取下一条。
+        let mut queue: VecDeque<String> = VecDeque::new();
+        // 本轮触发时刻：队列排不空（名额一直被占）时按它判断是否放弃。
+        let mut triggered_at: Option<chrono::DateTime<Local>> = None;
+        // 已成功触发的调度日期：防止时钟回拨后同一个调度日重复执行。
+        let mut last_run: Option<chrono::NaiveDate> = None;
+
+        loop {
+            tokio::time::sleep(CHECK_INTERVAL).await;
+            let now = Local::now();
+            let Ok(config) = app.state::<AppState>().store.load_config() else {
+                last_tick = now;
+                continue;
+            };
+            let settings = &config.settings;
+
+            if settings.scheduled_container_enabled {
+                if let Some(scheduled) = next_schedule(settings, &now) {
+                    let crossed = scheduled > last_tick
+                        && scheduled <= now
+                        && last_run != Some(scheduled.date_naive());
+                    if crossed {
+                        // 先记日期：即使这一轮一个都没跑成，也不该在同一个调度日重复排队。
+                        last_run = Some(scheduled.date_naive());
+                        triggered_at = Some(now);
+                        // 只保留仍然存在的配置：被删掉的条目静默剔除，不让它把整晚的队列带崩。
+                        queue = settings
+                            .scheduled_container_config_ids
+                            .iter()
+                            .filter(|id| {
+                                config
+                                    .container_configs
+                                    .iter()
+                                    .any(|item| item.id == **id)
+                            })
+                            .cloned()
+                            .collect();
+                        if queue.is_empty() {
+                            emit_notice(&app, "containerNoConfig", None);
+                        }
+                    }
+                }
+            } else if !queue.is_empty() {
+                // 开关被关掉：这一晚排下的队列就地作废。
+                queue.clear();
+                triggered_at = None;
+            }
+            last_tick = now;
+
+            let Some(first) = queue.front().cloned() else {
+                triggered_at = None;
+                continue;
+            };
+            // 重试窗口只约束「一次都还没跑成」的等待：跑成第一条之后，剩下的就该等前一条
+            // 自然结束。一条容器任务本身可能跑几十分钟，不能被这个窗口掐掉。
+            if let Some(started) = triggered_at {
+                if now - started > chrono::Duration::minutes(RETRY_WINDOW_MINUTES) {
+                    let skipped = queue.len();
+                    queue.clear();
+                    triggered_at = None;
+                    emit_notice(
+                        &app,
+                        "containerFailed",
+                        Some(format!(
+                            "已有其它容器任务在运行，本次定时备份已跳过（{} 项未执行）",
+                            skipped
+                        )),
+                    );
+                    continue;
+                }
+            }
+            // 上一条（手动的或队列里前一个配置）还在跑：等它结束再取下一个人。
+            if app.state::<AppState>().has_active_container() {
+                continue;
+            }
+            match start_container_config_backup(app.clone(), app.state::<AppState>(), first) {
+                Ok(_) => {
+                    queue.pop_front();
+                    triggered_at = None;
+                    emit_notice(&app, "containerStarted", None);
+                }
+                Err(err) => {
+                    let busy = app.state::<AppState>().has_active_container()
+                        || matches!(err, CoreError::Busy(_));
+                    if busy {
+                        continue;
+                    }
+                    // 单条配置自身有问题（服务器被删、项目已经不在了）：跳过它，
+                    // 后面的配置照跑，否则一个坏条目能把整晚的备份堵在队列头上。
+                    queue.pop_front();
+                    emit_notice(&app, "containerFailed", Some(err.to_string()));
+                }
+            }
+        }
+    });
+}
+
+/// 今天那个 HH:MM 对应的本地时刻；时间写错时返回 None（与数据库备份同样的宽容度）。
+fn next_schedule(settings: &Settings, now: &chrono::DateTime<Local>) -> Option<chrono::DateTime<Local>> {
+    let time = parse_hhmm(&settings.scheduled_container_time)?;
+    // 夏令时回拨会产生两个相同的本地时间：取较早者触发，last_run 保证当天只执行一次。
+    Local
+        .from_local_datetime(&now.date_naive().and_time(time))
+        .earliest()
 }
 
 /// 倒计时到点的关机：先摘掉计划（与「取消」互斥），再下发系统关机请求并触发退出清理。

@@ -251,6 +251,8 @@ export interface Settings {
   containerHistoryLimit: number;
   /** 单次容器快照 / 迁移的超时秒数（含两台服务器之间的中转）。 */
   containerTimeoutSecs: number;
+  /** 同一个 compose 项目在本机保留几个备份包，0 表示不自动清理。 */
+  containerBundleKeep: number;
   language: string;
   atomicRelease: boolean;
   releaseKeep: number;
@@ -259,6 +261,10 @@ export interface Settings {
   scheduledBackupConfigId: string | null;
   scheduledShutdownEnabled: boolean;
   scheduledShutdownTime: string;
+  /** 容器定时备份：到点按 scheduledContainerConfigIds 的顺序逐个排队执行。 */
+  scheduledContainerEnabled: boolean;
+  scheduledContainerTime: string;
+  scheduledContainerConfigIds: string[];
 }
 
 /** 关机计划的来源：每天定时排的那一次，或用户手动按下的倒计时。 */
@@ -294,13 +300,22 @@ export interface ImportPreview {
   deployConfigs: ImportCounts;
   backupConfigs: ImportCounts;
   pagesConfigs: ImportCounts;
+  containerConfigs: ImportCounts;
   /** 导出文件里被脱敏清空、因而保留本机值的敏感字段条数。 */
   keptLocalSecrets: number;
 }
 
-/** 定时任务通知（如定时备份启动/失败、定时关机已执行/失败）。 */
+/** 定时任务通知（定时备份 / 容器定时备份 / 定时关机的开始、跳过与失败）。 */
 export interface SchedulerNotice {
-  kind: "started" | "noConfig" | "failed" | "shutdownFired" | "shutdownFailed";
+  kind:
+    | "started"
+    | "noConfig"
+    | "failed"
+    | "containerStarted"
+    | "containerNoConfig"
+    | "containerFailed"
+    | "shutdownFired"
+    | "shutdownFailed";
   message?: string;
 }
 
@@ -618,6 +633,20 @@ export interface ContainerRequest {
 export interface ContainerRestoreRequest {
   bundlePath: string;
   target: ContainerTarget;
+}
+
+/** 保存的容器备份配置：一次快照 / 迁移的全部参数，可复用、可定时。 */
+export interface ContainerConfig {
+  id: string;
+  name: string;
+  serverId: string;
+  project: string;
+  pauseSource: boolean;
+  includeVolumes: boolean;
+  includeImages: boolean;
+  /** 迁移目标；null 表示只备份到本机。 */
+  target: ContainerTarget | null;
+  createdAt: string;
 }
 
 export type ContainerRecordKind = "backup" | "migrate" | "restore";

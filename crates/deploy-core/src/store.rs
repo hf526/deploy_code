@@ -7,9 +7,10 @@ use directories::ProjectDirs;
 use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, new_id, AppConfig, BackupConfig, BackupRecord, ContainerRecord, DbBackupSource,
-    DeployConfig, DeployRecord, DeployStatus, EnvFileConfig, ExportData, ImportCounts,
-    ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig, SshAuth,
+    now_string, new_id, AppConfig, BackupConfig, BackupRecord, ContainerConfig, ContainerRecord,
+    DbBackupSource, DeployConfig, DeployRecord, DeployStatus, EnvFileConfig, ExportData,
+    ImportCounts, ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig,
+    SshAuth,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -670,6 +671,169 @@ impl Store {
         })
     }
 
+    /// 按 id / 名称查找容器备份配置；id 精确命中优先，避免与名称歧义。
+    pub fn find_container_config<'a>(
+        config: &'a AppConfig,
+        key: &str,
+    ) -> Result<&'a ContainerConfig> {
+        let key = key.trim();
+        if let Some(item) = config
+            .container_configs
+            .iter()
+            .find(|item| item.id == key)
+        {
+            return Ok(item);
+        }
+        config
+            .container_configs
+            .iter()
+            .find(|item| item.name == key)
+            .ok_or_else(|| CoreError::not_found(format!("容器备份配置不存在: {key}")))
+    }
+
+    /// 新建或更新一条容器备份配置：规范化服务器引用与迁移目标并校验名称唯一。
+    /// 界面与调度器都从这里取参数，所以校验要在这里做完，别留到夜里执行时才报错。
+    pub fn save_container_config(
+        store: &Store,
+        config: ContainerConfig,
+    ) -> Result<ContainerConfig> {
+        let mut config = config;
+        config.name = config.name.trim().to_string();
+        if config.name.is_empty() {
+            return Err(CoreError::config("容器备份配置名称不能为空"));
+        }
+        config.project = config.project.trim().to_string();
+        if config.project.is_empty() {
+            return Err(CoreError::config("请选择要打包的 compose 项目"));
+        }
+        if !config.include_volumes && !config.include_images {
+            return Err(CoreError::config("数据卷与镜像至少要勾选一项，否则备份包是空的"));
+        }
+        config.id = config.id.trim().to_string();
+        config.server_id = config.server_id.trim().to_string();
+
+        store.mutate_config(|app| {
+            // 服务器必须以 id 形式存在；名称 / host 也允许（兼容 CLI）。
+            let source = Store::find_server(app, &config.server_id)?.clone();
+            config.server_id = source.id.clone();
+
+            if let Some(target) = config.target.as_mut() {
+                let key = target.server_id.trim().to_string();
+                if key.is_empty() {
+                    // 目标服务器留空 = 只备份到本机，不留一条指向来源机的空目标。
+                    config.target = None;
+                } else {
+                    let server = Store::find_server(app, &key)?.clone();
+                    if server.id == config.server_id {
+                        return Err(CoreError::config("目标服务器不能与来源服务器相同"));
+                    }
+                    target.server_id = server.id.clone();
+                    target.target_dir =
+                        crate::container::validate_remote_dir(&target.target_dir)?;
+                }
+            }
+
+            let by_id = app
+                .container_configs
+                .iter()
+                .find(|item| item.id == config.id);
+            if config.id.is_empty() {
+                config.id = new_id();
+            } else if by_id.is_none() {
+                // 明确携带 id 却不存在（配置已被其它窗口删除）：报错而不是静默新建。
+                return Err(CoreError::not_found(format!(
+                    "容器备份配置不存在（可能已被删除）: {}",
+                    config.id
+                )));
+            }
+            // 更新已有配置时以存储中的创建时间为准，避免调用方传入的旧快照覆盖。
+            match by_id {
+                Some(existing) if !existing.created_at.trim().is_empty() => {
+                    config.created_at = existing.created_at.clone();
+                }
+                _ => {
+                    if config.created_at.trim().is_empty() {
+                        config.created_at = now_string();
+                    }
+                }
+            }
+            if app
+                .container_configs
+                .iter()
+                .any(|item| item.id != config.id && item.name == config.name)
+            {
+                return Err(CoreError::config(format!(
+                    "容器备份配置名称已存在: {}",
+                    config.name
+                )));
+            }
+            match app
+                .container_configs
+                .iter_mut()
+                .find(|item| item.id == config.id)
+            {
+                Some(existing) => *existing = config.clone(),
+                None => app.container_configs.push(config.clone()),
+            }
+            Ok(config.clone())
+        })
+    }
+
+    /// 删除一条容器备份配置（不影响已有任务记录，本机备份包也留在原处）。
+    pub fn delete_container_config(store: &Store, key: &str) -> Result<bool> {
+        let key = key.trim();
+        store.mutate_config(|app| {
+            let removed: Vec<String> = if let Some(item) = app
+                .container_configs
+                .iter()
+                .find(|item| item.id == key)
+            {
+                vec![item.id.clone()]
+            } else {
+                app.container_configs
+                    .iter()
+                    .filter(|item| item.name == key)
+                    .map(|item| item.id.clone())
+                    .collect()
+            };
+            if removed.is_empty() {
+                return Ok(false);
+            }
+            app.container_configs.retain(|item| !removed.contains(&item.id));
+            // 被删的配置若还在定时列表里，一并摘掉，避免每天到点报「配置不存在」。
+            app.settings
+                .scheduled_container_config_ids
+                .retain(|id| !removed.contains(id));
+            Ok(true)
+        })
+    }
+
+    /// 服务器被删除后收敛容器备份配置：来源被删的整条删除（没有来源就无从打包），
+    /// 迁移目标被删的降级成「只备份到本机」——定时任务不该因为一台机器没了就天天报错。
+    pub fn detach_server_from_container_configs(config: &mut AppConfig, server_id: &str) {
+        for saved in config.container_configs.iter_mut() {
+            if saved
+                .target
+                .as_ref()
+                .is_some_and(|target| target.server_id == server_id)
+            {
+                saved.target = None;
+            }
+        }
+        config
+            .container_configs
+            .retain(|saved| saved.server_id != server_id);
+        let alive: Vec<String> = config
+            .container_configs
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        config
+            .settings
+            .scheduled_container_config_ids
+            .retain(|id| alive.contains(id));
+    }
+
     /// 列出所有 Pages 配置条目。
     pub fn list_pages_configs(config: &AppConfig) -> Vec<&PagesConfigEntry> {
         config.pages_configs.iter().collect()
@@ -1165,6 +1329,13 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         |item| item.id.as_str(),
         |_, _| {},
     );
+    // 容器备份配置只引用服务器 id 与 compose 项目名，本身不含凭据，整体跟随导入文件。
+    preview.container_configs = merge_by_id(
+        &mut config.container_configs,
+        &data.container_configs,
+        |item| item.id.as_str(),
+        |_, _| {},
+    );
 
     // 设置整体跟随导入文件（换机迁移主要靠它），但导出的空凭据一律保留本机值。
     let mut settings = data.settings.clone();
@@ -1412,6 +1583,7 @@ mod tests {
             deploy_configs: Vec::new(),
             backup_configs: Vec::new(),
             pages_configs: Vec::new(),
+            container_configs: Vec::new(),
             settings: Settings::default(),
         };
         serde_json::to_string(&data).unwrap()
@@ -1936,6 +2108,199 @@ mod tests {
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].name, "多机部署");
         assert!(!Store::delete_deploy_config(&store, &saved.id).unwrap());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_container_config_normalizes_target_and_prunes_schedule() {
+        use crate::models::{ContainerConfig, ContainerTarget};
+
+        let (store, dir) = temp_store();
+        let mut config = AppConfig::default();
+        for name in ["prod", "stage"] {
+            config.servers.push(ServerConfig::new(
+                name.to_string(),
+                format!("h-{name}"),
+                "u".to_string(),
+                SshAuth::Password {
+                    password: "x".to_string(),
+                },
+            ));
+        }
+        let ids: Vec<String> = config.servers.iter().map(|item| item.id.clone()).collect();
+        store.save_config(&config).unwrap();
+
+        // 服务器按名称传入也认：保存时换成 id，目标目录顺带规范掉结尾斜杠。
+        let saved = Store::save_container_config(
+            &store,
+            ContainerConfig {
+                id: String::new(),
+                name: " 博客 ".to_string(),
+                server_id: "prod".to_string(),
+                project: " lf-blog ".to_string(),
+                pause_source: false,
+                include_volumes: true,
+                include_images: false,
+                target: Some(ContainerTarget {
+                    server_id: "stage".to_string(),
+                    target_dir: "/opt/blog/".to_string(),
+                    start_services: true,
+                }),
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(saved.name, "博客");
+        assert_eq!(saved.project, "lf-blog");
+        assert_eq!(saved.server_id, ids[0]);
+        let target = saved.target.clone().expect("迁移目标应保留");
+        assert_eq!(target.server_id, ids[1]);
+        assert_eq!(target.target_dir, "/opt/blog");
+
+        // 卷和镜像都不勾 = 空备份包，保存时就该拒绝，而不是等夜里跑出一个空包。
+        let mut empty_bundle = saved.clone();
+        empty_bundle.id = String::new();
+        empty_bundle.name = "空包".to_string();
+        empty_bundle.include_volumes = false;
+        assert!(Store::save_container_config(&store, empty_bundle).is_err());
+
+        // 目标与来源同一台：compose 项目名在单机上会撞车，直接拒绝。
+        let mut same = saved.clone();
+        same.id = String::new();
+        same.name = "同机".to_string();
+        if let Some(target) = same.target.as_mut() {
+            target.server_id = ids[0].clone();
+        }
+        assert!(Store::save_container_config(&store, same).is_err());
+
+        // 目标服务器留空 = 降级成只备份到本机，不留一条指向来源机的空目标。
+        let mut no_target = saved.clone();
+        no_target.id = String::new();
+        no_target.name = "只备份".to_string();
+        no_target.target = Some(ContainerTarget {
+            server_id: "  ".to_string(),
+            target_dir: String::new(),
+            start_services: true,
+        });
+        let no_target = Store::save_container_config(&store, no_target).unwrap();
+        assert!(no_target.target.is_none());
+
+        // 定时列表指向被删配置时一起清掉，避免到点报「配置不存在」。
+        store
+            .mutate_config(|app| {
+                app.settings
+                    .scheduled_container_config_ids
+                    .push(saved.id.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(Store::delete_container_config(&store, &saved.id).unwrap());
+        let after = store.load_config().unwrap();
+        assert!(
+            after
+                .settings
+                .scheduled_container_config_ids
+                .iter()
+                .all(|id| id != &saved.id),
+            "已删除的容器配置仍留在定时列表里"
+        );
+
+        // 删掉来源服务器：整条配置失去意义，连同定时引用一起消失；
+        // 只当过迁移目标的那条则降级为纯备份，任务照跑。
+        let mut config = store.load_config().unwrap();
+        config.container_configs.clear();
+        config.container_configs.push(no_target.clone());
+        config.container_configs.push(saved.clone());
+        config.settings.scheduled_container_config_ids =
+            vec![no_target.id.clone(), saved.id.clone()];
+        store.save_config(&config).unwrap();
+        Store::detach_server_from_container_configs(&mut config, &ids[1]);
+        assert_eq!(config.container_configs.len(), 2);
+        assert!(config.container_configs[1].target.is_none());
+        Store::detach_server_from_container_configs(&mut config, &ids[0]);
+        assert!(config.container_configs.is_empty());
+        assert!(config.settings.scheduled_container_config_ids.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 保存的配置是「手动一键执行」与「定时执行」唯一的参数来源：
+    /// `request()` 少带一个字段，夜里跑的就不是白天存的那次操作，而且不会报错。
+    /// 所以这里把 存配置 -> request() -> 引擎 整条链钉住。
+    #[test]
+    fn saved_container_config_feeds_the_engine_unchanged() {
+        use crate::container::{ContainerEngine, ContainerJob};
+        use crate::models::{ContainerConfig, ContainerRecordKind, ContainerTarget};
+
+        let (store, dir) = temp_store();
+        // 引擎按 `Arc<Store>` 持有存储，与 src-tauri 里的用法保持一致。
+        let store = std::sync::Arc::new(store);
+        let mut config = AppConfig::default();
+        for name in ["prod", "stage"] {
+            config.servers.push(ServerConfig::new(
+                name.to_string(),
+                format!("h-{name}"),
+                "u".to_string(),
+                SshAuth::Password {
+                    password: "x".to_string(),
+                },
+            ));
+        }
+        store.save_config(&config).unwrap();
+
+        let migrate = Store::save_container_config(
+            &store,
+            ContainerConfig {
+                id: String::new(),
+                name: "博客迁移".to_string(),
+                server_id: "prod".to_string(),
+                project: "lf-blog".to_string(),
+                pause_source: true,
+                include_volumes: true,
+                include_images: false,
+                target: Some(ContainerTarget {
+                    server_id: "stage".to_string(),
+                    target_dir: "/opt/blog".to_string(),
+                    start_services: false,
+                }),
+                created_at: String::new(),
+            },
+        )
+        .unwrap();
+
+        let engine = ContainerEngine::new(store.clone());
+        let (record, job) = engine.prepare(&migrate.request()).unwrap();
+        assert_eq!(record.kind, ContainerRecordKind::Migrate);
+        assert_eq!(record.server_name, "prod");
+        assert_eq!(record.target_server_name, "stage");
+        assert_eq!(record.target_dir, "/opt/blog");
+        match job {
+            ContainerJob::Snapshot(plan) => {
+                assert_eq!(plan.project, "lf-blog");
+                assert!(plan.pause_source, "暂停来源机的选项必须传到引擎");
+                assert!(plan.include_volumes);
+                assert!(!plan.include_images, "只勾卷时不该带上镜像");
+                let (server, target_dir, start) = plan.target.as_ref().expect("迁移目标应传到引擎");
+                assert_eq!(server.name, "stage");
+                assert_eq!(target_dir, "/opt/blog");
+                assert!(!*start, "配置里没勾启动服务，到点不该 compose up");
+            }
+            ContainerJob::Restore(_) => panic!("快照配置不该产出恢复任务"),
+        }
+
+        // 同一份配置去掉目标：降级成纯备份， kinds 与目标字段都要跟着变。
+        let mut backup_only = migrate.clone();
+        backup_only.id = String::new();
+        backup_only.name = "博客只备份".to_string();
+        backup_only.target = None;
+        let backup_only = Store::save_container_config(&store, backup_only).unwrap();
+        let (record, job) = engine.prepare(&backup_only.request()).unwrap();
+        assert_eq!(record.kind, ContainerRecordKind::Backup);
+        assert!(record.target_server_id.is_empty());
+        match job {
+            ContainerJob::Snapshot(plan) => assert!(plan.target.is_none()),
+            ContainerJob::Restore(_) => panic!("快照配置不该产出恢复任务"),
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
     }

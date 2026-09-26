@@ -12,9 +12,9 @@
     "deploy": "Deploy",
     "servers": "Servers",
     "nginx": "Nginx",
-    "containers": "Containers",
+    "containers": "Container Backups",
     "cronJobs": "Scheduled requests",
-    "backups": "Backups",
+    "backups": "Database Backups",
     "history": "History",
     "settings": "Settings"
   },
@@ -573,7 +573,8 @@
         "backupTargets": "Backup Targets",
         "deployConfigs": "Deploy Configs",
         "backupConfigs": "Backup Configs",
-        "pagesConfigs": "Pages Configs"
+        "pagesConfigs": "Pages Configs",
+        "containerConfigs": "Container Backup Configs"
       },
       "preview": {
         "exportedAt": "Exported at {{time}}",
@@ -592,7 +593,9 @@
       "title": "Container backup & migration",
       "description": "Record retention and timeout when bundling a docker-compose project",
       "historyLimit": "Records to keep",
-      "timeout": "Task timeout (seconds)"
+      "timeout": "Task timeout (seconds)",
+      "bundleKeep": "Bundles Kept Per Project",
+      "bundleKeepHint": "A nightly run drops another GB-scale bundle on this machine: each (server + compose project) keeps only this many, older ones are deleted after a successful run. 0 disables cleanup."
     }
   },
   "deploy": {
@@ -860,7 +863,7 @@
     "reload": "Reload Nginx"
   },
   "containers": {
-    "subtitle": "Package a docker-compose project (config files + volumes + images) and move it losslessly to another server",
+    "subtitle": "Package docker-compose projects (config files + volumes + images), with saved configs, scheduled backups and lossless migration",
     "rescan": "Rescan",
     "sourceTitle": "Source project",
     "sourceDescription": "Pick a server to scan the projects it runs under docker compose",
@@ -887,7 +890,7 @@
     "includeImages": "Bundle images (docker save)",
     "pauseSource": "Stop the source services before bundling volumes, start them again afterwards",
     "pauseSourceHint": "Without stopping, volumes are a live snapshot: databases may copy inconsistent data mid-write. Run off-peak or tick this box",
-    "targetTitle": "Backup & migration",
+    "targetTitle": "Manual backup & migration",
     "targetDescription": "Leave the target empty to only back up locally; migrating reuses the same snapshot to restore on the target",
     "targetServer": "Target server",
     "targetServerHint": "Excludes the source",
@@ -940,6 +943,47 @@
       "backedUp": "{{name}} backed up locally",
       "migrated": "{{name}} migrated",
       "failed": "{{name}} failed: {{error}}"
+    },
+    "config": {
+      "title": "Backup Configs",
+      "description": "Save the projects and bundle options you reuse, then run them on demand or on a schedule",
+      "subtitle": "Saved on this machine so you can run it on demand or on a schedule",
+      "new": "New Config",
+      "edit": "Edit Config",
+      "delete": "Delete Config",
+      "deleteTitle": "Delete Container Backup Config",
+      "deleteDescription": "Delete <b>{{name}}</b>? Existing records and local bundles stay, but this config can no longer be run with one click.",
+      "saved": "Config “{{name}}” saved",
+      "deleted": "Config “{{name}}” deleted",
+      "name": "Config Name",
+      "nameHint": "Leave empty to use the compose project name",
+      "namePlaceholder": "e.g. Blog nightly backup",
+      "project": "Compose Project",
+      "serverRequired": "Select a source server",
+      "unknownServer": "Unknown server",
+      "localBundle": "Back up locally only",
+      "scheduled": "Scheduled",
+      "backupOnlyTarget": "None = back up locally only",
+      "saveAs": "Save As Config",
+      "saveAsHint": "Save the selected project and bundle options as a reusable, schedulable config",
+      "scheduleNote": "A scheduled run follows this config as-is: with a target it backs up and migrates, without one it only bundles locally.",
+      "empty": "No saved container backup configs",
+      "emptyDescription": "Scan a server below and press “Save As Config”, or create one manually"
+    },
+    "schedule": {
+      "title": "Scheduled Backup",
+      "description": "While the app is running (including minimized to the tray), run the selected configs daily at the chosen time",
+      "enable": "Enable scheduled container backup",
+      "time": "Run time",
+      "saved": "Schedule settings saved",
+      "noConfigs": "Nothing to schedule yet — save a container backup config above first",
+      "summary": "Enabled: runs {{count}} config(s) one after another every day at {{time}}",
+      "disabled": "Disabled. When enabled, keep the app running at the chosen time.",
+      "started": "Scheduled container backup started",
+      "noConfig": "Scheduled container backup skipped: every selected config was deleted",
+      "failed": "Scheduled container backup failed: {{error}}",
+      "retention": "Keeps the newest {{keep}} bundles per project here; older ones are deleted after a successful run",
+      "retentionOff": "Automatic cleanup is off (keep = 0): bundles keep piling up, watch your free disk space"
     }
   }
 }

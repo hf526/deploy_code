@@ -11,6 +11,7 @@ import type {
   BackupRecord,
   BackupRequest,
   BackupTarget,
+  ContainerConfig,
   ContainerEvent,
   ContainerRecord,
   ContainerRequest,
@@ -57,6 +58,7 @@ export const defaultSettings: Settings = {
   pagesHistoryLimit: 200,
   containerHistoryLimit: 200,
   containerTimeoutSecs: 7200,
+  containerBundleKeep: 3,
   language: "",
   atomicRelease: false,
   releaseKeep: 5,
@@ -65,6 +67,9 @@ export const defaultSettings: Settings = {
   scheduledBackupConfigId: null,
   scheduledShutdownEnabled: false,
   scheduledShutdownTime: "04:00",
+  scheduledContainerEnabled: false,
+  scheduledContainerTime: "03:30",
+  scheduledContainerConfigIds: [],
 };
 
 let toastSeq = 0;
@@ -82,6 +87,7 @@ interface AppStore {
   deployConfigs: DeployConfig[];
   pagesRecords: PagesDeployRecord[];
   pagesConfigs: PagesConfigEntry[];
+  containerConfigs: ContainerConfig[];
   containerRecords: ContainerRecord[];
   toasts: Toast[];
   live: LiveDeploy | null;
@@ -105,6 +111,7 @@ interface AppStore {
   refreshPagesRecords: (repoId?: string | null) => Promise<void>;
   refreshPagesConfigs: () => Promise<void>;
   refreshContainerRecords: () => Promise<void>;
+  refreshContainerConfigs: () => Promise<void>;
   setSettings: (settings: Settings) => void;
   setShutdownStatus: (status: ShutdownStatus) => void;
   cancelShutdown: () => Promise<void>;
@@ -125,6 +132,8 @@ interface AppStore {
 
   startContainerTransfer: (request: ContainerRequest) => Promise<string>;
   restoreContainerBundle: (request: ContainerRestoreRequest) => Promise<string>;
+  /** 按已保存的配置发起：与定时调度器走同一条命令，参数只从盘上的配置里取。 */
+  startContainerConfigBackup: (configId: string) => Promise<string>;
   cancelContainer: () => Promise<void>;
   handleContainerEvent: (event: ContainerEvent) => void;
 }
@@ -132,6 +141,40 @@ interface AppStore {
 // 仓库列表刷新的 in-flight 请求：轮询与手动点击会撞在一起，复用同一个请求，
 // 避免并发写回时“后发先至”把旧数据覆盖回去。
 let reposRefreshTask: Promise<void> | null = null;
+
+/**
+ * 容器任务的三种发起方式（快照 / 恢复 / 按配置）共用这一段：
+ * 先占住 liveContainer，拿到记录 id 再回填，失败则收回占位让界面恢复可点。
+ */
+async function launchContainer(start: () => Promise<string>): Promise<string> {
+  const { liveContainer, toast } = useApp.getState();
+  if (liveContainer?.status === "running") {
+    const message = i18n.t("containers.toast.running");
+    toast("error", message);
+    throw new Error(message);
+  }
+  useApp.setState({
+    liveContainer: {
+      recordId: "",
+      lines: [],
+      progress: 0,
+      progressMessage: "",
+      status: "running",
+      record: null,
+    },
+  });
+  try {
+    const recordId = await start();
+    useApp.setState((state) =>
+      state.liveContainer ? { liveContainer: { ...state.liveContainer, recordId } } : {},
+    );
+    return recordId;
+  } catch (error) {
+    useApp.setState({ liveContainer: null });
+    useApp.getState().toast("error", String(error));
+    throw error;
+  }
+}
 
 export const useApp = create<AppStore>((set, get) => ({
   ready: false,
@@ -146,6 +189,7 @@ export const useApp = create<AppStore>((set, get) => ({
   deployConfigs: [],
   pagesRecords: [],
   pagesConfigs: [],
+  containerConfigs: [],
   containerRecords: [],
   toasts: [],
   live: null,
@@ -167,6 +211,7 @@ export const useApp = create<AppStore>((set, get) => ({
       deployConfigsResult,
       pagesResult,
       pagesConfigsResult,
+      containerConfigsResult,
       containersResult,
       shutdownResult,
     ] = await Promise.allSettled([
@@ -180,6 +225,7 @@ export const useApp = create<AppStore>((set, get) => ({
       api.listDeployConfigs(),
       api.listPagesRecords(),
       api.listPagesConfigs(),
+      api.listContainerConfigs(),
       api.listContainerRecords(),
       api.getShutdownStatus(),
     ]);
@@ -199,6 +245,9 @@ export const useApp = create<AppStore>((set, get) => ({
       ...(pagesConfigsResult.status === "fulfilled"
         ? { pagesConfigs: pagesConfigsResult.value }
         : {}),
+      ...(containerConfigsResult.status === "fulfilled"
+        ? { containerConfigs: containerConfigsResult.value }
+        : {}),
       ...(containersResult.status === "fulfilled"
         ? { containerRecords: containersResult.value }
         : {}),
@@ -215,6 +264,7 @@ export const useApp = create<AppStore>((set, get) => ({
       deployConfigsResult,
       pagesResult,
       pagesConfigsResult,
+      containerConfigsResult,
       containersResult,
       shutdownResult,
     ].filter((result): result is PromiseRejectedResult => result.status === "rejected");
@@ -357,6 +407,14 @@ export const useApp = create<AppStore>((set, get) => ({
   refreshPagesConfigs: async () => {
     try {
       set({ pagesConfigs: await api.listPagesConfigs() });
+    } catch (error) {
+      get().toast("error", String(error));
+    }
+  },
+
+  refreshContainerConfigs: async () => {
+    try {
+      set({ containerConfigs: await api.listContainerConfigs() });
     } catch (error) {
       get().toast("error", String(error));
     }
@@ -572,49 +630,12 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   /** 快照（带 target 时同时恢复到目标服务器）；进度与结果走 container://event。 */
-  startContainerTransfer: async (request) => {
-    if (get().liveContainer?.status === "running") {
-      const message = i18n.t("containers.toast.running");
-      get().toast("error", message);
-      throw new Error(message);
-    }
-    set({
-      liveContainer: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
-    });
-    try {
-      const recordId = await api.startContainerTransfer(request);
-      set((state) =>
-        state.liveContainer ? { liveContainer: { ...state.liveContainer, recordId } } : {},
-      );
-      return recordId;
-    } catch (error) {
-      set({ liveContainer: null });
-      get().toast("error", String(error));
-      throw error;
-    }
-  },
+  startContainerTransfer: (request) => launchContainer(() => api.startContainerTransfer(request)),
 
-  restoreContainerBundle: async (request) => {
-    if (get().liveContainer?.status === "running") {
-      const message = i18n.t("containers.toast.running");
-      get().toast("error", message);
-      throw new Error(message);
-    }
-    set({
-      liveContainer: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
-    });
-    try {
-      const recordId = await api.restoreContainerBundle(request);
-      set((state) =>
-        state.liveContainer ? { liveContainer: { ...state.liveContainer, recordId } } : {},
-      );
-      return recordId;
-    } catch (error) {
-      set({ liveContainer: null });
-      get().toast("error", String(error));
-      throw error;
-    }
-  },
+  restoreContainerBundle: (request) => launchContainer(() => api.restoreContainerBundle(request)),
+
+  startContainerConfigBackup: (configId) =>
+    launchContainer(() => api.startContainerConfigBackup(configId)),
 
   cancelContainer: async () => {
     const { liveContainer, containerRecords } = get();

@@ -8,9 +8,10 @@ import {
   FolderOpen,
   RefreshCw,
   RotateCcw,
+  Save,
   Square,
 } from "lucide-react";
-import { useTranslation } from "react-i18next";
+import { Trans, useTranslation } from "react-i18next";
 
 import { LogConsole } from "../components/LogConsole";
 import { ExpandableRecordRow, RecordLog } from "../components/RecordRows";
@@ -30,8 +31,16 @@ import {
 import { api } from "../lib/api";
 import { containerKindLabel, containerSummary } from "../lib/container";
 import { useApp } from "../lib/store";
-import type { ComposeStack, ComposeStackDetail, ContainerRequest } from "../lib/types";
+import type {
+  ComposeStack,
+  ComposeStackDetail,
+  ContainerConfig,
+  ContainerRequest,
+} from "../lib/types";
 import { cn, deployStatusLabel, humanSize, statusBadgeKind } from "../lib/utils";
+import { ContainerConfigList } from "./containers/ContainerConfigList";
+import { ContainerConfigModal } from "./containers/ContainerConfigModal";
+import { ContainerScheduleCard } from "./containers/ContainerScheduleCard";
 import { RestoreBundleModal } from "./containers/RestoreBundleModal";
 import { StackDetail } from "./containers/StackDetail";
 
@@ -51,6 +60,8 @@ export default function ContainersPage() {
   const startTransfer = useApp((state) => state.startContainerTransfer);
   const cancelContainer = useApp((state) => state.cancelContainer);
   const refreshRecords = useApp((state) => state.refreshContainerRecords);
+  const refreshConfigs = useApp((state) => state.refreshContainerConfigs);
+  const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
 
   const [serverId, setServerId] = useState("");
@@ -79,6 +90,14 @@ export default function ContainersPage() {
   const [confirmClear, setConfirmClear] = useState(false);
   const [bundleDir, setBundleDir] = useState("");
 
+  // 已保存配置：编辑弹窗（preset 来自扫描区「存为配置」）与待删除项，都是页面级状态。
+  const [editing, setEditing] = useState<{
+    config: ContainerConfig | null;
+    preset: ContainerConfig | null;
+  } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ContainerConfig | null>(null);
+  const [deleting, setDeleting] = useState(false);
+
   // 查询序号：切换服务器/项目后，旧请求返回时直接丢弃，避免串数据。
   // 两类查询各用一个序号：共用一个时，扫描途中点某一行详情会把在途扫描判为过期，
   // 而 loadingStacks 只在「自己的序号仍是最新」时才复位，扫描按钮就永远转圈。
@@ -90,7 +109,9 @@ export default function ContainersPage() {
       .getContainerBackupDir()
       .then(setBundleDir)
       .catch(() => undefined);
-  }, []);
+    // 配置列表可能被 CLI 或另一个窗口改过，进页面拉一次最新数据。
+    void refreshConfigs();
+  }, [refreshConfigs]);
 
   useEffect(() => {
     if (servers.length === 0) {
@@ -227,6 +248,51 @@ export default function ContainersPage() {
     void submit(request);
   }
 
+  async function handleDeleteConfig() {
+    if (!deleteTarget || deleting) return;
+    setDeleting(true);
+    try {
+      await api.deleteContainerConfig(deleteTarget.id);
+      await refreshConfigs();
+      // 后端会连带摘掉定时列表里的引用：拉一次设置，避免界面还勾着一条已删的配置。
+      setSettings(await api.getSettings());
+      toast("success", t("containers.config.deleted", { name: deleteTarget.name }));
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setDeleting(false);
+      setDeleteTarget(null);
+    }
+  }
+
+  /** 把扫描区当前选中的项目与选项存成配置：名称留空，由后端按项目名兜底。 */
+  function handleSaveAsConfig() {
+    if (!serverId || !project) {
+      toast("error", t("containers.pickProject"));
+      return;
+    }
+    if (!includeVolumes && !includeImages) {
+      toast("error", t("containers.emptyBundle"));
+      return;
+    }
+    setEditing({
+      config: null,
+      preset: {
+        id: "",
+        name: "",
+        serverId,
+        project,
+        pauseSource,
+        includeVolumes,
+        includeImages,
+        target: targetServerId
+          ? { serverId: targetServerId, targetDir: targetDir.trim(), startServices }
+          : null,
+        createdAt: "",
+      },
+    });
+  }
+
   async function handleClear() {
     try {
       await api.clearContainerRecords();
@@ -275,6 +341,11 @@ export default function ContainersPage() {
     >
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_400px]">
         <div className="flex min-w-0 flex-col gap-6">
+          <ContainerConfigList
+            onEdit={(config) => setEditing({ config, preset: null })}
+            onDelete={(config) => setDeleteTarget(config)}
+          />
+
           <section>
             <SectionTitle
               title={t("containers.sourceTitle")}
@@ -444,6 +515,15 @@ export default function ContainersPage() {
                 >
                   {t("containers.migrate")}
                 </Button>
+                <Button
+                  variant="ghost"
+                  icon={<Save className="size-4" />}
+                  disabled={!selected}
+                  title={t("containers.config.saveAsHint")}
+                  onClick={handleSaveAsConfig}
+                >
+                  {t("containers.config.saveAs")}
+                </Button>
                 {running && (
                   <Button
                     variant="danger"
@@ -481,6 +561,8 @@ export default function ContainersPage() {
               </div>
             </Card>
           </section>
+
+          <ContainerScheduleCard />
         </div>
 
         <div className="flex min-w-0 flex-col gap-6">
@@ -640,6 +722,36 @@ export default function ContainersPage() {
         description={t("containers.clearDescription")}
         onCancel={() => setConfirmClear(false)}
         onConfirm={() => void handleClear()}
+      />
+
+      {editing && (
+        <ContainerConfigModal
+          config={editing.config}
+          preset={editing.preset}
+          onClose={() => setEditing(null)}
+          onSaved={(saved) => {
+            setEditing(null);
+            void refreshConfigs();
+            toast("success", t("containers.config.saved", { name: saved.name }));
+          }}
+        />
+      )}
+
+      <ConfirmModal
+        open={deleteTarget !== null}
+        danger
+        loading={deleting}
+        title={t("containers.config.deleteTitle")}
+        confirmText={t("common.delete")}
+        description={
+          <Trans
+            i18nKey="containers.config.deleteDescription"
+            values={{ name: deleteTarget?.name ?? deleteTarget?.project ?? "" }}
+            components={{ b: <b className="text-ink" /> }}
+          />
+        }
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => void handleDeleteConfig()}
       />
     </Page>
   );

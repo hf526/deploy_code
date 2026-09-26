@@ -9,6 +9,7 @@ import type {
   Commit,
   ComposeStack,
   ComposeStackDetail,
+  ContainerConfig,
   ContainerRecord,
   ContainerRequest,
   ContainerRestoreRequest,
@@ -242,6 +243,14 @@ export const api = {
   /** 快照（可选目标时再恢复到目标服务器）；返回记录 id，进度走 container://event。 */
   startContainerTransfer: (request: ContainerRequest) =>
     invoke<string>("start_container_transfer", { request }),
+  /** 已保存的容器备份配置：列表 / 保存 / 删除 / 按配置发起。 */
+  listContainerConfigs: () => invoke<ContainerConfig[]>("list_container_configs"),
+  saveContainerConfig: (config: ContainerConfig) =>
+    invoke<ContainerConfig>("save_container_config", { config }),
+  deleteContainerConfig: (configId: string) =>
+    invoke<boolean>("delete_container_config", { configId }),
+  startContainerConfigBackup: (configId: string) =>
+    invoke<string>("start_container_config_backup", { configId }),
   restoreContainerBundle: (request: ContainerRestoreRequest) =>
     invoke<string>("restore_container_bundle", { request }),
   cancelContainer: (recordId: string) => invoke<string>("cancel_container", { recordId }),

@@ -340,6 +340,71 @@ impl ContainerEngine {
     }
 
     /// 执行任务。无论成功失败都会返回带最终状态的记录。
+    /// 备份包轮转：同一个（服务器 + compose 项目）连本次成功任务在内只保留 `keep` 个包，
+    /// 窗口之外的从磁盘删掉，并把那条记录里的 `bundle_path` 抹空——
+    /// 界面的「恢复到目标服务器」入口就是按它判断有没有包可用，留着悬空路径只会让人点了才报错。
+    ///
+    /// 定时备份一晚落一个 GB 级文件，没有这一步会把系统盘写满。`keep` 为 0 表示完全不轮转。
+    /// 只认 `<数据目录>/containers/` 下的直接子文件：老记录可能指向别的机器上的路径，
+    /// 也可能被用户自己挪走了，那些一律跳过。
+    fn prune_bundles(
+        &self,
+        record: &ContainerRecord,
+        keep: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        if keep == 0 || record.server_id.is_empty() || record.project.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bundle_dir = self.store.container_bundle_dir();
+        let mut records = self.store.load_containers()?;
+        let mut stale: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.id != record.id
+                    && item.kind != ContainerRecordKind::Restore
+                    && item.server_id == record.server_id
+                    && item.project == record.project
+                    && !item.bundle_path.is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if stale.len() < keep {
+            return Ok(Vec::new());
+        }
+        // started_at 是 "%Y-%m-%d %H:%M:%S"，字典序就是时间序；本次任务自己不在候选里，
+        // 所以窗口按 keep - 1 算，新下来的这个包永远不会被自己挤掉。
+        stale.sort_by(|a, b| records[*b].started_at.cmp(&records[*a].started_at));
+        let mut removed = Vec::new();
+        let mut touched: Vec<ContainerRecord> = Vec::new();
+        for index in stale.into_iter().skip(keep - 1) {
+            let path = PathBuf::from(&records[index].bundle_path);
+            if path.parent().map(|parent| parent != bundle_dir).unwrap_or(true) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if path.is_file() {
+                // 删不掉（被别的进程占着）就原样留着这条，下次任务收尾时再试一次。
+                if std::fs::remove_file(&path).is_err() {
+                    continue;
+                }
+                removed.push((name, records[index].bundle_size));
+            }
+            // 走到这里：要么刚删掉，要么文件早就不在了。两种情况这条路径都指不到东西了，
+            // 抹空它，界面的「恢复」入口会跟着收起。
+            records[index].bundle_path = String::new();
+            touched.push(records[index].clone());
+        }
+        for item in touched {
+            self.store.upsert_container(&item, limit)?;
+        }
+        Ok(removed)
+    }
+
     pub async fn run(
         &self,
         mut record: ContainerRecord,
@@ -380,15 +445,37 @@ impl ContainerEngine {
             }
         }
 
+        let settings = self
+            .store
+            .load_config()
+            .map(|config| config.settings)
+            .unwrap_or_default();
+        let limit = settings.container_history_limit;
+
+        // 只有成功收尾才轮转：失败那次的半截包不该占住窗口，更不该顺手把上一晚的好包挤掉。
+        if record.status == DeployStatus::Success {
+            match self.prune_bundles(&record, settings.container_bundle_keep, limit) {
+                Ok(removed) => {
+                    for (name, _) in &removed {
+                        logger.info(format!("清理旧备份包 {name}"));
+                    }
+                    if !removed.is_empty() {
+                        let freed: u64 = removed.iter().map(|(_, size)| size).sum();
+                        logger.success(format!(
+                            "本轮清理 {} 个旧备份包，释放 {}",
+                            removed.len(),
+                            human_size(freed)
+                        ));
+                    }
+                }
+                Err(err) => logger.warn(format!("备份包轮转失败: {err}")),
+            }
+        }
+
         record.log = logger.joined();
         record.finished_at = Some(now_string());
         record.duration_ms = started.elapsed().as_millis() as u64;
 
-        let limit = self
-            .store
-            .load_config()
-            .map(|config| config.settings.container_history_limit)
-            .unwrap_or(200);
         if let Err(err) = self.store.upsert_container(&record, limit) {
             logger.error(format!("保存容器记录失败: {err}"));
             record.log = logger.joined();
@@ -1334,5 +1421,116 @@ DEPLOYCODE_LIST"));
         // 快照第 7 步（打包）落在区间末段，恢复第 6 步（校验）同样到顶。
         assert_eq!(scale(7, 6, (2, 45)), 45);
         assert_eq!(scale(3, 6, (85, 99)), 92);
+    }
+
+    /// 备份包轮转：同一个（服务器 + 项目）只留最近 keep 个，
+    /// 多出来的删文件并把记录里的 `bundle_path` 抹空；目录外的路径与别的项目一律不动。
+    #[test]
+    fn prune_bundles_keeps_the_newest_and_blanks_the_rest() {
+        use crate::models::AppConfig;
+
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-container-prune-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(Store::new(&dir));
+        let engine = ContainerEngine::new(store.clone());
+        let bundles = store.container_bundle_dir();
+        std::fs::create_dir_all(&bundles).unwrap();
+        // 故意放在备份目录之外：轮转不许删用户自己挪走的包。
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let prod = server("prod");
+        let prod_id = prod.id.clone();
+        let mut config = AppConfig::default();
+        config.servers.push(prod);
+        store.save_config(&config).unwrap();
+
+        let bundle = |dir: &Path, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"tar").unwrap();
+            path
+        };
+        let record = |id: &str, project: &str, started_at: &str, path: &Path| ContainerRecord {
+            kind: ContainerRecordKind::Backup,
+            id: id.to_string(),
+            project: project.to_string(),
+            server_id: prod_id.clone(),
+            server_name: "prod".to_string(),
+            target_server_id: String::new(),
+            target_server_name: String::new(),
+            target_dir: String::new(),
+            bundle_path: path.to_string_lossy().into_owned(),
+            bundle_size: 3,
+            services: Vec::new(),
+            volumes: Vec::new(),
+            images: Vec::new(),
+            include_volumes: true,
+            include_images: true,
+            status: DeployStatus::Success,
+            error: None,
+            log: String::new(),
+            started_at: started_at.to_string(),
+            finished_at: None,
+            duration_ms: 0,
+        };
+
+        let moved = bundle(&elsewhere, "blog-moved.tar");
+        let oldest = bundle(&bundles, "blog-0.tar");
+        let older = bundle(&bundles, "blog-1.tar");
+        let mid = bundle(&bundles, "blog-2.tar");
+        let newest_old = bundle(&bundles, "blog-3.tar");
+        let other_project = bundle(&bundles, "api-0.tar");
+        let current = bundle(&bundles, "blog-cur.tar");
+
+        let history = vec![
+            record("moved", "blog", "2026-09-20 03:30:00", &moved),
+            record("oldest", "blog", "2026-09-21 03:30:00", &oldest),
+            record("older", "blog", "2026-09-22 03:30:00", &older),
+            record("mid", "blog", "2026-09-23 03:30:00", &mid),
+            record("newest", "blog", "2026-09-24 03:30:00", &newest_old),
+            record("api", "api", "2026-09-25 03:30:00", &other_project),
+        ];
+        for item in &history {
+            store.upsert_container(item, 100).unwrap();
+        }
+        let running = record("cur", "blog", "2026-09-27 03:30:00", &current);
+
+        // keep = 0 表示关掉轮转：一个都不许动。
+        assert!(engine
+            .prune_bundles(&running, 0, 100)
+            .unwrap()
+            .is_empty());
+        assert!(oldest.is_file() && moved.is_file());
+
+        // keep = 2：本次这个占一席，历史里只留最新的一个。
+        let removed = engine.prune_bundles(&running, 2, 100).unwrap();
+        let names: Vec<String> = removed.iter().map(|(name, _)| name.clone()).collect();
+        assert_eq!(names, vec!["blog-2.tar", "blog-1.tar", "blog-0.tar"]);
+        assert!(!oldest.is_file() && !older.is_file() && !mid.is_file());
+        assert!(newest_old.is_file(), "窗口内的最新历史包要留下");
+        assert!(current.is_file(), "刚做出来的包不该被自己挤掉");
+        assert!(other_project.is_file(), "别的项目的包不在轮转范围");
+        assert!(moved.is_file(), "备份目录外的文件一律不碰");
+
+        let stored = store.load_containers().unwrap();
+        let path_of = |id: &str| -> String {
+            stored
+                .iter()
+                .find(|item| item.id == id)
+                .expect("记录应还在")
+                .bundle_path
+                .clone()
+        };
+        // 记录留在列表里（历史与日志还有用），只是不再指向一个已经不存在的文件。
+        assert_eq!(path_of("oldest"), "");
+        assert_eq!(path_of("older"), "");
+        assert_eq!(path_of("mid"), "");
+        assert_eq!(path_of("newest"), newest_old.to_string_lossy());
+        assert_eq!(path_of("moved"), moved.to_string_lossy());
+        assert_eq!(path_of("api"), other_project.to_string_lossy());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

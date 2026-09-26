@@ -39,6 +39,8 @@ pub fn run() {
             tray::create(app.handle(), &language)?;
             // 定时任务：应用运行期间（含隐藏到托盘）按设置的时间点自动备份与关机。
             scheduler::spawn(app.handle().clone());
+            // 容器备份另起一个循环：一条任务动辄几十分钟，队列推进的节奏与数据库备份不同。
+            scheduler::spawn_container(app.handle().clone());
             Ok(())
         })
         // 点窗口 X 只隐藏到托盘，程序继续运行；退出请使用托盘菜单。
@@ -116,6 +118,10 @@ pub fn run() {
             commands::container::get_container_backup_dir,
             commands::container::list_compose_stacks,
             commands::container::inspect_compose_stack,
+            commands::container::list_container_configs,
+            commands::container::save_container_config,
+            commands::container::delete_container_config,
+            commands::container::start_container_config_backup,
             commands::container::start_container_transfer,
             commands::container::restore_container_bundle,
             commands::container::cancel_container,

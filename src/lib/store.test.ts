@@ -5,6 +5,9 @@ vi.mock("./api", () => ({
     listRepos: vi.fn(async () => []),
     deployConfigTargets: vi.fn(async () => 2),
     startPagesDeploy: vi.fn(async () => "p1"),
+    startContainerTransfer: vi.fn(async () => "c1"),
+    restoreContainerBundle: vi.fn(async () => "c2"),
+    startContainerConfigBackup: vi.fn(async () => "c3"),
     listHistory: vi.fn(async () => []),
     listBackups: vi.fn(async () => []),
     listPagesRecords: vi.fn(async () => []),
@@ -13,11 +16,22 @@ vi.mock("./api", () => ({
 vi.mock("./i18n", () => ({ default: { t: (key: string) => key } }));
 
 import { api } from "./api";
-import type { PagesDeployRecord } from "./types";
+import type { ContainerRequest, PagesDeployRecord } from "./types";
 import { useApp } from "./store";
 
 // toast 内部用 window.setTimeout 自动消失；node 环境用桩即可。
 vi.stubGlobal("window", { setTimeout: () => 0 });
+
+function containerRequest(): ContainerRequest {
+  return {
+    serverId: "s1",
+    project: "lf-blog",
+    pauseSource: false,
+    includeVolumes: true,
+    includeImages: true,
+    target: null,
+  };
+}
 
 function pagesRecord(status: PagesDeployRecord["status"]): PagesDeployRecord {
   return {
@@ -44,6 +58,7 @@ beforeEach(() => {
     live: null,
     liveBackup: null,
     livePages: null,
+    liveContainer: null,
     history: [],
     backups: [],
     pagesRecords: [],
@@ -159,6 +174,36 @@ describe("store 长任务接线", () => {
 
     vi.mocked(api.listRepos).mockRejectedValueOnce(new Error("读取失败"));
     await useApp.getState().refreshRepos();
+    expect(useApp.getState().toasts).toHaveLength(1);
+  });
+
+  // 快照 / 恢复 / 按配置三条发起路径共用 store.ts 的 launchContainer，这里只测一条即覆盖三者。
+  it("按已保存配置发起容器备份：配置 id 原样提交，记录 id 回填到 liveContainer", async () => {
+    const id = await useApp.getState().startContainerConfigBackup("cfg-1");
+    expect(api.startContainerConfigBackup).toHaveBeenCalledWith("cfg-1");
+    expect(id).toBe("c3");
+    expect(useApp.getState().liveContainer).toEqual({
+      recordId: "c3",
+      lines: [],
+      progress: 0,
+      progressMessage: "",
+      status: "running",
+      record: null,
+    });
+  });
+
+  it("已有容器任务运行时拒绝再次发起", async () => {
+    useApp.setState({
+      liveContainer: { recordId: "c1", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+    });
+    await expect(useApp.getState().startContainerTransfer(containerRequest())).rejects.toThrow();
+    expect(api.startContainerTransfer).not.toHaveBeenCalled();
+  });
+
+  it("容器任务发起失败时收回占位，界面不会卡在运行中", async () => {
+    vi.mocked(api.startContainerTransfer).mockRejectedValueOnce(new Error("已有容器任务正在进行"));
+    await expect(useApp.getState().startContainerTransfer(containerRequest())).rejects.toThrow();
+    expect(useApp.getState().liveContainer).toBeNull();
     expect(useApp.getState().toasts).toHaveLength(1);
   });
 });
