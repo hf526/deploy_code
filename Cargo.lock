@@ -993,7 +993,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "clap",
  "deploy-core",
@@ -1004,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-code"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "chrono",
  "deploy-core",
@@ -1020,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.21.7",
