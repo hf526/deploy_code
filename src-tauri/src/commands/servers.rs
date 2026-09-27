@@ -1,4 +1,5 @@
 use deploy_core::models::{now_string, new_id, ServerConfig};
+use deploy_core::tunnel::{assert_local_ports_free, normalize_rules};
 use deploy_core::{CoreError, Result, Store};
 use tauri::State;
 
@@ -33,8 +34,10 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
     if server.created_at.trim().is_empty() {
         server.created_at = now_string();
     }
+    // 隧道规则与独立的隧道入口共用同一份校验，表单带过来的旧规则也照样规范化。
+    server.tunnels = normalize_rules(&server.tunnels)?;
 
-    let saved = state.store.mutate_config(|config| {
+    let (saved, servers) = state.store.mutate_config(|config| {
         // 名称是 CLI / 仓库默认服务器的查找键之一，重名会导致命中错误服务器。
         if config
             .servers
@@ -43,15 +46,22 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
         {
             return Err(CoreError::config(format!("服务器名称已存在: {}", server.name)));
         }
+        // 本机端口全局唯一：和别的服务器撞了就不能存。
+        assert_local_ports_free(&config.servers, &server.id, &server.tunnels)?;
         Store::upsert_server(config, server.clone())?;
-        Ok(server.clone())
+        Ok((server.clone(), config.servers.clone()))
     })?;
+    // 配置已落盘：按新规则对齐隧道（规则变了的重建监听，删掉的让出端口）。
+    state.tunnels.sync(&servers);
     Ok(saved)
 }
 
 #[tauri::command(async)]
 pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
-    state.store.mutate_config(|config| {
+    // 删的正是控制机：先按「卸载 agent」那一套把执行位收回本机。漏了这一步，留下的就是
+    // 「配置写着控制机、控制机已经不在了」——定时循环照旧让位，本机又撒手，那一晚两头都不跑。
+    state.store.forget_agent_server(&server_id)?;
+    let servers = state.store.mutate_config(|config| {
         config.servers.retain(|server| server.id != server_id);
         // 服务器已删除，其备份配置不再可用（备份记录保留作历史）。
         let removed: Vec<String> = config
@@ -79,8 +89,11 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
                 repo.default_server_id = None;
             }
         }
-        Ok(())
-    })
+        Ok(config.servers.clone())
+    })?;
+    // 这台机器的隧道监听必须马上收掉，否则本机端口会一直被已删除的服务器占着。
+    state.tunnels.sync(&servers);
+    Ok(())
 }
 
 /// 测试连接（可以直接测试未保存的表单配置）。

@@ -41,6 +41,15 @@ pub fn run() {
             scheduler::spawn(app.handle().clone());
             // 容器备份另起一个循环：一条任务动辄几十分钟，队列推进的节奏与数据库备份不同。
             scheduler::spawn_container(app.handle().clone());
+            // 隧道：打开软件就按已保存的规则把本机端口接到远端容器上。
+            // 放在运行时任务里做，因为建立监听要 tokio::spawn；连不上的服务器只记状态、不打扰启动。
+            let tunnels = app.state::<AppState>().tunnels.clone();
+            let tunnel_store = app.state::<AppState>().store.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Ok(config) = tunnel_store.load_config() {
+                    tunnels.sync(&config.servers);
+                }
+            });
             Ok(())
         })
         // 点窗口 X 只隐藏到托盘，程序继续运行；退出请使用托盘菜单。
@@ -52,8 +61,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::app::get_data_dir,
-            commands::app::get_app_version,
-            commands::app::get_settings,
+            commands::app::get_app_version,            commands::app::get_settings,
             commands::app::save_settings,
             commands::app::export_config,
             commands::app::preview_config_import,
@@ -61,6 +69,16 @@ pub fn run() {
             commands::app::reveal_path,
             commands::app::get_autostart,
             commands::app::set_autostart,
+            commands::agent::install_agent,
+            commands::agent::uninstall_agent,
+            commands::agent::agent_status,
+            commands::agent::agent_sync,
+            commands::agent::agent_logs,
+            commands::agent::agent_backup_records,
+            commands::agent::agent_container_records,
+            commands::agent::start_agent_backup,
+            commands::agent::start_agent_container,
+            commands::agent::restore_agent_container,
             commands::shutdown::get_shutdown_status,
             commands::shutdown::schedule_shutdown,
             commands::shutdown::cancel_shutdown,
@@ -109,6 +127,9 @@ pub fn run() {
             commands::servers::kick_server_session,
             commands::servers::enable_server_guard,
             commands::servers::disable_server_guard,
+            commands::tunnel::save_server_tunnels,
+            commands::tunnel::list_tunnel_status,
+            commands::tunnel::reconnect_tunnels,
             commands::nginx::list_nginx_containers,
             commands::nginx::list_nginx_configs,
             commands::nginx::read_nginx_config,
@@ -179,6 +200,8 @@ pub fn run() {
             }
             // 终止仍在运行的本地子进程（构建 / wrangler 等），避免残留。
             deploy_core::process::kill_all_children();
+            // 隧道是本机监听：立刻收掉，把端口让出来给下次启动或别的应用。
+            app_handle.state::<AppState>().tunnels.stop_all();
 
             if !EXIT_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
                 let state = app_handle.state::<AppState>();

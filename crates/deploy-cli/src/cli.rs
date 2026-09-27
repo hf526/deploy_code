@@ -58,6 +58,10 @@ pub enum Command {
     #[command(subcommand)]
     Pages(PagesCommand),
 
+    /// 控制机（备份 agent）：安装、下发配置、回读状态与记录、即时发起
+    #[command(subcommand)]
+    Agent(AgentCommand),
+
     /// 打印数据目录位置
     Where,
 }
@@ -585,4 +589,84 @@ pub struct ContainerRestoreArgs {
     /// 恢复后不自动启动服务
     #[arg(long)]
     pub no_start: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AgentCommand {
+    /// 指定哪台服务器是控制机（跑 agent 的那台）
+    Use {
+        /// 服务器 id / 名称 / host
+        server: String,
+    },
+    /// 显示控制机的 agent 状态（版本 / 时区 / 磁盘水位 / 定时摘要）
+    Status {
+        /// 临时指定服务器（默认用设置里那台）
+        #[arg(short, long)]
+        server: Option<String>,
+    },
+    /// 上传 agent 与 systemd unit 并起服务（重复执行即为升级）
+    Install {
+        /// 装到哪台（默认用设置里那台）
+        #[arg(short, long)]
+        server: Option<String>,
+    },
+    /// 停服务并删除 unit 与二进制（控制机上的备份包与记录保留）
+    Uninstall {
+        /// 从哪台卸载（默认用设置里那台）
+        #[arg(short, long)]
+        server: Option<String>,
+    },
+    /// 下发配置：其余服务器的 SSH 凭据 + 执行位为控制机的备份配置
+    Sync {
+        /// 临时指定服务器（默认用设置里那台）
+        #[arg(short, long)]
+        server: Option<String>,
+    },
+    /// 查看控制机上的执行记录
+    Records {
+        /// backup | container
+        #[arg(short, long, default_value = "backup")]
+        kind: String,
+        /// 最多取几条
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+    },
+    /// 查看 agent 自身的运行日志
+    Logs {
+        /// 取最后几行
+        #[arg(short, long, default_value_t = 50)]
+        lines: usize,
+    },
+    /// 把某条配置的执行位改成控制机（remote）或本机（local）
+    Location {
+        /// 配置 id / 名称
+        config: String,
+        /// remote | local
+        at: String,
+        /// backup | container
+        #[arg(short, long, default_value = "backup")]
+        kind: String,
+    },
+    /// 让控制机立刻跑一条配置（事件按行输出；--json 时是结构化事件流）
+    Run {
+        /// backup | container
+        #[arg(short, long, default_value = "backup")]
+        kind: String,
+        /// 配置 id / 名称
+        config: String,
+    },
+    /// 用控制机上已有的容器备份包恢复到另一台服务器
+    Restore {
+        /// 控制机上的容器备份记录 id
+        record: String,
+        /// 目标服务器 id / 名称 / host
+        #[arg(short, long)]
+        server: String,
+        /// 目标目录（留空沿用备份包内记录的目录）
+        #[arg(short, long)]
+        dir: Option<String>,
+        /// 恢复后不自动 compose up -d
+        #[arg(long)]
+        no_start: bool,
+    },
 }

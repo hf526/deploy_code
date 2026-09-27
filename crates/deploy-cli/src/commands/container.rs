@@ -201,7 +201,7 @@ pub(super) async fn container_command(cli: &Cli, command: &ContainerCommand) -> 
     }
 }
 
-fn lookup_server(store: &Store, key: &str) -> Result<deploy_core::ServerConfig> {
+pub(super) fn lookup_server(store: &Store, key: &str) -> Result<deploy_core::ServerConfig> {
     let config = store.load_config()?;
     Ok(Store::find_server(&config, key)?.clone())
 }

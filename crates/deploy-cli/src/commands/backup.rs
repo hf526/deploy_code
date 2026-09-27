@@ -62,6 +62,12 @@ pub(super) async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result
             // 与 GUI / 其他命令行进程互斥，避免并发执行破坏性操作。
             let _lock = claim_task_lock(&store, "backup")?;
             let loaded = store.load_config()?;
+            // 与 GUI 的 start_backup 同一个口径：执行位在控制机的配置本机不代跑，
+            // 要跑请用 `agent run`，让控制机自己出面。
+            if let Some(key) = config_key.as_deref().filter(|key| !key.trim().is_empty()) {
+                let saved = Store::find_backup_config(&loaded, key)?;
+                saved.run_location.assert_runs_here(&saved.name)?;
+            }
             let server_id =
                 resolve_backup_server(&loaded, server.as_deref(), config_key.as_deref())?;
             let engine = BackupEngine::new(store.clone());
@@ -215,6 +221,11 @@ pub(super) async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result
                         source,
                         target_id,
                         supabase_url,
+                        // 命令行改配置不该顺手把执行位改回来：沿用盘上那条，新配置按默认本机。
+                        run_location: existing
+                            .as_ref()
+                            .map(|item| item.run_location)
+                            .unwrap_or_default(),
                     };
                     if item.name.is_empty() {
                         return Err(CoreError::config("配置名称不能为空"));

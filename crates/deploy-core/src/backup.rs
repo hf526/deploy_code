@@ -1,17 +1,23 @@
 //! 数据库备份：把服务器上的 PostgreSQL schema 导出并全量恢复到远端 PostgreSQL。
 //!
-//! 流程全部在目标服务器上完成（不上传数据库数据到本机）：
+//! 导出与导入都在目标服务器上完成，本机默认只收一个大小数字：
 //! 1. 通过 `pg_dump`（docker exec 或本机命令）导出为压缩的 SQL 文件；
 //! 2. 校验压缩文件完整性；
 //! 3. 清空并重建目标 schema（默认 public，保留默认角色授权）；
 //! 4. `gunzip | psql` 全量导入目标数据库。
+//!
+//! `settings.db_bundle_keep` 非 0 时多一步：脚本导出后不删远端文件，由本机下载留档
+//! （`<数据目录>/backups/`），下载完再把远端那份删掉 —— 源服务器仍然不留副本，
+//! 所有备份包集中在执行机上，轮转和水位只需管一处。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::container::{safe_component, short_id};
+use crate::disk;
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, AppConfig, BackupEvent, BackupRecord, BackupRequest, BackupTarget, DbBackupSource,
@@ -30,6 +36,13 @@ impl Drop for TempScriptGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
     }
+}
+
+/// 一次备份的执行结果。
+pub struct BackupOutcome {
+    pub dump_size: u64,
+    /// 导出包在本机的路径；未开启留存时为空串。
+    pub bundle_path: String,
 }
 
 /// 备份事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
@@ -70,6 +83,7 @@ impl BackupEngine {
             error: None,
             log: String::new(),
             dump_size: 0,
+            bundle_path: String::new(),
             started_at: now_string(),
             finished_at: None,
             duration_ms: 0,
@@ -109,14 +123,18 @@ impl BackupEngine {
         let result = self.execute(&record, &source, &target, &mut logger).await;
 
         match result {
-            Ok(size) => {
-                record.dump_size = size;
+            Ok(outcome) => {
+                record.dump_size = outcome.dump_size;
+                record.bundle_path = outcome.bundle_path.clone();
                 record.status = DeployStatus::Success;
                 logger.success(format!(
                     "备份成功（{}，耗时 {}）",
-                    human_size(size),
+                    human_size(outcome.dump_size),
                     format_duration(started.elapsed().as_millis() as u64)
                 ));
+                if !outcome.bundle_path.is_empty() {
+                    logger.info(format!("导出包已留存: {}", outcome.bundle_path));
+                }
             }
             Err(err) => {
                 record.status = DeployStatus::Failed;
@@ -125,15 +143,37 @@ impl BackupEngine {
             }
         }
 
+        let settings = self
+            .store
+            .load_config()
+            .map(|config| config.settings)
+            .unwrap_or_default();
+        let limit = settings.backup_history_limit;
+
+        // 只有成功收尾才轮转：失败那次的半截包不该占住窗口，更不该顺手把上一晚的好包挤掉。
+        if record.status == DeployStatus::Success {
+            match self.prune_bundles(&record, settings.db_bundle_keep, limit) {
+                Ok(removed) => {
+                    for (name, _) in &removed {
+                        logger.info(format!("清理旧导出包 {name}"));
+                    }
+                    if !removed.is_empty() {
+                        let freed: u64 = removed.iter().map(|(_, size)| size).sum();
+                        logger.success(format!(
+                            "本轮清理 {} 个旧导出包，释放 {}",
+                            removed.len(),
+                            human_size(freed)
+                        ));
+                    }
+                }
+                Err(err) => logger.warn(format!("导出包轮转失败: {err}")),
+            }
+        }
+
         record.log = logger.joined();
         record.finished_at = Some(now_string());
         record.duration_ms = started.elapsed().as_millis() as u64;
 
-        let limit = self
-            .store
-            .load_config()
-            .map(|config| config.settings.backup_history_limit)
-            .unwrap_or(200); // 默认保留最近 200 条备份记录
         if let Err(err) = self.store.upsert_backup(&record, limit) {
             logger.error(format!("保存备份记录失败: {err}"));
             record.log = logger.joined();
@@ -153,10 +193,17 @@ impl BackupEngine {
         source: &DbBackupSource,
         target: &str,
         logger: &mut TaskLogger<BackupEvent>,
-    ) -> Result<u64> {
+    ) -> Result<BackupOutcome> {
         let config = self.store.load_config()?;
         let settings = config.settings.clone();
         let server = Store::find_server(&config, &record.server_id)?.clone();
+        // 留存开关：0 时脚本跑完照旧把远端导出删掉、本机什么都不留（改动前的行为）。
+        let keep = settings.db_bundle_keep > 0;
+        // 水位闸只拦控制机（见 `Store::agent_mode`）：笔电上少一道保险，总好过定时备份
+        // 突然因为系统盘只剩十几个 GB 而启动即失败。
+        if keep && self.store.agent_mode() {
+            disk::ensure_room(&self.store.db_bundle_dir(), 0)?;
+        }
 
         let source_label = if source.is_docker() {
             format!("docker 容器 {}", source.container)
@@ -178,13 +225,181 @@ impl BackupEngine {
         let client = SshClient::connect(&server, settings.connect_timeout_secs).await?;
         logger.success(format!("SSH 连接成功 ({})", client.label()));
 
-        let script = build_backup_script(record, source, &target_url, target_password.as_deref());
-        let remote = format!("/tmp/deploycode-backup-{}.sh", record.id);
-        let outcome = self
-            .run_script(&client, &remote, &script, timeout, logger, &record.id)
-            .await;
+        let script =
+            build_backup_script(record, source, &target_url, target_password.as_deref(), keep);
+        let remote_script = format!("/tmp/deploycode-backup-{}.sh", record.id);
+        let remote_dump = remote_dump_path(&record.id);
+        let result = async {
+            let size = self
+                .run_script(
+                    &client,
+                    &remote_script,
+                    &script,
+                    timeout,
+                    logger,
+                    &record.id,
+                )
+                .await?;
+            if !keep {
+                return Ok(BackupOutcome {
+                    dump_size: size,
+                    bundle_path: String::new(),
+                });
+            }
+            let bundle = self.bundle_path(record);
+            let pulled = self
+                .pull_dump(&client, &remote_dump, size, &bundle, logger)
+                .await;
+            // 无论下载成败都要删掉远端那份：源服务器不留备份，
+            // 下载失败也不能在 /tmp 落一个 GB 级文件等人来收（脚本的 trap 这次特意放过它）。
+            let _ = client
+                .exec_capture(
+                    &format!("rm -f {}", shell_quote(&remote_dump)),
+                    30,
+                )
+                .await;
+            let bundle = pulled?;
+            Ok(BackupOutcome {
+                dump_size: size,
+                bundle_path: bundle.to_string_lossy().into_owned(),
+            })
+        }
+        .await;
         client.disconnect().await;
-        outcome
+        result
+    }
+
+    /// 导出包落盘路径：`<数据目录>/backups/<服务器>-<库>-<schema>-<时间>-<记录前缀>.sql.gz`。
+    ///
+    /// 带上记录 id 前缀是为了同库同秒也不会撞名（手动补跑和定时撞在一起是可能的）。
+    fn bundle_path(&self, record: &BackupRecord) -> PathBuf {
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let name = format!(
+            "{}-{}-{}-{}-{}.sql.gz",
+            safe_component(&record.server_name),
+            safe_component(&record.database),
+            safe_component(&record.schema),
+            stamp,
+            short_id(&record.id)
+        );
+        self.store.db_bundle_dir().join(name)
+    }
+
+    /// 把远端导出包下载到本机：先下成 `.part`，大小对上才改名，避免留下一个看起来完整的半截包。
+    async fn pull_dump(
+        &self,
+        client: &SshClient,
+        remote: &str,
+        expected: u64,
+        bundle: &Path,
+        logger: &mut TaskLogger<BackupEvent>,
+    ) -> Result<PathBuf> {
+        if let Some(parent) = bundle.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| CoreError::io_path(parent, e))?;
+            // 导出完成才知道真实大小：按体积再查一次，别把盘写到爆（同样只拦控制机）。
+            if self.store.agent_mode() {
+                disk::ensure_room(parent, expected)?;
+            }
+        }
+        logger.command("正在下载导出包到本机 ...");
+        let part = crate::container::bundle_part_path(bundle);
+        let mut cleanup = crate::container::PartGuard::new(part.clone());
+        let outcome = async {
+            client
+                .download_file(remote, &part, &mut |received, total| {
+                    // 脚本收尾时进度条已经走到 100，这里把它压在 96..100 之间往上走，不往回跳。
+                    let percent = if total == 0 {
+                        99
+                    } else {
+                        96 + ((received * 4) / total).min(3) as u8
+                    };
+                    logger.progress(percent, &format!("下载中 {percent}%"));
+                })
+                .await?;
+            let local = std::fs::metadata(&part).map(|m| m.len()).unwrap_or(0);
+            if expected > 0 && local != expected {
+                return Err(CoreError::backup(format!(
+                    "导出包下载不完整（远端 {expected} 字节，本机 {local} 字节）"
+                )));
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // 导出包里是全库数据与建表语句，权限与含密码的脚本同级。
+                let _ = std::fs::set_permissions(&part, std::fs::Permissions::from_mode(0o600));
+            }
+            std::fs::rename(&part, bundle).map_err(|e| CoreError::io_path(bundle, e))?;
+            cleanup.disarm();
+            Ok::<(), CoreError>(())
+        }
+        .await;
+        // 半截的 .part 由 cleanup 在 Drop 里收掉：Err、被取消（future 被 drop）、panic 三种下场都盖到。
+        if let Err(err) = outcome {
+            return Err(err);
+        }
+        logger.success(format!("导出包已保存: {}", bundle.display()));
+        Ok(bundle.to_path_buf())
+    }
+
+    /// 导出包轮转：同一个（服务器 + 库 + schema）只保留最近 `keep` 个包，窗口之外的删文件
+    /// 并把那条记录的 `bundle_path` 抹空（界面按它判断有没有包可恢复，留着悬空路径只会点了才报错）。
+    ///
+    /// 与容器包的轮转同构，只是分组键换成库 + schema：一台机器上常常有十几个库，
+    /// 按服务器分组会让一个库的 nightly 备份把别的库的包挤掉。
+    fn prune_bundles(
+        &self,
+        record: &BackupRecord,
+        keep: usize,
+        limit: usize,
+    ) -> Result<Vec<(String, u64)>> {
+        if keep == 0 || record.server_id.is_empty() || record.database.is_empty() {
+            return Ok(Vec::new());
+        }
+        let bundle_dir = self.store.db_bundle_dir();
+        let mut records = self.store.load_backups()?;
+        let mut stale: Vec<usize> = records
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| {
+                item.id != record.id
+                    && item.server_id == record.server_id
+                    && item.database == record.database
+                    && item.schema == record.schema
+                    && !item.bundle_path.is_empty()
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if stale.len() < keep {
+            return Ok(Vec::new());
+        }
+        // started_at 是 "%Y-%m-%d %H:%M:%S"，字典序即时间序；本次任务不在候选里，
+        // 所以窗口按 keep - 1 算，刚落地的这个包永远不会被自己挤掉。
+        stale.sort_by(|a, b| records[*b].started_at.cmp(&records[*a].started_at));
+        let mut removed = Vec::new();
+        let mut touched: Vec<BackupRecord> = Vec::new();
+        for index in stale.into_iter().skip(keep - 1) {
+            let path = PathBuf::from(&records[index].bundle_path);
+            if path.parent().map(|parent| parent != bundle_dir).unwrap_or(true) {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if path.is_file() {
+                // 删不掉（被别的进程占着）就原样留着这条，下次任务收尾时再试。
+                if std::fs::remove_file(&path).is_err() {
+                    continue;
+                }
+                removed.push((name, records[index].dump_size));
+            }
+            records[index].bundle_path = String::new();
+            touched.push(records[index].clone());
+        }
+        for item in touched {
+            self.store.upsert_backup(&item, limit)?;
+        }
+        Ok(removed)
     }
 
     async fn run_script(
@@ -242,7 +457,7 @@ impl BackupEngine {
                 // 尽力重新连上并终止其进程组，避免用户重试时并发写同一 schema。
                 // kill_script 会删除 pidfile，这里一并删除脚本与导出文件。
                 let pidfile = format!("/tmp/deploycode-backup-{record_id}.pid");
-                let dump = format!("/tmp/deploycode-backup-{record_id}.sql.gz");
+                let dump = remote_dump_path(record_id);
                 let kill = format!(
                     "{}; rm -f {} {}",
                     crate::engine::kill_script(&pidfile),
@@ -840,8 +1055,16 @@ DB_NAME=__DB_NAME__
 DB_USER=__DB_USER__
 DB_PASSWORD=__DB_PASSWORD__
 SCHEMA=__SCHEMA__
+KEEP=__KEEP__
 
-cleanup() { rm -f "$OUT" "$PID_FILE" "$0"; }
+# KEEP=1 时把导出留给调用方下载（下载完由调用方删），否则照旧一走了之。
+cleanup() {
+  if [ "$KEEP" = "1" ]; then
+    rm -f "$PID_FILE" "$0"
+  else
+    rm -f "$OUT" "$PID_FILE" "$0"
+  fi
+}
 trap cleanup EXIT INT TERM
 echo $$ > "$PID_FILE"
 
@@ -930,16 +1153,23 @@ else
 fi
 "##;
 
+/// 远端导出文件路径。脚本模板里是字面量，这里拼一份给下载与善后用 —— 两处必须同规则。
+fn remote_dump_path(record_id: &str) -> String {
+    format!("/tmp/deploycode-backup-{record_id}.sql.gz")
+}
+
 fn build_backup_script(
     record: &BackupRecord,
     source: &DbBackupSource,
     target_url: &str,
     target_password: Option<&str>,
+    keep: bool,
 ) -> String {
     render_template(
         BACKUP_TEMPLATE,
         &[
             ("__ID__", record.id.clone()),
+            ("__KEEP__", if keep { "1" } else { "0" }.to_string()),
             ("__TARGET_URL__", shell_quote(target_url)),
             // 目标密码可选：配置中未设置时为空字符串（不影响执行）
             (
@@ -1057,6 +1287,7 @@ mod tests {
             error: None,
             log: String::new(),
             dump_size: 0,
+            bundle_path: String::new(),
             started_at: String::new(),
             finished_at: None,
             duration_ms: 0,
@@ -1194,6 +1425,7 @@ mod tests {
             &source(),
             "postgresql://u@h:5432/db",
             Some("secret"),
+            false,
         );
         assert!(script.contains("###STAGE:1"));
         assert!(script.contains("###STAGE:4"));
@@ -1232,12 +1464,94 @@ mod tests {
     }
 
     #[test]
+    fn retention_flag_decides_whether_the_dump_survives_the_script() {
+        let url = "postgresql://u@h:5432/db";
+        let keep = build_backup_script(&record(), &source(), url, None, true);
+        assert!(keep.contains("KEEP=1"));
+        // 留存模式下 cleanup 放过 $OUT，本机才有东西可下载；pidfile 与脚本仍旧照删。
+        assert!(keep.contains("if [ \"$KEEP\" = \"1\" ]"));
+        assert!(keep.contains("rm -f \"$PID_FILE\" \"$0\""));
+
+        let discard = build_backup_script(&record(), &source(), url, None, false);
+        assert!(discard.contains("KEEP=0"));
+        assert!(discard.contains("rm -f \"$OUT\" \"$PID_FILE\" \"$0\""));
+    }
+
+    /// 导出包轮转：同一个（服务器 + 库 + schema）只留最近 keep 个，多出来的删文件并把记录里的
+    /// `bundle_path` 抹空。本次任务自己不在候选里，所以窗口按 keep - 1 算。
+    #[test]
+    fn prune_bundles_keeps_the_newest_and_blanks_the_rest() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-db-prune-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(Store::new(&dir));
+        let engine = BackupEngine::new(store.clone());
+        let bundles = store.db_bundle_dir();
+        std::fs::create_dir_all(&bundles).unwrap();
+        // 故意放在备份目录之外：轮转不许删用户自己挪走的包。
+        let elsewhere = dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+
+        let stashed = |dir: &Path, name: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"gz").unwrap();
+            path
+        };
+        let record_of = |id: &str, database: &str, started_at: &str, path: &Path| {
+            let mut item = record();
+            item.id = id.to_string();
+            item.database = database.to_string();
+            item.status = DeployStatus::Success;
+            item.started_at = started_at.to_string();
+            item.bundle_path = path.to_string_lossy().into_owned();
+            item
+        };
+
+        let oldest = stashed(&bundles, "oldest.sql.gz");
+        let middle = stashed(&bundles, "middle.sql.gz");
+        let moved = stashed(&elsewhere, "moved.sql.gz");
+        let other_db = stashed(&bundles, "other-db.sql.gz");
+        store.upsert_backup(&record_of("r1", "app", "2026-01-01 03:00:00", &oldest), 50).unwrap();
+        store.upsert_backup(&record_of("r2", "app", "2026-01-02 03:00:00", &middle), 50).unwrap();
+        store.upsert_backup(&record_of("r3", "app", "2026-01-03 03:00:00", &moved), 50).unwrap();
+        store.upsert_backup(&record_of("r4", "blog", "2026-01-04 03:00:00", &other_db), 50).unwrap();
+
+        let current_file = stashed(&bundles, "current.sql.gz");
+        let current = record_of("r5", "app", "2026-01-05 03:00:00", &current_file);
+        let removed = engine.prune_bundles(&current, 2, 50).unwrap();
+
+        let names: Vec<&str> = removed.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["middle.sql.gz", "oldest.sql.gz"]);
+        assert!(!oldest.exists() && !middle.exists());
+        // 留下的那个是「最近的候选 + 本次」，别的库完全不受影响。
+        assert!(moved.exists() && other_db.exists() && current_file.exists());
+
+        let records = store.load_backups().unwrap();
+        let path_of = |id: &str| {
+            records
+                .iter()
+                .find(|item| item.id == id)
+                .map(|item| item.bundle_path.clone())
+                .unwrap_or_default()
+        };
+        assert!(path_of("r1").is_empty() && path_of("r2").is_empty());
+        assert!(path_of("r3").ends_with("moved.sql.gz"), "目录外的包不该被抹空");
+        assert!(path_of("r4").ends_with("other-db.sql.gz"));
+    }
+
+    #[test]
     fn template_values_with_reset_sql_placeholder_are_not_rescanned() {
         let mut src = source();
         src.database = "x__RESET_SQL__y$(touch /tmp/pwned)".to_string();
         src.schema = "s__RESET_SQL__$(id)".to_string();
-        let script =
-            build_backup_script(&record(), &src, "postgresql://u@h:5432/db", Some("secret"));
+        let script = build_backup_script(
+            &record(),
+            &src,
+            "postgresql://u@h:5432/db",
+            Some("secret"),
+            false,
+        );
         // 值整体留在单引号内，内部的 __RESET_SQL__ 不会被二次替换成裸 SQL。
         assert!(
             script.contains("DB_NAME='x__RESET_SQL__y$(touch /tmp/pwned)'"),
@@ -1265,8 +1579,13 @@ mod tests {
 
     #[test]
     fn import_filters_dump_created_schema_statement() {
-        let script =
-            build_backup_script(&record(), &source(), "postgresql://u@h:5432/db", Some("secret"));
+        let script = build_backup_script(
+            &record(),
+            &source(),
+            "postgresql://u@h:5432/db",
+            Some("secret"),
+            false,
+        );
         // 导入时必须过滤 pg_dump 自带的 CREATE SCHEMA，否则目标 schema 已存在会中断导入。
         assert!(
             script.contains("gunzip -c \"$OUT\" | awk"),

@@ -155,7 +155,11 @@ pub fn start_container_config_backup(
 ) -> Result<String> {
     let request = {
         let config = state.store.load_config()?;
-        Store::find_container_config(&config, &config_id)?.request()
+        let saved = Store::find_container_config(&config, &config_id)?;
+        // 与定时循环同一个口径：执行位在控制机的配置本机不代跑，
+        // 界面的「立即备份」会把它交给 start_agent_container。
+        saved.run_location.assert_runs_here(&saved.name)?;
+        saved.request()
     };
     start_container_transfer(app, state, request)
 }
@@ -241,7 +245,13 @@ pub async fn cancel_container(
             let _ = state.store.upsert_container(&record, limit);
         }
         let _ = app.emit("container://event", ContainerEvent::Finished { record });
+        return Ok("已取消".to_string());
     }
+    // 本机没有这条记录 = 这是在控制机上跑的那类任务：记录与收尾都归它，
+    // 但界面的 live 状态必须收敛，否则进度条永远停在「进行中」。
+    let _ = app.emit("container://event", ContainerEvent::Finished {
+        record: ContainerRecord::stopped(&record_id),
+    });
     Ok("已取消".to_string())
 }
 

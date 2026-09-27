@@ -289,6 +289,8 @@ export default function ContainersPage() {
           ? { serverId: targetServerId, targetDir: targetDir.trim(), startServices }
           : null,
         createdAt: "",
+        // 新存下来的配置默认本机执行；要交给控制机，在弹窗里显式改执行位。
+        runLocation: "local",
       },
     });
   }

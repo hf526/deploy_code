@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use deploy_core::store::TaskLock;
-use deploy_core::{DeployEngine, Result, Store};
+use deploy_core::{DeployEngine, Result, Store, TunnelManager};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -274,6 +274,8 @@ pub struct AppState {
     pub pending_container_cleanups: Mutex<Vec<(String, ActiveContainer)>>,
     /// 排定中的关机计划（倒计时阶段）；到点由调度器取出并下发系统关机请求。
     pending_shutdown: Mutex<Option<PendingShutdown>>,
+    /// 本机 SSH 隧道：每台启用规则的服务器一个常驻转发任务。
+    pub tunnels: Arc<TunnelManager>,
     /// 部署抢占标记：在 prepare 之前原子占位，避免两个并发命令同时通过检查。
     deploy_claim: AtomicBool,
     /// 备份抢占标记：同一时间只允许一个数据库备份。
@@ -307,6 +309,7 @@ impl AppState {
             pending_cleanups: Mutex::new(Vec::new()),
             pending_container_cleanups: Mutex::new(Vec::new()),
             pending_shutdown: Mutex::new(None),
+            tunnels: Arc::new(TunnelManager::new()),
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),

@@ -20,6 +20,7 @@ import type {
 } from "./lib/types";
 
 // 按页面分包：启动只加载首屏，其余页面首次访问时按需加载。
+const AgentPage = lazy(() => import("./pages/AgentPage"));
 const BackupsPage = lazy(() => import("./pages/BackupsPage"));
 const ContainersPage = lazy(() => import("./pages/ContainersPage"));
 const CronJobsPage = lazy(() => import("./pages/CronJobsPage"));
@@ -69,6 +70,7 @@ function TabsAndRoutes() {
             <Route path="/containers" element={<ContainersPage />} />
             <Route path="/cron-jobs" element={<CronJobsPage />} />
             <Route path="/backups" element={<BackupsPage />} />
+            <Route path="/agent" element={<AgentPage />} />
             <Route path="/history" element={<HistoryPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/repos" replace />} />
@@ -119,6 +121,10 @@ export default function App() {
         break;
       case "containerFailed":
         toast("error", i18n.t("containers.schedule.failed", { error: notice.message ?? "" }));
+        break;
+      // 让位给控制机是正常收尾，不是失败：以前它落到 default 分支，弹成红色「定时备份失败」。
+      case "remoteSkipped":
+        toast("info", i18n.t("backup.schedule.remoteSkipped", { name: notice.message ?? "" }));
         break;
       case "shutdownFired":
         toast("info", i18n.t("settings.shutdown.fired"));

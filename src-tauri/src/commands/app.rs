@@ -17,7 +17,11 @@ pub fn preview_config_import(state: State<AppState>, json_str: String) -> Result
 
 #[tauri::command(async)]
 pub fn import_config(state: State<AppState>, json_str: String) -> Result<ImportPreview> {
-    state.store.import_config(&json_str)
+    let preview = state.store.import_config(&json_str)?;
+    // 导入会整体替换服务器表，隧道得跟着对齐，否则旧规则的监听会一直占着本机端口。
+    let config = state.store.load_config()?;
+    state.tunnels.sync(&config.servers);
+    Ok(preview)
 }
 
 #[cfg(target_os = "windows")]
@@ -298,6 +302,7 @@ mod tests {
             include_images: true,
             target: None,
             created_at: String::new(),
+            run_location: deploy_core::RunLocation::Local,
         }
     }
 

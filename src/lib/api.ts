@@ -1,6 +1,8 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  AgentStatus,
+  AgentSyncReport,
   BackupConfig,
   BackupRecord,
   BackupRequest,
@@ -42,6 +44,8 @@ import type {
   ServerConfig,
   Settings,
   ShutdownStatus,
+  ServerTunnelStatus,
+  TunnelRule,
 } from "./types";
 
 /** 后端 Tauri 命令的类型化封装。 */
@@ -144,6 +148,12 @@ export const api = {
     invoke<string>("enable_server_guard", { server, threshold, windowMins }),
   disableServerGuard: (server: ServerConfig) =>
     invoke<string>("disable_server_guard", { server }),
+
+  // SSH 隧道（本机端口 -> 服务器上的地址）
+  saveServerTunnels: (serverId: string, tunnels: TunnelRule[]) =>
+    invoke<ServerConfig>("save_server_tunnels", { serverId, tunnels }),
+  listTunnelStatus: () => invoke<ServerTunnelStatus[]>("list_tunnel_status"),
+  reconnectTunnels: (serverId: string) => invoke<void>("reconnect_tunnels", { serverId }),
 
   // Nginx
   listNginxContainers: (serverId: string) =>
@@ -258,4 +268,28 @@ export const api = {
   deleteContainerRecord: (recordId: string) =>
     invoke<boolean>("delete_container_record", { recordId }),
   clearContainerRecords: () => invoke<void>("clear_container_records"),
+  /** 控制机（备份 agent）：安装 / 下发 / 状态 / 日志 / 回读 / 即时发起。 */
+  installAgent: (serverId: string) => invoke<AgentStatus>("install_agent", { serverId }),
+  uninstallAgent: (serverId: string) => invoke<string>("uninstall_agent", { serverId }),
+  agentStatus: (serverId = "") => invoke<AgentStatus>("agent_status", { serverId }),
+  agentSync: (serverId = "") => invoke<AgentSyncReport>("agent_sync", { serverId }),
+  agentLogs: (lines = 200) => invoke<string[]>("agent_logs", { lines }),
+  agentBackupRecords: (limit = 50) => invoke<BackupRecord[]>("agent_backup_records", { limit }),
+  agentContainerRecords: (limit = 50) =>
+    invoke<ContainerRecord[]>("agent_container_records", { limit }),
+  /** 让控制机立刻跑一条数据库备份配置；命令会等任务结束，进度走 backup://event。 */
+  startAgentBackup: (configId: string) => invoke<string>("start_agent_backup", { configId }),
+  startAgentContainer: (configId: string) => invoke<string>("start_agent_container", { configId }),
+  restoreAgentContainer: (
+    recordId: string,
+    targetServerId: string,
+    targetDir: string,
+    startServices: boolean,
+  ) =>
+    invoke<string>("restore_agent_container", {
+      recordId,
+      targetServerId,
+      targetDir,
+      startServices,
+    }),
 };

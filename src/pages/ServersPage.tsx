@@ -1,6 +1,7 @@
 import { useRef, useState } from "react";
 import {
   Ban,
+  Cable,
   FolderOpen,
   KeyRound,
   Loader2,
@@ -32,7 +33,16 @@ import {
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
 import { useApp } from "../lib/store";
-import type { OnlineSession, SecurityReport, ServerConfig, SecuritySetting } from "../lib/types";
+import { activeTunnelCount, findTunnelStatus, tunnelTone } from "../lib/tunnel";
+import { useAutoRefresh } from "../lib/useAutoRefresh";
+import { TunnelModal } from "./servers/TunnelModal";
+import type {
+  OnlineSession,
+  SecurityReport,
+  ServerConfig,
+  ServerTunnelStatus,
+  SecuritySetting,
+} from "../lib/types";
 import { authSummary, newServerTemplate } from "../lib/utils";
 
 function firewallLabel(firewall: string): string {
@@ -61,6 +71,8 @@ export default function ServersPage() {
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ServerConfig | null>(null);
   const [removing, setRemoving] = useState<ServerConfig | null>(null);
+  const [tunneling, setTunneling] = useState<ServerConfig | null>(null);
+  const [tunnelStatuses, setTunnelStatuses] = useState<ServerTunnelStatus[]>([]);
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
 
@@ -74,6 +86,14 @@ export default function ServersPage() {
   const [guardThreshold, setGuardThreshold] = useState(5);
   const [guardWindowMins, setGuardWindowMins] = useState(10);
   const [guardBusy, setGuardBusy] = useState(false);
+
+  // 隧道状态只是读内存里的登记表（不含 SSH 往返），所以进页面 / 窗口聚焦时补一次即可，不轮询。
+  const { refresh: refreshTunnels } = useAutoRefresh(
+    async () => {
+      setTunnelStatuses(await api.listTunnelStatus());
+    },
+    { minGapMs: 3000 },
+  );
 
   // 扫描请求序号 + 当前打开的服务器：切换/关闭后，旧服务器操作触发的重扫直接丢弃，
   // 避免把 A 的报告显示到 B 上，或对错误的服务器执行拉黑/解除。
@@ -201,6 +221,8 @@ export default function ServersPage() {
       setRemoving(null);
       // 后端会一并删除该服务器的备份配置并清理定时备份引用，同步刷新避免残留悬空配置 / 选择。
       await Promise.all([refreshServers(), refreshBackupConfigs()]);
+      // 删掉的那台会释放它的本机端口，徽章与状态要跟着收。
+      void refreshTunnels(true);
       void api
         .getSettings()
         .then(setSettings)
@@ -249,7 +271,9 @@ export default function ServersPage() {
       ) : (
         <Card className="overflow-hidden">
           <ul className="divide-y divide-line">
-            {servers.map((server) => (
+            {servers.map((server) => {
+              const enabledTunnels = activeTunnelCount(server.tunnels);
+              return (
               <li
                 key={server.id}
                 className="group flex items-center gap-4 px-4 py-3 transition-colors hover:bg-hover"
@@ -267,6 +291,11 @@ export default function ServersPage() {
                       {server.name}
                     </p>
                     <Badge kind="gray">{authSummary(server)}</Badge>
+                    {enabledTunnels > 0 && (
+                      <Badge kind={tunnelTone(findTunnelStatus(tunnelStatuses, server.id), enabledTunnels)}>
+                        {t("servers.tunnelBadge", { count: enabledTunnels })}
+                      </Badge>
+                    )}
                   </div>
                   <p className="mt-0.5 truncate font-mono text-[11px] text-ink-dim">
                     {server.username}@{server.host}:{server.port}
@@ -294,6 +323,15 @@ export default function ServersPage() {
                   <Button
                     size="sm"
                     variant="secondary"
+                    title={t("servers.tunnelButton")}
+                    icon={<Cable className="size-3.5" />}
+                    onClick={() => setTunneling(server)}
+                  >
+                    {t("servers.tunnelButton")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
                     title={t("servers.securityTitle")}
                     icon={<ShieldCheck className="size-3.5" />}
                     onClick={() => openSecurity(server)}
@@ -313,7 +351,8 @@ export default function ServersPage() {
                   />
                 </div>
               </li>
-            ))}
+              );
+            })}
           </ul>
         </Card>
       )}
@@ -325,8 +364,23 @@ export default function ServersPage() {
         onSaved={() => {
           setFormOpen(false);
           void refreshServers();
+          // 服务器表单也能带隧道规则，保存后本机端口分配可能就变了。
+          void refreshTunnels(true);
         }}
       />
+
+      {tunneling && (
+        <TunnelModal
+          open
+          server={tunneling}
+          onClose={() => setTunneling(null)}
+          onSaved={(saved) => {
+            setTunneling(saved);
+            void refreshServers();
+            void refreshTunnels(true);
+          }}
+        />
+      )}
 
       <Modal
         open={!!securing}

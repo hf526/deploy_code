@@ -32,6 +32,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::engine::kill_script;
+use crate::disk;
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, new_id, ContainerEvent, ContainerRecord, ContainerRecordKind, ContainerRequest,
@@ -499,6 +500,12 @@ impl ContainerEngine {
         let timeout = settings.container_timeout_secs.max(300);
         match job {
             ContainerJob::Snapshot(plan) => {
+                // 先查盘再连服务器：一次容器快照要几十分钟，跑到最后才发现盘满是最贵的失败。
+                // 只拦控制机（见 `Store::agent_mode`）：笔电的系统盘常常就剩十几 GB，
+                // 拿同一把尺子量会让原本能跑的定时备份升级后启动即失败。
+                if self.store.agent_mode() {
+                    disk::ensure_room(&self.bundle_dir(), 0)?;
+                }
                 logger.info(format!(
                     "来源: {} ({}@{})",
                     plan.source.name, plan.source.username, plan.source.host
@@ -586,6 +593,7 @@ impl ContainerEngine {
         }
 
         let part = bundle_part_path(&plan.bundle);
+        let mut cleanup = PartGuard::new(part.clone());
         let outcome = async {
             put_script(client, &script_path, &script).await?;
             let size = run_script(
@@ -598,6 +606,10 @@ impl ContainerEngine {
             )
             .await?;
 
+            // 打包完成才知道真实大小：按体积再查一次，别把盘写到爆。
+            if self.store.agent_mode() {
+                disk::ensure_room(&self.bundle_dir(), size)?;
+            }
             logger.progress(pull_span.0, "正在下载备份包到本机 ...");
             let mut last = u8::MAX;
             client
@@ -623,6 +635,7 @@ impl ContainerEngine {
             }
             std::fs::rename(&part, &plan.bundle)
                 .map_err(|e| CoreError::io_path(&plan.bundle, e))?;
+            cleanup.disarm();
             Ok::<(), CoreError>(())
         }
         .await;
@@ -639,8 +652,8 @@ impl ContainerEngine {
                 60,
             )
             .await;
+        // 半截的 .part 由 cleanup 在 Drop 里收掉：Err、被取消（future 被 drop）、panic 三种下场都盖到。
         if let Err(err) = outcome {
-            let _ = std::fs::remove_file(&part);
             return Err(err);
         }
         let size = std::fs::metadata(&plan.bundle).map(|m| m.len()).unwrap_or(0);
@@ -986,6 +999,35 @@ pub(crate) fn bundle_part_path(bundle: &Path) -> PathBuf {
         .and_then(|name| name.to_str())
         .unwrap_or("container.tar");
     bundle.with_file_name(format!("{name}.part"))
+}
+
+/// `.part` 的收尾守卫：半途而废的下载文件必须跟着任务一起消失。
+///
+/// 只在 `Err` 分支里手动删不够 —— 取消是直接把整条 future drop 掉，那一段代码根本轮不到执行，
+/// 半截包就一直堆在磁盘水位闸要保的那块盘上。改名到位之后 `disarm`。
+#[derive(Debug)]
+pub(crate) struct PartGuard {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl PartGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// 正式包已经改名出来了，这个 `.part` 路径不再代表半成品。
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub(crate) fn short_id(record_id: &str) -> String {
@@ -1400,6 +1442,30 @@ DEPLOYCODE_LIST"));
             ..target
         };
         assert_eq!(target_dir_or(&bundle, &target).unwrap(), "/srv/other");
+    }
+
+    /// 被取消是整条 future 被 drop，`Err` 分支那句删不到 —— 只能靠 Drop 顶上去。
+    #[test]
+    fn part_guard_removes_the_partial_when_dropped() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-container-part-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let part = dir.join("bundle.tar.part");
+
+        std::fs::write(&part, b"partial").unwrap();
+        drop(PartGuard::new(part.clone()));
+        assert!(!part.exists(), "放弃的任务不该在盘上留半截包");
+
+        // 改名到位之后不能再回头删：那时这个路径已经是正式备份包。
+        std::fs::write(&part, b"complete").unwrap();
+        let mut guard = PartGuard::new(part.clone());
+        guard.disarm();
+        drop(guard);
+        assert!(part.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

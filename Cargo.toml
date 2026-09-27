@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/deploy-core", "crates/deploy-cli", "src-tauri"]
+members = ["crates/deploy-core", "crates/deploy-cli", "crates/deploy-agent", "src-tauri"]
 
 [workspace.package]
 version = "0.1.2"

@@ -1,4 +1,4 @@
-import { Container, Database, FolderOpen, GitBranch, History, Network, Rocket, Server, Settings, Webhook } from "lucide-react";
+import { Container, Database, FolderOpen, GitBranch, History, Network, Rocket, Server, ServerCog, Settings, Webhook } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink, useNavigate } from "react-router-dom";
 
@@ -16,6 +16,7 @@ const NAV_ITEMS = [
   { to: "/containers", labelKey: "nav.containers", icon: Container },
   { to: "/cron-jobs", labelKey: "nav.cronJobs", icon: Webhook },
   { to: "/backups", labelKey: "nav.backups", icon: Database },
+  { to: "/agent", labelKey: "nav.agent", icon: ServerCog },
   { to: "/history", labelKey: "nav.history", icon: History },
   { to: "/settings", labelKey: "nav.settings", icon: Settings },
 ];

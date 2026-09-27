@@ -1,10 +1,11 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use chrono::{Local, NaiveTime, TimeZone};
-use deploy_core::models::{BackupRequest, Settings};
+use chrono::Local;
+use deploy_core::models::{AppConfig, BackupRequest, Settings};
+use deploy_core::schedule::{format_date, has_crossed, parse_date, today_at, window_expired};
 use deploy_core::shutdown::{request_shutdown, CANCEL_WINDOW_SECS, OS_GRACE_SECS};
-use deploy_core::CoreError;
+use deploy_core::{CoreError, Store};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -17,8 +18,6 @@ use crate::state::{AppState, PendingShutdown, ShutdownSource};
 const CHECK_INTERVAL: Duration = Duration::from_secs(20);
 /// 排定关机后的轮询间隔：20 秒的粒度会让关机点最多晚 20 秒，倒计时也会跳格。
 const COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
-/// 到点后若因已有任务占用而无法启动，最多重试的时长。
-const RETRY_WINDOW_MINUTES: i64 = 10;
 
 /// 定时任务通知（前端转成 toast）。
 #[derive(Clone, Serialize)]
@@ -34,13 +33,20 @@ struct SchedulerNotice {
 /// 只在软件运行时生效；应用启动前已错过的时间点不补跑。
 pub fn spawn(app: AppHandle) {
     tauri::async_runtime::spawn(async move {
+        // 启动时先把落盘的调度日期认回来：否则每次重启软件都会让当天的定时备份再触发一次。
+        let stored = app
+            .state::<AppState>()
+            .store
+            .load_config()
+            .map(|config| config.settings)
+            .unwrap_or_default();
         let mut last_tick = Local::now();
         // 已到点但因其它备份占用未能启动：记录「发现时刻」与所属调度日期，window 内继续重试。
         let mut pending: Option<(chrono::DateTime<Local>, chrono::NaiveDate)> = None;
-        // 已成功触发的调度日期（不是完成日期）：防止时钟回拨后同一个调度日重复执行。
-        let mut last_run: Option<chrono::NaiveDate> = None;
+        // 已发起过的调度日期（不是完成日期）：防止时钟回拨或重启后同一个调度日重复执行。
+        let mut last_run = parse_date(&stored.scheduled_backup_last_run);
         // 已排过关机的调度日期：同一天只排一次，用户取消后当天也不再排。
-        let mut shutdown_last_run: Option<chrono::NaiveDate> = None;
+        let mut shutdown_last_run = parse_date(&stored.scheduled_shutdown_last_run);
 
         loop {
             tokio::time::sleep(tick_interval(&app)).await;
@@ -62,32 +68,20 @@ pub fn spawn(app: AppHandle) {
                 last_tick = now;
                 continue;
             }
-            let Some(time) = parse_hhmm(&settings.scheduled_backup_time) else {
+            let Some(scheduled) = today_at(&settings.scheduled_backup_time, &now) else {
                 pending = None;
-                last_tick = now;
-                continue;
-            };
-            // 夏令时回拨会产生两个相同的本地时间：取较早者触发，last_run 保证当天只执行一次。
-            let Some(scheduled) = Local
-                .from_local_datetime(&now.date_naive().and_time(time))
-                .earliest()
-            else {
                 last_tick = now;
                 continue;
             };
 
             // 只在「本次运行期间」跨过时间点时触发一次；休眠/时钟前跳后跨过的点按唤醒时刻补跑。
-            if pending.is_none()
-                && scheduled > last_tick
-                && scheduled <= now
-                && last_run != Some(scheduled.date_naive())
-            {
+            if pending.is_none() && has_crossed(scheduled, last_tick, now, last_run) {
                 pending = Some((now, scheduled.date_naive()));
             }
             last_tick = now;
 
             let Some((triggered_at, run_date)) = pending else { continue };
-            if now - triggered_at > chrono::Duration::minutes(RETRY_WINDOW_MINUTES) {
+            if window_expired(triggered_at, now) {
                 pending = None;
                 emit_notice(
                     &app,
@@ -107,6 +101,32 @@ pub fn spawn(app: AppHandle) {
                 continue;
             };
 
+            // 执行位是「控制机」的配置由 agent 到点执行：本机再跑一遍就是两次导出、两份包，
+            // 而且控制机上那份的节奏会和本机这份混在一起。
+            // 但只有「上次成功下发确实把这条带过去了」才算交给它 —— 光看执行位就撒手，
+            // 用户改了名字没重新下发（或压根没装 agent）的那一晚就两头都不跑。
+            match backup_owner(&app.state::<AppState>().store, &config, &config_id) {
+                BackupOwner::Agent(name) => {
+                    pending = None;
+                    emit_notice(&app, "remoteSkipped", Some(name));
+                    continue;
+                }
+                BackupOwner::Unsynced(name) => {
+                    // 本机不代跑：包会落在本机，而用户以为在控制机上，恢复和迁移都找不到东西。
+                    // 报失败，让他去点「下发配置」。
+                    pending = None;
+                    emit_notice(
+                        &app,
+                        "failed",
+                        Some(format!(
+                            "「{name}」的执行位是控制机，但控制机上没有这条配置（未安装或未下发），请到控制机页面点「下发配置」"
+                        )),
+                    );
+                    continue;
+                }
+                BackupOwner::Local => {}
+            }
+
             let request = BackupRequest {
                 server_id: String::new(),
                 backup_config_id: Some(config_id),
@@ -120,6 +140,7 @@ pub fn spawn(app: AppHandle) {
                 Ok(_) => {
                     pending = None;
                     last_run = Some(run_date);
+                    remember_schedule_run(&app, run_date, ScheduleKind::Backup);
                     emit_notice(&app, "started", None);
                 }
                 Err(err) => {
@@ -158,8 +179,13 @@ pub fn spawn_container(app: AppHandle) {
         let mut queue: VecDeque<String> = VecDeque::new();
         // 本轮触发时刻：队列排不空（名额一直被占）时按它判断是否放弃。
         let mut triggered_at: Option<chrono::DateTime<Local>> = None;
-        // 已成功触发的调度日期：防止时钟回拨后同一个调度日重复执行。
-        let mut last_run: Option<chrono::NaiveDate> = None;
+        // 已排队的调度日期：与数据库备份一样落盘，重启后不重复排队的也不漏排。
+        let mut last_run = app
+            .state::<AppState>()
+            .store
+            .load_config()
+            .map(|config| parse_date(&config.settings.scheduled_container_last_run))
+            .unwrap_or(None);
 
         loop {
             tokio::time::sleep(CHECK_INTERVAL).await;
@@ -171,27 +197,41 @@ pub fn spawn_container(app: AppHandle) {
             let settings = &config.settings;
 
             if settings.scheduled_container_enabled {
-                if let Some(scheduled) = next_schedule(settings, &now) {
-                    let crossed = scheduled > last_tick
-                        && scheduled <= now
-                        && last_run != Some(scheduled.date_naive());
-                    if crossed {
+                if let Some(scheduled) = today_at(&settings.scheduled_container_time, &now) {
+                    if has_crossed(scheduled, last_tick, now, last_run) {
                         // 先记日期：即使这一轮一个都没跑成，也不该在同一个调度日重复排队。
                         last_run = Some(scheduled.date_naive());
+                        remember_schedule_run(&app, scheduled.date_naive(), ScheduleKind::Container);
                         triggered_at = Some(now);
-                        // 只保留仍然存在的配置：被删掉的条目静默剔除，不让它把整晚的队列带崩。
-                        queue = settings
-                            .scheduled_container_config_ids
-                            .iter()
-                            .filter(|id| {
-                                config
-                                    .container_configs
-                                    .iter()
-                                    .any(|item| item.id == **id)
-                            })
-                            .cloned()
-                            .collect();
-                        if queue.is_empty() {
+                        // 只保留仍然存在、且今晚确实由本机负责的配置；真正交给控制机的才静默剔除。
+                        let (local, handed, unsynced) = split_container_queue(
+                            &app.state::<AppState>().store,
+                            &config,
+                            &settings.scheduled_container_config_ids,
+                        );
+                        queue = local;
+                        if handed > 0 {
+                            // 带单位：这条 message 会被拼进「已交给控制机执行：…」，
+                            // 只发一个数字过去，界面读起来像坏掉的输出。
+                            emit_notice(
+                                &app,
+                                "remoteSkipped",
+                                Some(format!("{handed} 条容器备份")),
+                            );
+                        }
+                        if !unsynced.is_empty() {
+                            emit_notice(
+                                &app,
+                                "containerFailed",
+                                Some(format!(
+                                    "{} 条容器备份的执行位是控制机，但控制机上没有它们（未安装或未下发），本次不执行",
+                                    unsynced.len()
+                                )),
+                            );
+                        }
+                        if queue.is_empty() && handed == 0 && unsynced.is_empty() {
+                            // 只在真的没人可跑时说「未选择配置」。上面两条分支已经解释过原因时
+                            // 再补一句「没配置」是错的，用户会去翻勾选框而不去点下发。
                             emit_notice(&app, "containerNoConfig", None);
                         }
                     }
@@ -210,7 +250,7 @@ pub fn spawn_container(app: AppHandle) {
             // 重试窗口只约束「一次都还没跑成」的等待：跑成第一条之后，剩下的就该等前一条
             // 自然结束。一条容器任务本身可能跑几十分钟，不能被这个窗口掐掉。
             if let Some(started) = triggered_at {
-                if now - started > chrono::Duration::minutes(RETRY_WINDOW_MINUTES) {
+                if window_expired(started, now) {
                     let skipped = queue.len();
                     queue.clear();
                     triggered_at = None;
@@ -249,15 +289,6 @@ pub fn spawn_container(app: AppHandle) {
             }
         }
     });
-}
-
-/// 今天那个 HH:MM 对应的本地时刻；时间写错时返回 None（与数据库备份同样的宽容度）。
-fn next_schedule(settings: &Settings, now: &chrono::DateTime<Local>) -> Option<chrono::DateTime<Local>> {
-    let time = parse_hhmm(&settings.scheduled_container_time)?;
-    // 夏令时回拨会产生两个相同的本地时间：取较早者触发，last_run 保证当天只执行一次。
-    Local
-        .from_local_datetime(&now.date_naive().and_time(time))
-        .earliest()
 }
 
 /// 倒计时到点的关机：先摘掉计划（与「取消」互斥），再下发系统关机请求并触发退出清理。
@@ -304,25 +335,17 @@ fn arm_scheduled_shutdown(
         }
         return;
     }
-    let Some(time) = parse_hhmm(&settings.scheduled_shutdown_time) else {
-        return;
-    };
-    // 夏令时回拨同备份：取较早的那个本地时间。
-    let Some(scheduled) = Local
-        .from_local_datetime(&now.date_naive().and_time(time))
-        .earliest()
-    else {
+    let Some(scheduled) = today_at(&settings.scheduled_shutdown_time, &now) else {
         return;
     };
 
     let state = app.state::<AppState>();
-    let crossed = scheduled > last_tick && scheduled <= now;
-    if !crossed || state.pending_shutdown().is_some() || *last_run == Some(scheduled.date_naive())
-    {
+    if !has_crossed(scheduled, last_tick, now, *last_run) || state.pending_shutdown().is_some() {
         return;
     }
     // 先记日期再排计划：用户取消后当天不该再被同一个时间点打扰。
     *last_run = Some(scheduled.date_naive());
+    remember_schedule_run(app, scheduled.date_naive(), ScheduleKind::Shutdown);
     state.arm_shutdown(PendingShutdown {
         at_ms: now.timestamp_millis() + CANCEL_WINDOW_SECS * 1000,
         source: ShutdownSource::Scheduled,
@@ -330,38 +353,192 @@ fn arm_scheduled_shutdown(
     emit_status(app);
 }
 
+/// 一条定时备份配置今晚归谁跑。
+enum BackupOwner {
+    /// 本机负责（执行位本来就是本机，或配置已经不在了）。
+    Local,
+    /// 控制机负责，附带配置名（提示里要说清楚是哪条）。
+    Agent(String),
+    /// 执行位写着控制机，但那台机器上并没有这一份：没装、没下发、或下发之后才改名/新建。
+    Unsynced(String),
+}
+
+/// 判定一条定时备份配置的归属。只在执行位是远端时才去读同步指纹，本机路径不多一次文件读。
+fn backup_owner(store: &Store, config: &AppConfig, config_id: &str) -> BackupOwner {
+    let Some(item) = config.backup_configs.iter().find(|entry| entry.id == config_id) else {
+        return BackupOwner::Local;
+    };
+    if !item.run_location.is_remote() {
+        return BackupOwner::Local;
+    }
+    let agent = config.settings.agent_server_id.trim();
+    if store.load_agent_sync().holds_backup(agent, &item.id) {
+        BackupOwner::Agent(item.name.clone())
+    } else {
+        BackupOwner::Unsynced(item.name.clone())
+    }
+}
+
+/// 容器定时队列按执行位分成三份：本机要跑的、已交给控制机的条数、写着控制机但它没持有的名字。
+///
+/// 最后一类**不进本机队列**：本机代跑会把包落在本机，而用户以为在控制机上，恢复和迁移
+/// 都找不到那个包 —— 宁可这一条不执行并报错，让他去补一次下发。
+fn split_container_queue(
+    store: &Store,
+    config: &AppConfig,
+    ids: &[String],
+) -> (VecDeque<String>, usize, Vec<String>) {
+    let mut local = VecDeque::new();
+    let mut handed = 0usize;
+    let mut unsynced = Vec::new();
+    let agent = config.settings.agent_server_id.trim();
+    let sync = store.load_agent_sync();
+    for id in ids {
+        match config.container_configs.iter().find(|item| &item.id == id) {
+            Some(item) if !item.run_location.is_remote() => local.push_back(item.id.clone()),
+            Some(item) if sync.holds_container(agent, &item.id) => handed += 1,
+            Some(item) => unsynced.push(item.name.clone()),
+            // 配置已经不在了：静默剔除，与改动前的行为一致。
+            None => {}
+        }
+    }
+    (local, handed, unsynced)
+}
+
 fn emit_notice(app: &AppHandle, kind: &'static str, message: Option<String>) {
     let _ = app.emit("scheduler://notice", SchedulerNotice { kind, message });
 }
 
-/// 解析 "HH:MM"（也接受 "H:MM"）。
-fn parse_hhmm(value: &str) -> Option<NaiveTime> {
-    let (hour, minute) = value.trim().split_once(':')?;
-    let hour: u32 = hour.trim().parse().ok()?;
-    let minute: u32 = minute.trim().parse().ok()?;
-    if hour > 23 || minute > 59 {
-        return None;
-    }
-    NaiveTime::from_hms_opt(hour, minute, 0)
+/// 三条调度循环各自记的触发日期，互不覆盖。
+enum ScheduleKind {
+    Backup,
+    Container,
+    Shutdown,
+}
+
+/// 把「这个调度日已经触发过」写回配置，好让重启后的进程认得它。
+///
+/// 写失败时静默：盘写不进的情况下备份本身也跑不动，多弹一条提示只会添个说不清的错。
+fn remember_schedule_run(app: &AppHandle, date: chrono::NaiveDate, kind: ScheduleKind) {
+    let store = app.state::<AppState>().store.clone();
+    let value = format_date(date);
+    let _ = store.mutate_config(|config| {
+        let slot = match kind {
+            ScheduleKind::Backup => &mut config.settings.scheduled_backup_last_run,
+            ScheduleKind::Container => &mut config.settings.scheduled_container_last_run,
+            ScheduleKind::Shutdown => &mut config.settings.scheduled_shutdown_last_run,
+        };
+        *slot = value;
+        Ok(())
+    });
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use deploy_core::agent::AgentSyncState;
+    use deploy_core::models::{BackupConfig, ContainerConfig, DbBackupSource, RunLocation};
 
-    #[test]
-    fn parse_hhmm_accepts_common_forms() {
-        assert_eq!(parse_hhmm("03:00"), NaiveTime::from_hms_opt(3, 0, 0));
-        assert_eq!(parse_hhmm("23:59"), NaiveTime::from_hms_opt(23, 59, 0));
-        assert_eq!(parse_hhmm(" 8:5 "), NaiveTime::from_hms_opt(8, 5, 0));
+    fn store_with(sync: Option<AgentSyncState>) -> Store {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-scheduler-{}",
+            deploy_core::models::new_id()
+        ));
+        let store = Store::new(&dir);
+        if let Some(state) = sync {
+            store.save_agent_sync(&state).unwrap();
+        }
+        store
+    }
+
+    fn backup(id: &str, remote: bool) -> BackupConfig {
+        let mut config =
+            BackupConfig::new(id.to_string(), "s1".to_string(), DbBackupSource::default());
+        config.id = id.to_string();
+        config.run_location = if remote { RunLocation::Remote } else { RunLocation::Local };
+        config
+    }
+
+    fn container(id: &str, remote: bool) -> ContainerConfig {
+        ContainerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            server_id: "s1".to_string(),
+            project: "app".to_string(),
+            pause_source: false,
+            include_volumes: true,
+            include_images: false,
+            target: None,
+            created_at: String::new(),
+            run_location: if remote { RunLocation::Remote } else { RunLocation::Local },
+        }
+    }
+
+    fn config_with(agent: &str, backups: Vec<BackupConfig>) -> AppConfig {
+        let mut config = AppConfig::default();
+        config.settings.agent_server_id = agent.to_string();
+        config.backup_configs = backups;
+        config
     }
 
     #[test]
-    fn parse_hhmm_rejects_invalid() {
-        assert!(parse_hhmm("").is_none());
-        assert!(parse_hhmm("24:00").is_none());
-        assert!(parse_hhmm("12:60").is_none());
-        assert!(parse_hhmm("abc").is_none());
-        assert!(parse_hhmm("12").is_none());
+    fn remote_config_only_yields_after_a_real_sync() {
+        let held = AgentSyncState {
+            server_id: "s1".to_string(),
+            backup_config_ids: vec!["b1".to_string()],
+            ..Default::default()
+        };
+
+        // 执行位是远端、且控制机确实持有这条 → 让位。
+        let store = store_with(Some(held.clone()));
+        let config = config_with("s1", vec![backup("b1", true)]);
+        assert!(matches!(
+            backup_owner(&store, &config, "b1"),
+            BackupOwner::Agent(name) if name == "b1"
+        ));
+
+        // 执行位是远端但从没下发过 → 判为未就绪：循环据此报失败，本机不代跑。
+        let empty = store_with(None);
+        assert!(matches!(
+            backup_owner(&empty, &config, "b1"),
+            BackupOwner::Unsynced(name) if name == "b1"
+        ));
+
+        // 换了一台控制机：旧指纹不算数，得重新下发。
+        assert!(matches!(
+            backup_owner(&store, &config_with("s2", vec![backup("b1", true)]), "b1"),
+            BackupOwner::Unsynced(_)
+        ));
+
+        // 本机执行位 / 配置已删除：与改动前一样走本机。
+        let local = config_with("s1", vec![backup("b2", false)]);
+        assert!(matches!(backup_owner(&store, &local, "b2"), BackupOwner::Local));
+        assert!(matches!(backup_owner(&store, &local, "gone"), BackupOwner::Local));
+    }
+
+    #[test]
+    fn container_queue_does_not_cover_for_unsynced_remote_configs() {
+        let store = store_with(Some(AgentSyncState {
+            server_id: "s1".to_string(),
+            container_config_ids: vec!["c1".to_string()],
+            ..Default::default()
+        }));
+        let mut config = AppConfig::default();
+        config.settings.agent_server_id = "s1".to_string();
+        config.container_configs = vec![
+            container("c1", true),
+            container("c2", true),
+            container("c3", false),
+        ];
+        let ids: Vec<String> = ["c1", "c2", "c3", "gone"]
+            .iter()
+            .map(|value| value.to_string())
+            .collect();
+        let (local, handed, unsynced) = split_container_queue(&store, &config, &ids);
+        // c1 真的在控制机上（本机剔除）；c2 写着远端但没下发过 —— 本机也不代跑，
+        // 只把它报成失败让人去补下发；c3 本来就是本机的。
+        assert_eq!(handed, 1);
+        assert_eq!(unsynced, vec!["c2".to_string()]);
+        assert_eq!(local, VecDeque::from(["c3".to_string()]));
     }
 }

@@ -186,6 +186,7 @@ export function newServerTemplate(): ServerConfig {
     username: "root",
     auth: { type: "password", password: "" },
     defaultTargetDir: "",
+    tunnels: [],
     createdAt: "",
   };
 }

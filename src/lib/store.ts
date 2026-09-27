@@ -58,18 +58,26 @@ export const defaultSettings: Settings = {
   pagesHistoryLimit: 200,
   containerHistoryLimit: 200,
   containerTimeoutSecs: 7200,
-  containerBundleKeep: 3,
+  containerBundleKeep: 2,
+  // 与 Rust 的 default_db_bundle_keep() 一致：本机默认不留导出包（每次备份往 %APPDATA%
+  // 拖一个 GB 级文件是不能默认的）。这份只在 getSettings 失败时兜底，取值必须和后端相同。
+  dbBundleKeep: 0,
   language: "",
   atomicRelease: false,
   releaseKeep: 5,
   scheduledBackupEnabled: false,
   scheduledBackupTime: "03:00",
   scheduledBackupConfigId: null,
+  scheduledBackupLastRun: "",
   scheduledShutdownEnabled: false,
   scheduledShutdownTime: "04:00",
+  scheduledShutdownLastRun: "",
   scheduledContainerEnabled: false,
   scheduledContainerTime: "03:30",
   scheduledContainerConfigIds: [],
+  scheduledContainerLastRun: "",
+  agentServerId: "",
+  agentBinaryPath: "",
 };
 
 let toastSeq = 0;
@@ -170,8 +178,23 @@ async function launchContainer(start: () => Promise<string>): Promise<string> {
     );
     return recordId;
   } catch (error) {
-    useApp.setState({ liveContainer: null });
-    useApp.getState().toast("error", String(error));
+    const message = String(error);
+    useApp.setState((state) => {
+      const live = state.liveContainer;
+      // 一条事件都没到过 = 压根没跑起来，收回占位让界面恢复可点。
+      // 已经跑过再断不能抹面板：控制机那条路是整条流跑完才 resolve，中途断线会把用户
+      // 正在看的日志一起清掉，而本机失败是走事件收尾的、不抹 —— 两边口径要一致。
+      return live && live.lines.length > 0
+        ? {
+            liveContainer: {
+              ...live,
+              status: "failed",
+              lines: [...live.lines, { level: "error", message }],
+            },
+          }
+        : { liveContainer: null };
+    });
+    useApp.getState().toast("error", message);
     throw error;
   }
 }
@@ -552,14 +575,35 @@ export const useApp = create<AppStore>((set, get) => ({
       liveBackup: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
     });
     try {
-      const recordId = await api.startBackup(request);
+      // 执行位在控制机的配置交给控制机执行：本机跑会把包和记录落在本机，
+      // 而后端 start_backup 也已拒掉这种走法 —— 两条路不能分叉。
+      const saved = request.backupConfigId
+        ? get().backupConfigs.find((item) => item.id === request.backupConfigId)
+        : undefined;
+      const recordId =
+        saved?.runLocation === "remote"
+          ? await api.startAgentBackup(saved.id)
+          : await api.startBackup(request);
       set((state) =>
         state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
       );
       return recordId;
     } catch (error) {
-      set({ liveBackup: null });
-      get().toast("error", String(error));
+      const message = String(error);
+      set((state) => {
+        const live = state.liveBackup;
+        // 与 launchContainer 同一口径：跑过再断只把状态收成失败，日志留着给人看。
+        return live && live.lines.length > 0
+          ? {
+              liveBackup: {
+                ...live,
+                status: "failed",
+                lines: [...live.lines, { level: "error", message }],
+              },
+            }
+          : { liveBackup: null };
+      });
+      get().toast("error", message);
       throw error;
     }
   },
@@ -634,8 +678,13 @@ export const useApp = create<AppStore>((set, get) => ({
 
   restoreContainerBundle: (request) => launchContainer(() => api.restoreContainerBundle(request)),
 
-  startContainerConfigBackup: (configId) =>
-    launchContainer(() => api.startContainerConfigBackup(configId)),
+  startContainerConfigBackup: (configId) => {
+    // 同 startBackup：执行位在控制机的配置由控制机出面跑，事件仍走 container://event。
+    const saved = get().containerConfigs.find((item) => item.id === configId);
+    return saved?.runLocation === "remote"
+      ? launchContainer(() => api.startAgentContainer(saved.id))
+      : launchContainer(() => api.startContainerConfigBackup(configId));
+  },
 
   cancelContainer: async () => {
     const { liveContainer, containerRecords } = get();

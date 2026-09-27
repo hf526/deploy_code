@@ -27,6 +27,48 @@ export interface BackupConfig {
   source: DbBackupSource;
   targetId: string | null;
   supabaseUrl: string | null;
+  /** 执行位：本机定时，或交给控制机上的 agent（对应 Rust 的 RunLocation）。 */
+  runLocation: RunLocation;
+}
+
+/** 备份任务的执行位（Rust: deploy_core::models::RunLocation）。 */
+export type RunLocation = "local" | "remote";
+
+/** 控制机 agent 回读的状态（Rust: deploy_core::agent::AgentStatus）。 */
+export interface AgentStatus {
+  proto: number;
+  version: string;
+  /** agent 主机的时区偏移，如 "+0800"。定时里的 HH:MM 按它解释。 */
+  timezone: string;
+  /** agent 主机的当前本地时间。 */
+  localTime: string;
+  dataDir: string;
+  totalBytes: number;
+  freeBytes: number;
+  /** 水位线：低于这个字节数就拒绝新的备份任务。 */
+  floorBytes: number;
+  bundleBytes: number;
+  bundleCount: number;
+  servers: number;
+  backupConfigs: number;
+  containerConfigs: number;
+  backupEnabled: boolean;
+  backupTime: string;
+  backupConfigName: string;
+  backupLastRun: string;
+  containerEnabled: boolean;
+  containerTime: string;
+  containerQueue: number;
+  containerLastRun: string;
+}
+
+/** 一次下发（注入）的结果（Rust: deploy_core::agent::AgentSyncReport）。 */
+export interface AgentSyncReport {
+  servers: number;
+  backupConfigs: number;
+  containerConfigs: number;
+  warnings: string[];
+  status: AgentStatus;
 }
 
 export interface NginxContainerInfo {
@@ -59,7 +101,43 @@ export interface ServerConfig {
   dbBackup?: DbBackupSource | null;
   backupTargetId?: string | null;
   supabaseUrl?: string | null;
+  /** 自动建立的 SSH 隧道规则（本机端口 → 该服务器上的地址）。 */
+  tunnels: TunnelRule[];
   createdAt: string;
+}
+
+/** 一条 SSH 本地端口转发规则，等价 `ssh -L {localPort}:{remoteHost}:{remotePort}`。 */
+export interface TunnelRule {
+  id: string;
+  localPort: number;
+  /** 从服务器那一侧看的目标地址，容器一般写 127.0.0.1。 */
+  remoteHost: string;
+  remotePort: number;
+  enabled: boolean;
+}
+
+export interface TunnelRuleStatus {
+  ruleId: string;
+  localPort: number;
+  remoteLabel: string;
+  /** 本机端口是否已绑定（绑定失败通常是端口被占用）。 */
+  bound: boolean;
+  /** 这条现在能不能真的转出去（已绑定 + SSH 在线）。 */
+  active: boolean;
+  error: string | null;
+}
+
+export interface ServerTunnelStatus {
+  serverId: string;
+  serverName: string;
+  connected: boolean;
+  /** 连续重连次数，连上即清零。 */
+  retries: number;
+  lastError: string | null;
+  connectedAt: string | null;
+  /** 本次在线期间转发过的连接数。 */
+  forwarded: number;
+  rules: TunnelRuleStatus[];
 }
 
 export interface EnvFileConfig {
@@ -253,18 +331,28 @@ export interface Settings {
   containerTimeoutSecs: number;
   /** 同一个 compose 项目在本机保留几个备份包，0 表示不自动清理。 */
   containerBundleKeep: number;
+  /** 同一个（服务器 + 库 + schema）保留几个数据库导出包，0 表示不留。 */
+  dbBundleKeep: number;
   language: string;
   atomicRelease: boolean;
   releaseKeep: number;
   scheduledBackupEnabled: boolean;
   scheduledBackupTime: string;
   scheduledBackupConfigId: string | null;
+  /** 三条调度循环各自「已触发」的调度日期（YYYY-MM-DD，空表示从未）。 */
+  scheduledBackupLastRun: string;
   scheduledShutdownEnabled: boolean;
   scheduledShutdownTime: string;
+  scheduledShutdownLastRun: string;
   /** 容器定时备份：到点按 scheduledContainerConfigIds 的顺序逐个排队执行。 */
   scheduledContainerEnabled: boolean;
   scheduledContainerTime: string;
   scheduledContainerConfigIds: string[];
+  scheduledContainerLastRun: string;
+  /** 控制机（跑备份 agent 的那台服务器）的 id；空表示未启用。 */
+  agentServerId: string;
+  /** 待上传的 agent 可执行文件路径；空表示用 <数据目录>/agent/deploy-agent。 */
+  agentBinaryPath: string;
 }
 
 /** 关机计划的来源：每天定时排的那一次，或用户手动按下的倒计时。 */
@@ -314,6 +402,8 @@ export interface SchedulerNotice {
     | "containerStarted"
     | "containerNoConfig"
     | "containerFailed"
+    | /** 到点了，但这条配置今晚由控制机执行：本机让位（正常收尾，不是失败）。 */
+      "remoteSkipped"
     | "shutdownFired"
     | "shutdownFailed";
   message?: string;
@@ -355,6 +445,8 @@ export interface BackupRecord {
   error: string | null;
   log: string;
   dumpSize: number;
+  /** 导出包在本机的路径；为空表示没留包（未开启留存，或已被轮转清掉）。 */
+  bundlePath: string;
   startedAt: string;
   finishedAt: string | null;
   durationMs: number;
@@ -647,6 +739,8 @@ export interface ContainerConfig {
   /** 迁移目标；null 表示只备份到本机。 */
   target: ContainerTarget | null;
   createdAt: string;
+  /** 执行位：本机定时，或交给控制机上的 agent。 */
+  runLocation: RunLocation;
 }
 
 export type ContainerRecordKind = "backup" | "migrate" | "restore";

@@ -1,0 +1,18 @@
+[package]
+name = "deploy-agent"
+version.workspace = true
+edition.workspace = true
+description = "DeployCode 控制机常驻进程：在服务器侧调度数据库备份与容器备份"
+
+[[bin]]
+name = "deploy-agent"
+path = "src/main.rs"
+
+[dependencies]
+deploy-core.workspace = true
+# signal：SIGTERM 要有退出原因，而不是被 systemd 静默杀掉。
+tokio = { workspace = true, features = ["signal"] }
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true

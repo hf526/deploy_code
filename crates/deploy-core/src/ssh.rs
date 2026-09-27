@@ -6,7 +6,8 @@ use russh::client::{self, Handle};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh::{ChannelMsg, Disconnect};
 use russh_sftp::client::SftpSession;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 use crate::error::{CoreError, Result};
 use crate::models::{ServerConfig, SshAuth};
@@ -41,9 +42,38 @@ pub struct SshClient {
 impl SshClient {
     /// 建立连接并完成认证。
     pub async fn connect(server: &ServerConfig, timeout_secs: u64) -> Result<Self> {
+        Self::connect_with(server, timeout_secs, None, false).await
+    }
+
+    /// 隧道用的长连接：空闲时也定期探活，并关掉 Nagle。
+    ///
+    /// 部署 / 备份那类会话几分钟就结束，等 TCP 自己报错就够了；隧道是「开着不动」的，
+    /// 一旦半开（拔网线、NAT 老化、路由器重启）russh 会话不会结束，`is_closed()` 永远是假，
+    /// 界面会一直谎报在线而每个请求都干等。keepalive 无响应即判死，交给上层退避重连。
+    /// 转发的又是接口调用这类小请求，Nagle 撞上延迟 ACK 会平白多等一拍，所以顺手关掉
+    /// （OpenSSH 客户端默认也是 TCP_NODELAY）。
+    pub async fn connect_tunnel(server: &ServerConfig, timeout_secs: u64) -> Result<Self> {
+        Self::connect_with(
+            server,
+            timeout_secs,
+            Some(Duration::from_secs(15)),
+            true,
+        )
+        .await
+    }
+
+    async fn connect_with(
+        server: &ServerConfig,
+        timeout_secs: u64,
+        keepalive_interval: Option<Duration>,
+        nodelay: bool,
+    ) -> Result<Self> {
         let label = format!("{}@{}:{}", server.username, server.host, server.port);
         let config = Arc::new(client::Config {
             inactivity_timeout: None,
+            keepalive_interval,
+            keepalive_max: 3,
+            nodelay,
             ..Default::default()
         });
 
@@ -106,6 +136,47 @@ impl SshClient {
 
     pub fn label(&self) -> &str {
         &self.label
+    }
+
+    /// 连接是否已断（会话任务结束后通道请求必然发不出去）。
+    pub fn is_closed(&self) -> bool {
+        self.session.is_closed()
+    }
+
+    /// 把一条本机 TCP 连接接到远端 `host:port`（direct-tcpip，等价 `ssh -L`）。
+    ///
+    /// 阻塞到这一路转发结束：本机或对端任一侧关闭都会在此返回。窗口收缩由 russh 处理，
+    /// 调用方只需要在返回后关掉两侧 socket。
+    pub async fn forward_tcp(
+        &self,
+        mut local: TcpStream,
+        host_to_connect: &str,
+        port_to_connect: u16,
+    ) -> Result<()> {
+        let channel = self
+            .session
+            .channel_open_direct_tcpip(
+                host_to_connect,
+                u32::from(port_to_connect),
+                // 发起侧地址只是给远端日志看的，转发本身不依赖它。
+                "127.0.0.1",
+                local
+                    .peer_addr()
+                    .map(|addr| u32::from(addr.port()))
+                    .unwrap_or_default(),
+            )
+            .await
+            .map_err(|e| {
+                CoreError::ssh(format!(
+                    "打开远端 {host_to_connect}:{port_to_connect} 通道失败: {e}"
+                ))
+            })?;
+
+        let mut remote = channel.into_stream();
+        copy_bidirectional(&mut local, &mut remote)
+            .await
+            .map_err(|e| CoreError::ssh(format!("转发中断 {host_to_connect}:{port_to_connect}: {e}")))?;
+        Ok(())
     }
 
     /// 执行远端命令并捕获完整输出（同时包含 stdout 和 stderr）。

@@ -500,7 +500,8 @@ export default function BackupsPage() {
                     }
                     subtitle={
                       <>
-                        {record.startedAt} · {humanSize(record.dumpSize)} ·{" "}
+                        {record.startedAt} · {humanSize(record.dumpSize)}
+                        {record.bundlePath ? ` · ${t("backup.bundleKept")}` : ""} ·{" "}
                         {record.targetName || t("backup.targetFallback")} · {record.target}
                       </>
                     }

@@ -1,3 +1,4 @@
+pub mod agent;
 pub mod app;
 pub mod backup;
 pub mod container;
@@ -10,4 +11,5 @@ pub mod repos;
 pub mod servers;
 pub mod shutdown;
 pub mod tray;
+pub mod tunnel;
 pub mod watch;

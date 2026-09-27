@@ -1,16 +1,19 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard};
 
 use directories::ProjectDirs;
 
+use crate::agent::AgentSyncState;
 use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
+use crate::schedule::ScheduleState;
 use crate::models::{
     now_string, new_id, AppConfig, BackupConfig, BackupRecord, ContainerConfig, ContainerRecord,
     DbBackupSource, DeployConfig, DeployRecord, DeployStatus, EnvFileConfig, ExportData,
-    ImportCounts, ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, ServerConfig,
-    SshAuth,
+    ImportCounts, ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, RunLocation,
+    ServerConfig, SshAuth,
 };
 
 /// 配置与部署记录的本地存储（JSON 文件）。
@@ -26,6 +29,8 @@ pub struct Store {
     base_dir: PathBuf,
     /// 串行化写入，避免并发部署/保存设置时互相覆盖或写出损坏文件。
     write_lock: Mutex<()>,
+    /// 进程身份：控制机上的 agent 启动时置真。见 [`Store::set_agent_mode`]。
+    agent_mode: AtomicBool,
 }
 
 /// 跨进程任务锁（GUI 与 CLI 抢占同一个任务时互斥）。
@@ -57,7 +62,22 @@ impl Store {
         Self {
             base_dir: base_dir.into(),
             write_lock: Mutex::new(()),
+            agent_mode: AtomicBool::new(false),
         }
+    }
+
+    /// 声明「这个进程是控制机上的 agent」：磁盘水位闸只在这种进程上拦任务。
+    ///
+    /// 刻意不是配置字段：它是进程身份，跟着二进制走。写在 `Settings` 里的话，
+    /// 客户端一次「保存设置」的整体回写、或导入别人那份配置，都会把笔电也变成
+    /// 「剩余不足 max(总量 10%, 5GB) 就拒绝备份」——升级后原本能跑的定时备份
+    /// 会直接启动即失败，而这道闸的设计对象只有控制机那块攒了所有备份包的盘。
+    pub fn set_agent_mode(&self, enabled: bool) {
+        self.agent_mode.store(enabled, Ordering::Relaxed);
+    }
+
+    pub fn agent_mode(&self) -> bool {
+        self.agent_mode.load(Ordering::Relaxed)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -127,8 +147,100 @@ impl Store {
         self.base_dir.join("containers")
     }
 
+    /// 数据库导出包的本机存放目录（`<数据目录>/backups`）。
+    ///
+    /// 与容器包分目录：一个可能是几十 GB 的 tar，另一个是几百 MB 的 sql.gz，
+    /// 混在一起既看不清各自占了多少盘，轮转也不好按目录整体核对。
+    pub fn db_bundle_dir(&self) -> PathBuf {
+        self.base_dir.join("backups")
+    }
+
     pub fn temp_dir(&self) -> PathBuf {
         self.base_dir.join("temp")
+    }
+
+    /// 调度器触发日期所在的文件（控制机上的 agent 用，见 [`crate::schedule::ScheduleState`]）。
+    pub fn schedule_state_path(&self) -> PathBuf {
+        self.base_dir.join("schedule-state.json")
+    }
+
+    /// 读调度状态；文件不存在或写坏了都按「从未触发」处理，不能让调度循环起不来。
+    pub fn load_schedule_state(&self) -> ScheduleState {
+        let path = self.schedule_state_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save_schedule_state(&self, state: &ScheduleState) -> Result<()> {
+        let _guard = self.write_guard()?;
+        atomic_write(
+            &self.schedule_state_path(),
+            &serde_json::to_string_pretty(state)?,
+        )
+    }
+
+    /// 上次成功下发给控制机的配置指纹所在的文件。
+    pub fn agent_sync_path(&self) -> PathBuf {
+        self.base_dir.join("agent-sync.json")
+    }
+
+    /// 读同步指纹；文件不存在或写坏了都按「从未同步」处理。
+    pub fn load_agent_sync(&self) -> AgentSyncState {
+        let path = self.agent_sync_path();
+        std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    /// 记同步指纹。单独一份文件（而不是塞进 `settings`）的理由与 [`Store::schedule_state_path`]
+    /// 同：`save_settings` 是前端整体回写 `Settings` 的，漏带这个字段就会把指纹冲没，
+    /// 而指纹是定时循环判断「这条该不该让给控制机」的唯一依据。
+    pub fn save_agent_sync(&self, state: &AgentSyncState) -> Result<()> {
+        let _guard = self.write_guard()?;
+        atomic_write(
+            &self.agent_sync_path(),
+            &serde_json::to_string_pretty(state)?,
+        )
+    }
+
+    /// 收回指向某台控制机的本机状态：执行位退回本机、指向清空、同步指纹作废；返回改回本机的条数。
+    ///
+    /// 「卸载 agent」与「删除这台服务器」共用这一条。两条判据都要有：
+    /// ① 动的不是当前控制机时一概不动 —— 顺手清掉另一台上的旧 agent，不该掐死现役那条的定时；
+    /// ② 指针对得上却不收回执行位，留下的就是「配置写着控制机、控制机已经不在了」的死局：
+    ///    定时循环照旧让位、本机又撒手，那一晚两头都不跑。
+    pub fn forget_agent_server(&self, server_id: &str) -> Result<usize> {
+        let mut moved = 0usize;
+        let mut mine = false;
+        self.mutate_config(|config| {
+            mine = config.settings.agent_server_id.trim() == server_id;
+            if !mine {
+                return Ok(());
+            }
+            for item in &mut config.backup_configs {
+                if item.run_location.is_remote() {
+                    item.run_location = RunLocation::Local;
+                    moved += 1;
+                }
+            }
+            for item in &mut config.container_configs {
+                if item.run_location.is_remote() {
+                    item.run_location = RunLocation::Local;
+                    moved += 1;
+                }
+            }
+            config.settings.agent_server_id = String::new();
+            Ok(())
+        })?;
+        if mine {
+            let mut state = self.load_agent_sync();
+            state.clear();
+            self.save_agent_sync(&state)?;
+        }
+        Ok(moved)
     }
 
     /// 设置主密码（首次使用时调用）
@@ -504,6 +616,26 @@ impl Store {
             return Ok(0);
         }
         self.mark_interrupted()
+    }
+
+    /// 半路放弃一条数据库备份时，把本机（控制机）那条 Running 收成失败。
+    ///
+    /// 不能留给 [`reconcile_interrupted`]：它要求四把任务锁都没人持有，而放弃发生的这一刻
+    /// 我们正持有自己那一把 —— 等下去就是记录永远挂着「进行中」。
+    pub fn abandon_backup_record(&self, record_id: &str, reason: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        mark_one_interrupted::<BackupRecord>(&self.backups_path(), BACKUP_LABEL, record_id, reason)
+    }
+
+    /// 同 [`Store::abandon_backup_record`]，容器备份 / 迁移那一条。
+    pub fn abandon_container_record(&self, record_id: &str, reason: &str) -> Result<()> {
+        let _guard = self.write_guard()?;
+        mark_one_interrupted::<ContainerRecord>(
+            &self.containers_path(),
+            CONTAINER_LABEL,
+            record_id,
+            reason,
+        )
     }
 
     /// 按 id / 名称 / 路径查找仓库。
@@ -1051,6 +1183,13 @@ impl Store {
                     source,
                     target_id,
                     supabase_url,
+                    // 已经指定了控制机：旧行为本来就是「定时在本机跑、包落本机」，但用户装
+                    // agent 的目的就是把这件事搬走，所以迁移过来的配置默认交给控制机。
+                    run_location: if config.settings.agent_server_id.trim().is_empty() {
+                        RunLocation::Local
+                    } else {
+                        RunLocation::Remote
+                    },
                 });
             }
             let created = additions.len();
@@ -1359,6 +1498,12 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         settings.master_password_hash = config.settings.master_password_hash.clone();
         kept += 1;
     }
+    // 三条「本调度日已触发」跟本机走，不跟导入文件：它是今晚还要不要跑的依据。
+    // 整体覆盖会让「从那台今天已经备份过的机器」导过来的配置把本机今晚那次直接吃掉，
+    // 而一次导入换来一次静默漏备份，是这里最贵的一种错。
+    settings.scheduled_backup_last_run = config.settings.scheduled_backup_last_run.clone();
+    settings.scheduled_container_last_run = config.settings.scheduled_container_last_run.clone();
+    settings.scheduled_shutdown_last_run = config.settings.scheduled_shutdown_last_run.clone();
     config.settings = settings;
 
     preview.kept_local_secrets = kept;
@@ -1473,6 +1618,29 @@ where
         write_records(path, &records)?;
     }
     Ok(converted)
+}
+
+/// 只收敛指定那一条 Running 记录（整批收敛见 [`mark_running_as_interrupted`]）。
+fn mark_one_interrupted<T>(path: &Path, label: &str, id: &str, message: &str) -> Result<()>
+where
+    T: TaskRecord + serde::Serialize + serde::de::DeserializeOwned,
+{
+    let mut records = load_records::<T>(path, label)?;
+    let mut changed = false;
+    for record in records.iter_mut() {
+        // 已经不是 Running 的那条不动：引擎可能赶在这之前自己写完了。
+        if record.id() != id || *record.status_mut() != DeployStatus::Running {
+            continue;
+        }
+        *record.status_mut() = DeployStatus::Failed;
+        *record.error_mut() = Some(message.to_string());
+        *record.finished_at_mut() = Some(now_string());
+        changed = true;
+    }
+    if changed {
+        write_records(path, &records)?;
+    }
+    Ok(())
 }
 
 /// 锁文件路径（`<base_dir>/locks/<name>.lock`），并确保目录存在。
@@ -1614,6 +1782,32 @@ mod tests {
         assert_eq!(preview.servers.overwritten, 1);
         // 密码 1 + env 本地/远端路径 2 + Token 2
         assert_eq!(preview.kept_local_secrets, 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_does_not_borrow_the_other_machines_scheduled_run_dates() {
+        let (store, dir) = temp_store();
+        let mut source = AppConfig::default();
+        // 对面那台机器今天已经跑过定时（导出文件里带着这三条日期）。
+        source.settings.scheduled_backup_last_run = "2026-09-27".to_string();
+        source.settings.scheduled_container_last_run = "2026-09-27".to_string();
+        source.settings.scheduled_shutdown_last_run = "2026-09-27".to_string();
+        store.save_config(&source).unwrap();
+        let exported = store.export_config().unwrap();
+
+        // 本机还没跑过：导入之后仍然是「没跑过」，否则今晚那次定时会被直接吃掉。
+        let mut fresh = store.load_config().unwrap();
+        fresh.settings.scheduled_backup_last_run = String::new();
+        fresh.settings.scheduled_container_last_run = String::new();
+        fresh.settings.scheduled_shutdown_last_run = String::new();
+        store.save_config(&fresh).unwrap();
+
+        store.import_config(&exported).unwrap();
+        let after = store.load_config().unwrap().settings;
+        assert_eq!(after.scheduled_backup_last_run, "");
+        assert_eq!(after.scheduled_container_last_run, "");
+        assert_eq!(after.scheduled_shutdown_last_run, "");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2148,6 +2342,7 @@ mod tests {
                     start_services: true,
                 }),
                 created_at: String::new(),
+                run_location: RunLocation::Local,
             },
         )
         .unwrap();
@@ -2264,6 +2459,7 @@ mod tests {
                     start_services: false,
                 }),
                 created_at: String::new(),
+                run_location: RunLocation::Local,
             },
         )
         .unwrap();
@@ -2490,6 +2686,7 @@ mod tests {
             error: None,
             log: String::new(),
             dump_size: 0,
+            bundle_path: String::new(),
             started_at: "2026-01-01 00:00:00".to_string(),
             finished_at: None,
             duration_ms: 0,
