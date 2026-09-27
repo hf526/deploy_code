@@ -32,9 +32,11 @@ import {
 } from "../components/ui";
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
+import { blockGuardReason, isWhitelisted, type BlockGuardReason } from "../lib/security";
 import { useApp } from "../lib/store";
 import { activeTunnelCount, findTunnelStatus, tunnelTone } from "../lib/tunnel";
 import { useAutoRefresh } from "../lib/useAutoRefresh";
+import { GuardSection } from "./servers/GuardSection";
 import { TunnelModal } from "./servers/TunnelModal";
 import type {
   OnlineSession,
@@ -60,6 +62,13 @@ function settingTone(setting: SecuritySetting): "green" | "red" | "amber" | "gra
   return "gray";
 }
 
+/** 保护理由的完整说明（挂在旁边的短标签上，鼠标悬停看细节）。 */
+function blockReasonTip(reason: BlockGuardReason, ip: string): string {
+  return reason === "self"
+    ? i18n.t("servers.blockReasonSelf", { ip })
+    : i18n.t("servers.blockReasonWhitelisted", { ip });
+}
+
 export default function ServersPage() {
   const { t } = useTranslation();
   const servers = useApp((state) => state.servers);
@@ -83,9 +92,6 @@ export default function ServersPage() {
   const [ipBusy, setIpBusy] = useState<string | null>(null);
   const [kicking, setKicking] = useState<OnlineSession | null>(null);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
-  const [guardThreshold, setGuardThreshold] = useState(5);
-  const [guardWindowMins, setGuardWindowMins] = useState(10);
-  const [guardBusy, setGuardBusy] = useState(false);
 
   // 隧道状态只是读内存里的登记表（不含 SSH 往返），所以进页面 / 窗口聚焦时补一次即可，不轮询。
   const { refresh: refreshTunnels } = useAutoRefresh(
@@ -108,8 +114,6 @@ export default function ServersPage() {
       const result = await api.scanServerSecurity(server);
       if (seq !== scanSeq.current || securingRef.current?.id !== server.id) return;
       setReport(result);
-      setGuardThreshold(result.guardThreshold || 5);
-      setGuardWindowMins(result.guardWindowMins || 10);
       setSecError(null);
     } catch (error) {
       if (seq !== scanSeq.current || securingRef.current?.id !== server.id) return;
@@ -176,34 +180,6 @@ export default function ServersPage() {
       toast("error", String(error));
     } finally {
       setSessionBusy(null);
-    }
-  }
-
-  async function handleEnableGuard() {
-    if (!securing) return;
-    setGuardBusy(true);
-    try {
-      const message = await api.enableServerGuard(securing, guardThreshold, guardWindowMins);
-      toast("success", message);
-      await scanSecurity(securing);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setGuardBusy(false);
-    }
-  }
-
-  async function handleDisableGuard() {
-    if (!securing) return;
-    setGuardBusy(true);
-    try {
-      const message = await api.disableServerGuard(securing);
-      toast("success", message);
-      await scanSecurity(securing);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setGuardBusy(false);
     }
   }
 
@@ -416,7 +392,7 @@ export default function ServersPage() {
           <p className="rounded-md border border-neg/30 bg-neg-soft px-4 py-3 text-xs break-all text-neg">
             {secError}
           </p>
-        ) : report ? (
+        ) : report && securing ? (
           <div className="flex flex-col gap-5">
             <div className="flex flex-wrap items-center gap-2">
               <Badge
@@ -462,46 +438,61 @@ export default function ServersPage() {
                 <p className="text-xs text-ink-faint">{t("servers.noFailedLogins")}</p>
               ) : (
                 <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
-                  {report.failed.map((item) => (
-                    <li
-                      key={`${item.user}-${item.ip}`}
-                      className="flex items-center gap-3 px-3 py-1.5 transition-colors hover:bg-hover"
-                    >
-                      <span
-                        className="w-40 shrink-0 truncate font-mono text-xs text-ink"
-                        title={item.user}
+                  {report.failed.map((item) => {
+                    // 判定用服务器上的白名单：界面上没点「更新」的改动还没生效，远端只认那份配置。
+                    // 禁用态的按钮不吃指针事件（ui.tsx 的 disabled:pointer-events-none），
+                    // 所以理由必须摆在旁边，挂 title 是看不到的。
+                    const reason = blockGuardReason(report.whitelist, report.selfIp, item.ip);
+                    return (
+                      <li
+                        key={`${item.user}-${item.ip}`}
+                        className="flex items-center gap-3 px-3 py-1.5 transition-colors hover:bg-hover"
                       >
-                        {item.user}
-                      </span>
-                      <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-dim">
-                        {item.ip}
-                      </span>
-                      <Badge kind="red">{t("servers.times", { count: item.count })}</Badge>
-                      {report.blocked.includes(item.ip) ? (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          loading={ipBusy === item.ip}
-                          disabled={ipBusy !== null && ipBusy !== item.ip}
-                          icon={<X className="size-3.5" />}
-                          onClick={() => void handleUnblock(item.ip)}
+                        <span
+                          className="w-40 shrink-0 truncate font-mono text-xs text-ink"
+                          title={item.user}
                         >
-                          {t("servers.unblock")}
-                        </Button>
-                      ) : (
-                        <Button
-                          size="sm"
-                          variant="secondary"
-                          loading={ipBusy === item.ip}
-                          disabled={ipBusy !== null && ipBusy !== item.ip}
-                          icon={<Ban className="size-3.5" />}
-                          onClick={() => void handleBlock(item.ip)}
-                        >
-                          {t("servers.block")}
-                        </Button>
-                      )}
-                    </li>
-                  ))}
+                          {item.user}
+                        </span>
+                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-dim">
+                          {item.ip}
+                        </span>
+                        <Badge kind="red">{t("servers.times", { count: item.count })}</Badge>
+                        {report.blocked.includes(item.ip) ? (
+                          <Button
+                            size="sm"
+                            variant="secondary"
+                            loading={ipBusy === item.ip}
+                            disabled={ipBusy !== null && ipBusy !== item.ip}
+                            icon={<X className="size-3.5" />}
+                            onClick={() => void handleUnblock(item.ip)}
+                          >
+                            {t("servers.unblock")}
+                          </Button>
+                        ) : (
+                          <>
+                            {reason && (
+                              <span title={blockReasonTip(reason, item.ip)} className="text-[11px] text-warn">
+                                {reason === "self"
+                                  ? t("servers.blockGuardSelf")
+                                  : t("servers.guardWhitelistBadge")}
+                              </span>
+                            )}
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              loading={ipBusy === item.ip}
+                              disabled={(ipBusy !== null && ipBusy !== item.ip) || reason !== null}
+                              icon={<Ban className="size-3.5" />}
+                              onClick={() => void handleBlock(item.ip)}
+                            >
+                              {t("servers.block")}
+                            </Button>
+                          </>
+                        )}
+                      </li>
+                    );
+                  })}
                 </ul>
               )}
             </section>
@@ -586,74 +577,42 @@ export default function ServersPage() {
                 <p className="text-xs text-ink-faint">{t("servers.noBlockedIps")}</p>
               ) : (
                 <div className="flex flex-wrap gap-2">
-                  {report.blocked.map((ip) => (
-                    <span
-                      key={ip}
-                      className="inline-flex items-center gap-1.5 rounded-md border border-line bg-field py-0.5 pr-1 pl-2 font-mono text-[11px] text-ink"
-                    >
-                      {ip}
-                      <button
-                        type="button"
-                        disabled={ipBusy !== null}
-                        onClick={() => void handleUnblock(ip)}
-                        className="rounded px-1.5 py-0.5 text-[10px] text-ink-faint hover:bg-hover hover:text-ink disabled:opacity-50"
+                  {report.blocked.map((ip) => {
+                    // 白名单里的地址还挂在拦截列表里 = 自己（或定时任务）正被挡在外面，
+                    // 白名单只挡以后的拉黑、不会自动把已封的放出来，所以单独标出来。
+                    const guarded = isWhitelisted(report.whitelist, ip);
+                    return (
+                      <span
+                        key={ip}
+                        title={guarded ? t("servers.blockedWhitelisted") : undefined}
+                        className={`inline-flex items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 font-mono text-[11px] ${
+                          guarded ? "border-warn/30 bg-warn-soft text-warn" : "border-line bg-field text-ink"
+                        }`}
                       >
-                        {ipBusy === ip ? t("servers.unblocking") : t("servers.unblock")}
-                      </button>
-                    </span>
-                  ))}
+                        {ip}
+                        {guarded && (
+                          <span className="font-sans text-[10px]">{t("servers.guardWhitelistBadge")}</span>
+                        )}
+                        <button
+                          type="button"
+                          disabled={ipBusy !== null}
+                          onClick={() => void handleUnblock(ip)}
+                          className="rounded px-1.5 py-0.5 text-[10px] text-ink-faint hover:bg-hover hover:text-ink disabled:opacity-50"
+                        >
+                          {ipBusy === ip ? t("servers.unblocking") : t("servers.unblock")}
+                        </button>
+                      </span>
+                    );
+                  })}
                 </div>
               )}
             </section>
 
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.guardTitle")}</h4>
-              <div className="rounded-md border border-line bg-field p-3.5">
-                <div className="flex flex-wrap items-center gap-2">
-                  <Badge kind={report.guardEnabled ? "green" : "gray"}>
-                    {report.guardEnabled ? t("servers.guardEnabled") : t("servers.guardDisabled")}
-                  </Badge>
-                  <span className="text-[11.5px] text-ink-dim">{t("servers.guardDescription")}</span>
-                </div>
-                <div className="mt-3 flex flex-wrap items-end gap-2">
-                  <Field label={t("servers.guardThreshold")} className="w-28">
-                    <Input
-                      type="number"
-                      value={guardThreshold}
-                      onChange={(event) => setGuardThreshold(Number(event.target.value))}
-                    />
-                  </Field>
-                  <Field label={t("servers.guardWindow")} className="w-32">
-                    <Input
-                      type="number"
-                      value={guardWindowMins}
-                      onChange={(event) => setGuardWindowMins(Number(event.target.value))}
-                    />
-                  </Field>
-                  <Button
-                    variant="secondary"
-                    loading={guardBusy}
-                    icon={<ShieldCheck className="size-3.5" />}
-                    onClick={() => void handleEnableGuard()}
-                  >
-                    {report.guardEnabled ? t("servers.guardUpdate") : t("servers.guardEnable")}
-                  </Button>
-                  {report.guardEnabled && (
-                    <Button
-                      variant="ghost"
-                      className="text-neg hover:bg-neg-soft hover:text-neg"
-                      disabled={guardBusy}
-                      onClick={() => void handleDisableGuard()}
-                    >
-                      {t("servers.guardDisable")}
-                    </Button>
-                  )}
-                </div>
-                {!report.isRoot && !report.hasSudo && (
-                  <p className="mt-2 text-[11px] text-ink-faint">{t("servers.guardNeedRoot")}</p>
-                )}
-              </div>
-            </section>
+            <GuardSection
+              server={securing}
+              report={report}
+              onChanged={() => void scanSecurity(securing)}
+            />
 
             <section>
               <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.sshdTitle")}</h4>

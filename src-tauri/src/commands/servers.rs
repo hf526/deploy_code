@@ -142,14 +142,19 @@ pub async fn kick_server_session(
 }
 
 /// 启用服务器端自动防护（失败 N 次后自动拉黑，长期生效）。
+/// `whitelist` 是免封白名单（单个 IP），整份随本次下发覆盖服务器那份配置。
 #[tauri::command]
 pub async fn enable_server_guard(
     state: State<'_, AppState>,
     server: ServerConfig,
     threshold: u32,
     window_mins: u64,
+    whitelist: Vec<String>,
 ) -> Result<String> {
-    state.engine().enable_server_guard(&server, threshold, window_mins).await
+    state
+        .engine()
+        .enable_server_guard(&server, threshold, window_mins, &whitelist)
+        .await
 }
 
 /// 停用服务器端自动防护。

@@ -13,3 +13,6 @@ pages.json
 *.key
 *.local
 .DS_Store
+
+# 打进安装包的 agent 二进制（见 src-tauri/agent/README.md），不进仓库
+src-tauri/agent/deploy-agent

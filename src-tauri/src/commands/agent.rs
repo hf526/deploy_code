@@ -16,7 +16,7 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use deploy_core::agent::{AgentControl, AgentStatus, AgentSyncReport};
+use deploy_core::agent::{AgentBinaryInfo, AgentControl, AgentStatus, AgentSyncReport};
 use deploy_core::models::{BackupEvent, BackupRecord, ContainerEvent, ContainerRecord};
 use deploy_core::{CoreError, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -32,6 +32,12 @@ fn explicit_server(server_id: &str) -> Option<String> {
 
 fn control_of(store: Arc<Store>) -> AgentControl {
     AgentControl::new(store)
+}
+
+/// 本机这份 agent 可执行文件的情况：只读盘上有什么，不连服务器、不占任务名额。
+#[tauri::command(async)]
+pub fn agent_binary_info(state: State<AppState>) -> AgentBinaryInfo {
+    deploy_core::agent::binary_info(&state.store)
 }
 
 #[tauri::command]

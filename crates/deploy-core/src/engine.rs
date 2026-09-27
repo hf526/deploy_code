@@ -790,15 +790,23 @@ impl DeployEngine {
     }
 
     /// 启用服务器端自动防护（失败 N 次自动拉黑，服务器上长期生效）。
+    /// `whitelist` 是免封白名单，每次都随配置整体重写——留空即清空，不做「不传就保留」。
     pub async fn enable_server_guard(
         &self,
         server: &ServerConfig,
         threshold: u32,
         window_mins: u64,
+        whitelist: &[String],
     ) -> Result<String> {
         let settings = self.store.load_config()?.settings;
-        crate::security::enable_guard(server, settings.connect_timeout_secs, threshold, window_mins)
-            .await
+        crate::security::enable_guard(
+            server,
+            settings.connect_timeout_secs,
+            threshold,
+            window_mins,
+            whitelist,
+        )
+        .await
     }
 
     /// 停用服务器端自动防护。

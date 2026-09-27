@@ -1129,12 +1129,6 @@ pub struct Settings {
     /// 控制机（跑了备份 agent 的那台服务器）的服务器 id；空表示未启用。
     #[serde(default)]
     pub agent_server_id: String,
-    /// 待上传的 agent 可执行文件在本机的路径；空表示用默认位置。
-    ///
-    /// agent 是 Linux 二进制，Windows 上交叉编译麻烦，所以由使用者自己构建后放到
-    /// `<数据目录>/agent/deploy-agent`，这里只在需要指向别处时填写。
-    #[serde(default)]
-    pub agent_binary_path: String,
 }
 
 fn default_scheduled_container_time() -> String {
@@ -1224,7 +1218,6 @@ impl Default for Settings {
             scheduled_container_config_ids: Vec::new(),
             scheduled_container_last_run: String::new(),
             agent_server_id: String::new(),
-            agent_binary_path: String::new(),
         }
     }
 }

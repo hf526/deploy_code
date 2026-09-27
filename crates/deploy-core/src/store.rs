@@ -1,7 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use directories::ProjectDirs;
 
@@ -31,6 +31,8 @@ pub struct Store {
     write_lock: Mutex<()>,
     /// 进程身份：控制机上的 agent 启动时置真。见 [`Store::set_agent_mode`]。
     agent_mode: AtomicBool,
+    /// 安装包内置的 agent 可执行文件。见 [`Store::set_bundled_agent_binary`]。
+    bundled_agent_binary: OnceLock<PathBuf>,
 }
 
 /// 跨进程任务锁（GUI 与 CLI 抢占同一个任务时互斥）。
@@ -63,6 +65,7 @@ impl Store {
             base_dir: base_dir.into(),
             write_lock: Mutex::new(()),
             agent_mode: AtomicBool::new(false),
+            bundled_agent_binary: OnceLock::new(),
         }
     }
 
@@ -78,6 +81,20 @@ impl Store {
 
     pub fn agent_mode(&self) -> bool {
         self.agent_mode.load(Ordering::Relaxed)
+    }
+
+    /// 登记安装包内置的 agent 可执行文件（`<资源目录>/agent/deploy-agent`）。
+    ///
+    /// 与 `agent_mode` 同理，这也是进程/安装属性而不是配置字段：资源目录跟着这台机器上的
+    /// 安装位置走，写进 config.json 就会被导出/导入带走，换台机器指到不存在的路径。
+    /// 只有 Tauri 壳问得到资源目录（`deploy-core` 不许依赖 tauri），所以由 `lib.rs` 启动时登记；
+    /// CLI 与单测不登记，`agent::locate_binary` 自然跳过这一档。
+    pub fn set_bundled_agent_binary(&self, path: impl Into<PathBuf>) {
+        let _ = self.bundled_agent_binary.set(path.into());
+    }
+
+    pub fn bundled_agent_binary(&self) -> Option<&Path> {
+        self.bundled_agent_binary.get().map(PathBuf::as_path)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {

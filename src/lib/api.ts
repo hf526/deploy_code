@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  AgentBinaryInfo,
   AgentStatus,
   AgentSyncReport,
   BackupConfig,
@@ -144,8 +145,12 @@ export const api = {
     invoke<string>("unblock_server_ip", { server, ip }),
   kickServerSession: (server: ServerConfig, tty: string) =>
     invoke<string>("kick_server_session", { server, tty }),
-  enableServerGuard: (server: ServerConfig, threshold: number, windowMins: number) =>
-    invoke<string>("enable_server_guard", { server, threshold, windowMins }),
+  enableServerGuard: (
+    server: ServerConfig,
+    threshold: number,
+    windowMins: number,
+    whitelist: string[],
+  ) => invoke<string>("enable_server_guard", { server, threshold, windowMins, whitelist }),
   disableServerGuard: (server: ServerConfig) =>
     invoke<string>("disable_server_guard", { server }),
 
@@ -269,6 +274,8 @@ export const api = {
     invoke<boolean>("delete_container_record", { recordId }),
   clearContainerRecords: () => invoke<void>("clear_container_records"),
   /** 控制机（备份 agent）：安装 / 下发 / 状态 / 日志 / 回读 / 即时发起。 */
+  /** 本机这份 agent 二进制从哪来（安装包内置 / 手动放置 / 没有），只读盘、不连服务器。 */
+  agentBinaryInfo: () => invoke<AgentBinaryInfo>("agent_binary_info"),
   installAgent: (serverId: string) => invoke<AgentStatus>("install_agent", { serverId }),
   uninstallAgent: (serverId: string) => invoke<string>("uninstall_agent", { serverId }),
   agentStatus: (serverId = "") => invoke<AgentStatus>("agent_status", { serverId }),

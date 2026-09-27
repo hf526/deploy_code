@@ -96,7 +96,10 @@ export function Field({
   className?: string;
 }) {
   return (
-    <label className={cn("block", className)}>
+    // flex + justify-end：表头高度由文案决定（标签一行、说明折两三行都可能），同一行的两个 Field
+    // 于是控件起点错开。网格会把两个格子拉到等高，把控件压到底部对齐，控件就永远在同一条线上，
+    // 说明文字长短不再影响排版。
+    <label className={cn("flex h-full flex-col justify-end", className)}>
       <span className="mb-1 flex items-baseline gap-1 text-xs font-medium text-ink-dim">
         {label}
         {required && <span className="text-neg">*</span>}

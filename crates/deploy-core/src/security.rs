@@ -61,6 +61,10 @@ pub struct SecurityReport {
     pub guard_threshold: u32,
     /// 自动防护的统计窗口（分钟）。
     pub guard_window_mins: u64,
+    /// 免封白名单（服务器 `ALLOW=` 配置里的条目，单个 IP）。
+    pub whitelist: Vec<String>,
+    /// 本次扫描这条 SSH 连接的来源 IP（未知时为空）。
+    pub self_ip: String,
     /// 失败登录（按账号 + IP 汇总，次数降序）。
     pub failed: Vec<FailedLogin>,
     /// 最近成功登录。
@@ -76,7 +80,10 @@ pub struct SecurityReport {
 }
 
 /// 采集脚本：一次 SSH 执行，输出按 `###` 标记分段。
-const SCAN_SCRIPT: &str = r#"SUDO=""
+const SCAN_SCRIPT: &str = r#"SELF="${SSH_CLIENT%% *}"
+case "$SELF" in *[!0-9a-fA-F:.]*) SELF="" ;; esac
+echo '###SELF '"$SELF"
+SUDO=""
 [ "$(id -u)" != "0" ] 2>/dev/null && SUDO="sudo -n"
 echo '###ROOT '$(id -u 2>/dev/null || echo '?')
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then echo '###SUDO yes'; else echo '###SUDO no'; fi
@@ -112,7 +119,7 @@ last -i -n 25 2>/dev/null | head -n 25 || true
 echo '###SESSIONS'
 who 2>/dev/null | head -n 50 || true
 echo '###GUARD'
-grep -E '^(THRESHOLD|WINDOW)=' /etc/deploycode-guard.conf 2>/dev/null || true
+grep -E '^(THRESHOLD|WINDOW|ALLOW)=' /etc/deploycode-guard.conf 2>/dev/null || true
 if [ -f /etc/cron.d/deploycode-guard ] && grep -q deploycode-guard /etc/cron.d/deploycode-guard 2>/dev/null; then echo 'CRON yes'; else echo 'CRON no'; fi
 echo '###DONE'"#;
 
@@ -176,6 +183,8 @@ const GUARD_SCRIPT: &str = r#"#!/bin/sh
 [ -f /etc/deploycode-guard.conf ] && . /etc/deploycode-guard.conf
 THRESHOLD=${THRESHOLD:-5}
 WINDOW=${WINDOW:-10}
+# 免封白名单（逗号分隔的单个 IP）：命中就不计数，也不会被拉黑。
+ALLOW=${ALLOW:-}
 LOG=/var/log/deploycode-guard.log
 [ "$(id -u)" != "0" ] && exit 0
 
@@ -211,6 +220,13 @@ failed() {
   done 2>/dev/null | grep -Ei 'Failed password|Invalid user' | tail -n 5000
 }
 
+whitelisted() {
+  for entry in $(printf '%s' "$ALLOW" | tr ',' ' '); do
+    [ "$entry" = "$1" ] && return 0
+  done
+  return 1
+}
+
 blocked_ips() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
     ufw status 2>/dev/null | grep -i deny | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
@@ -241,6 +257,7 @@ block() {
 
 BLOCKED=$(blocked_ips)
 failed | grep -oE 'from [0-9a-fA-F:.]+' | awk '{print $2}' | sort | uniq -c | while read count ip; do
+  whitelisted "$ip" && continue
   [ "${count}" -ge "${THRESHOLD}" ] 2>/dev/null || continue
   echo "$BLOCKED" | grep -qxF "$ip" && continue
   if block "$ip"; then
@@ -251,16 +268,24 @@ failed | grep -oE 'from [0-9a-fA-F:.]+' | awk '{print $2}' | sort | uniq -c | wh
 done
 "#;
 
-/// 启用服务器端自动防护：写入守护脚本 + 配置 + 每分钟 cron 任务。
+/// 启用服务器端自动防护：写入守护脚本 + 配置（含免封白名单）+ 每分钟 cron 任务。
 pub async fn enable_guard(
     server: &ServerConfig,
     connect_timeout_secs: u64,
     threshold: u32,
     window_mins: u64,
+    whitelist: &[String],
 ) -> Result<String> {
     let threshold = threshold.clamp(1, 100);
     let window_mins = window_mins.clamp(1, 1440);
-    let command = format!(
+    let allow = normalize_whitelist(whitelist)?.join(",");
+    let command = enable_script(threshold, window_mins, &allow);
+    run_rule_command(server, connect_timeout_secs, &command, "启用自动防护").await
+}
+
+/// 启用自动防护的远端脚本：守护脚本本体 + 配置（阈值 / 窗口 / 白名单）+ cron 任务。
+fn enable_script(threshold: u32, window_mins: u64, allow: &str) -> String {
+    format!(
         r#"SUDO=""
 [ "$(id -u)" != "0" ] 2>/dev/null && SUDO="sudo -n"
 $SUDO tee /usr/local/bin/deploycode-guard >/dev/null <<'GUARD_EOF' || exit 1
@@ -269,6 +294,7 @@ GUARD_EOF
 $SUDO tee /etc/deploycode-guard.conf >/dev/null <<'CONF_EOF' || exit 1
 THRESHOLD={threshold}
 WINDOW={window_mins}
+ALLOW={allow}
 CONF_EOF
 $SUDO tee /etc/cron.d/deploycode-guard >/dev/null <<'CRON_EOF' || exit 1
 * * * * * root /usr/local/bin/deploycode-guard >/dev/null 2>&1
@@ -279,8 +305,7 @@ $SUDO chmod 644 /etc/deploycode-guard.conf /etc/cron.d/deploycode-guard || exit 
 $SUDO /usr/local/bin/deploycode-guard >/dev/null 2>&1 || true
 echo '自动防护已启用'
 "#
-    );
-    run_rule_command(server, connect_timeout_secs, &command, "启用自动防护").await
+    )
 }
 
 /// 停用服务器端自动防护（移除 cron 任务，保留脚本与配置便于再次启用）。
@@ -300,6 +325,21 @@ fn rule_script(ip: &str, block: bool) -> String {
             r#"SUDO=""
 [ "$(id -u)" != "0" ] 2>/dev/null && SUDO="sudo -n"
 IP={quoted}
+# 自我封锁保护：白名单命中、或封的正是本次连接的来源地址时直接拒绝。
+# 用 grep 读那一行而不是 source 整份配置：`.` 打不开文件会让脚本直接退出，
+# 配置没装过（第一次拉黑）时就会被这条莫名其妙的原因绊住。
+ALLOW="$(grep -E '^ALLOW=' /etc/deploycode-guard.conf 2>/dev/null | tail -n 1 | cut -d= -f2-)"
+SELF="${{SSH_CLIENT%% *}}"
+if [ -n "$SELF" ] && [ "$SELF" = "$IP" ]; then
+  echo "拉黑被拒绝：$IP 是本次 SSH 连接的来源地址，封掉会立刻断开自己" >&2
+  exit 1
+fi
+for entry in $(printf '%s' "$ALLOW" | tr ',' ' '); do
+  if [ "$entry" = "$IP" ]; then
+    echo "拉黑被拒绝：$IP 在免封白名单里，请先从白名单移除" >&2
+    exit 1
+  fi
+done
 done=0
 if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi 'Status: active'; then
   $SUDO ufw deny from "$IP" >/dev/null 2>&1 && done=1
@@ -366,6 +406,44 @@ fn validate_ip(ip: &str) -> Result<()> {
     }
 }
 
+/// 白名单条数上限：守护脚本每分钟都要遍历一次，够日常运维用就行。
+const WHITELIST_MAX: usize = 64;
+
+/// 校验并整理白名单：去空白、去重、限长，返回可写进配置的条目。
+fn normalize_whitelist(entries: &[String]) -> Result<Vec<String>> {
+    let mut result: Vec<String> = Vec::new();
+    for entry in entries {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        if !is_ip(entry) {
+            return Err(CoreError::config(format!(
+                "白名单只接受单个 IP 地址（不支持主机名与网段）: {entry}"
+            )));
+        }
+        // 比对前先规范化：`2001:0db8::1` 与 `2001:db8::1` 在远端匹配时是同一个地址。
+        let normalized = entry
+            .trim_matches(|c| c == '[' || c == ']')
+            .split('%')
+            .next()
+            .unwrap_or(entry)
+            .parse::<std::net::IpAddr>()
+            .map(|addr| addr.to_string())
+            .unwrap_or_else(|_| entry.to_string());
+        if result.iter().any(|kept| kept == &normalized) {
+            continue;
+        }
+        result.push(normalized);
+        if result.len() > WHITELIST_MAX {
+            return Err(CoreError::config(format!(
+                "白名单最多 {WHITELIST_MAX} 条，请删掉不再使用的地址"
+            )));
+        }
+    }
+    Ok(result)
+}
+
 fn clean_output(output: &str) -> String {
     // 保留 stderr 内容（去掉标记前缀），否则脚本的真实失败原因会被吞掉。
     output
@@ -393,6 +471,8 @@ fn parse_report(output: &str) -> SecurityReport {
     let mut guard_cron = false;
     let mut guard_threshold: u32 = 5;
     let mut guard_window_mins: u64 = 10;
+    let mut whitelist: Vec<String> = Vec::new();
+    let mut self_ip = String::new();
 
     for raw in output.lines() {
         let line = raw.trim();
@@ -407,6 +487,13 @@ fn parse_report(output: &str) -> SecurityReport {
                 "ROOT" => is_root = value == "0",
                 "SUDO" => has_sudo = value == "yes",
                 "FW" => firewall = value.to_string(),
+                // 只认这一行里的合法地址：脚本已按字符集过滤，这里再兜一道，
+                // 免得被日志成串的文本污染 selfIp（界面拿它做预填和高亮）。
+                "SELF" => {
+                    if is_ip(value) {
+                        self_ip = value.to_string();
+                    }
+                }
                 _ => {}
             }
             section = match name {
@@ -503,6 +590,14 @@ fn parse_report(output: &str) -> SecurityReport {
                     if let Ok(value) = value.trim().parse::<u64>() {
                         guard_window_mins = value.max(1);
                     }
+                } else if let Some(value) = line.strip_prefix("ALLOW=") {
+                    // 老版本守护配置没有这一行；空值就是没配白名单。
+                    for token in value.split(',') {
+                        let token = token.trim();
+                        if is_ip(token) && !whitelist.iter().any(|kept| kept == token) {
+                            whitelist.push(token.to_string());
+                        }
+                    }
                 } else if line.eq_ignore_ascii_case("CRON yes") {
                     guard_cron = true;
                 }
@@ -537,6 +632,19 @@ fn parse_report(output: &str) -> SecurityReport {
     if failed.is_empty() {
         notes.push("未读取到失败登录记录（可能缺少日志权限，或系统未记录）".to_string());
     }
+    // 白名单只挡住"以后"的拉黑；已经被封的（老配置、或封之后才加的白名单）要在这里点出来，
+    // 否则界面列着一堆已封 IP，看不出哪个是必须马上解除的。
+    let locked_out: Vec<String> = blocked
+        .iter()
+        .filter(|ip| whitelist.iter().any(|allowed| allowed == *ip))
+        .cloned()
+        .collect();
+    if !locked_out.is_empty() {
+        notes.push(format!(
+            "白名单里的这些 IP 当前仍被拦截，需要手动解除：{}",
+            locked_out.join("、")
+        ));
+    }
 
     SecurityReport {
         is_root,
@@ -546,6 +654,8 @@ fn parse_report(output: &str) -> SecurityReport {
         guard_enabled: guard_conf && guard_cron,
         guard_threshold,
         guard_window_mins,
+        whitelist,
+        self_ip,
         failed,
         success,
         sessions,
@@ -782,5 +892,147 @@ mod tests {
         assert!(validate_tty("pts/0; rm -rf /").is_err());
         assert!(validate_tty("").is_err());
         assert!(validate_tty("pts/0 $(id)").is_err());
+    }
+
+    #[test]
+    fn normalize_whitelist_keeps_plain_ips() {
+        let entries = [" 1.2.3.4 ".to_string(), String::new(), "2001:db8::1".to_string()];
+        assert_eq!(
+            normalize_whitelist(&entries).unwrap(),
+            vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_whitelist_dedups_by_normalized_address() {
+        let entries = [
+            "[2001:0db8::1]".to_string(),
+            "2001:db8::1".to_string(),
+            "fe80::1%eth0".to_string(),
+        ];
+        assert_eq!(
+            normalize_whitelist(&entries).unwrap(),
+            vec!["2001:db8::1".to_string(), "fe80::1".to_string()]
+        );
+    }
+
+    #[test]
+    fn normalize_whitelist_rejects_cidr_and_hostnames() {
+        // 白名单只收单个 IP：网段匹配要在远端 sh 里另写一套 IPv6 逻辑，宁可拒绝也不静默收下。
+        for bad in ["10.0.0.0/8", "example.com", "1.2.3", "0.0.0.0"] {
+            assert!(
+                normalize_whitelist(&[bad.to_string()]).is_err(),
+                "{bad} 应当被拒绝"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_whitelist_caps_entry_count() {
+        let entries: Vec<String> = (0..=WHITELIST_MAX)
+            .map(|i| format!("10.0.0.{}", i % 251 + 1))
+            .collect();
+        assert!(normalize_whitelist(&entries).is_err());
+    }
+
+    #[test]
+    fn parse_report_reads_whitelist_and_self_ip() {
+        let report = parse_report(
+            "###SELF 9.9.9.9\n###ROOT 0\n###FW ufw\nDENY FROM 1.2.3.4\n###GUARD\nTHRESHOLD=3\nWINDOW=15\nALLOW=1.2.3.4,2001:db8::1\nCRON yes\n###DONE\n",
+        );
+        assert_eq!(report.self_ip, "9.9.9.9");
+        assert_eq!(report.guard_threshold, 3);
+        assert_eq!(report.guard_window_mins, 15);
+        assert!(report.guard_enabled);
+        assert_eq!(report.whitelist, vec!["1.2.3.4", "2001:db8::1"]);
+        // ###SELF 那行不能被当成防火墙规则收进已封列表。
+        assert!(!report.blocked.iter().any(|ip| ip == "9.9.9.9"));
+        // 白名单里的 IP 仍在拦截列表里，必须靠 note 提醒（不自动解除）。
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note.contains("仍被拦截") && note.contains("1.2.3.4")));
+    }
+
+    #[test]
+    fn parse_report_tolerates_guard_config_without_allow_line() {
+        // 老版本装的守护配置没有 ALLOW=，白名单读成空，不能因此报错。
+        let report = parse_report("###GUARD\nTHRESHOLD=5\nWINDOW=10\nCRON yes\n###DONE\n");
+        assert!(report.whitelist.is_empty());
+        assert!(report.self_ip.is_empty());
+        assert!(report.guard_enabled);
+    }
+
+    #[test]
+    fn parse_report_ignores_malformed_allow_and_self_values() {
+        let report = parse_report(
+            "###SELF not-an-ip\n###GUARD\nALLOW=1.2.3.4,,garbage\nCRON yes\n###DONE\n",
+        );
+        assert_eq!(report.whitelist, vec!["1.2.3.4"]);
+        assert_eq!(report.self_ip, "");
+    }
+
+    #[test]
+    fn guard_script_skips_whitelisted_ips() {
+        assert!(GUARD_SCRIPT.contains("ALLOW=${ALLOW:-}"));
+        assert!(GUARD_SCRIPT.contains("whitelisted \"$ip\" && continue"));
+    }
+
+    #[test]
+    fn block_rule_refuses_self_and_whitelisted_before_touching_firewall() {
+        let script = rule_script("1.2.3.4", true);
+        // 来源地址取自本次连接的 SSH_CLIENT，白名单从服务器那份配置里 grep 出来。
+        assert!(script.contains("${SSH_CLIENT%% *}"));
+        assert!(script.contains("grep -E '^ALLOW=' /etc/deploycode-guard.conf"));
+        // 检查必须排在防火墙分支之前。
+        let guard_at = script.find("拉黑被拒绝").unwrap();
+        let firewall_at = script.find("done=0").unwrap();
+        assert!(guard_at < firewall_at);
+        // 拼进远端 shell 的变量必须逐个过 shell_quote（安全红线）：日志里的 [IPv6] 写法
+        // 带方括号，不加引号会被当成 glob 展开。
+        assert!(script.contains("IP=1.2.3.4"));
+        assert!(rule_script("[2001:db8::1]", true).contains("IP='[2001:db8::1]'"));
+        // 解除方向不该有这些拒绝分支。
+        assert!(!rule_script("1.2.3.4", false).contains("拉黑被拒绝"));
+    }
+
+    #[test]
+    fn enable_script_writes_whitelist_into_guard_conf() {
+        let script = enable_script(3, 15, "1.2.3.4,2001:db8::1");
+        assert!(script.contains("THRESHOLD=3\nWINDOW=15\nALLOW=1.2.3.4,2001:db8::1\n"));
+        // 清空白名单也必须写一行空的 ALLOW=：整份配置是重写而不是合并，
+        // 否则服务器上残留的旧名单会继续给那批地址免封。
+        assert!(enable_script(5, 10, "").contains("ALLOW=\n"));
+    }
+
+    /// Rust 与 TS 是手工镜像的，字段名对不上编译器不报错、界面静默拿到 undefined。
+    /// 这条把安全弹窗读到的键名钉死（尤其后两个新字段）。
+    #[test]
+    fn report_json_keys_match_the_frontend_types() {
+        let report = parse_report(
+            "###SELF 1.2.3.4\n###GUARD\nTHRESHOLD=5\nWINDOW=10\nALLOW=5.6.7.8\nCRON yes\n###DONE\n",
+        );
+        let value = serde_json::to_value(&report).expect("序列化");
+        for key in [
+            "isRoot",
+            "hasSudo",
+            "firewall",
+            "blocked",
+            "guardEnabled",
+            "guardThreshold",
+            "guardWindowMins",
+            "whitelist",
+            "selfIp",
+            "failed",
+            "success",
+            "sessions",
+            "scannedAt",
+            "sshd",
+            "notes",
+        ] {
+            assert!(value.get(key).is_some(), "缺字段 {key}");
+        }
+        assert_eq!(value["selfIp"].as_str(), Some("1.2.3.4"));
+        assert_eq!(value["whitelist"].as_array().map(Vec::len), Some(1));
     }
 }

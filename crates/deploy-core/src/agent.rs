@@ -46,7 +46,7 @@ pub const UNIT_PATH: &str = "/etc/systemd/system/deploy-agent.service";
 /// 回读执行日志的默认行数。
 pub const DEFAULT_LOG_LINES: usize = 200;
 
-/// 本机侧 agent 可执行文件的默认存放位置：`<数据目录>/agent/deploy-agent`。
+/// 手放 agent 可执行文件的位置：`<数据目录>/agent/deploy-agent`，安装包没内置时（开发期交叉编译）用这一档。
 pub const LOCAL_BINARY_SUBDIR: &str = "agent";
 
 /// 控制机上数据库导出包的兜底份数（本机 `db_bundle_keep` = 0 时用它）。
@@ -356,30 +356,105 @@ impl AgentSyncState {
     }
 }
 
-/// 本机要用的 agent 可执行文件在哪：显式设置优先，其次 `<数据目录>/agent/deploy-agent`。
+/// 本机要用的 agent 可执行文件是从哪一档来的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AgentBinarySource {
+    /// 客户端安装包自带的（`<资源目录>/agent/deploy-agent`），正常安装就是这一档。
+    Bundled,
+    /// `<数据目录>/agent/` 下手放的那份（开发期换产物用，压过内置）。
+    Manual,
+    /// 一处都没有：点「安装/更新」会报错。
+    Missing,
+}
+
+/// 界面那一行「agent 可执行文件」的素材：只读展示，不再让用户敲路径。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentBinaryInfo {
+    pub source: AgentBinarySource,
+    /// 绝对路径；[`AgentBinarySource::Missing`] 时是空串。
+    pub path: String,
+    pub size_bytes: u64,
+}
+
+/// 上传之前先确认这是 Linux 可执行文件（ELF 头）。
 ///
-/// agent 是 Linux 二进制，Windows 上不方便交叉编译，所以由使用者自行构建后放进来，
-/// 找不到时报错并给出构建命令，而不是悄悄上传一个本机平台跑不起来的文件。
-pub fn resolve_binary(settings: &Settings, store: &Store) -> Result<PathBuf> {
-    let explicit = settings.agent_binary_path.trim();
-    if !explicit.is_empty() {
-        let path = PathBuf::from(explicit);
-        return path
-            .is_file()
-            .then_some(path)
-            .ok_or_else(|| CoreError::config(format!("找不到 agent 可执行文件: {explicit}")));
+/// Windows 上开发很容易顺手放一份 `deploy-agent.exe` 或占位文件：装到服务器上
+/// `install -m 755` 照装、systemd 照起，直到 `--version` 那一行打不出来才炸，
+/// 而那时旧服务已经被 stop 掉了。所以在源头就拦下来。
+fn is_linux_binary(path: &Path) -> bool {
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
+}
+
+/// 一个候选路径的两道检查：在不在、是不是 Linux 二进制。
+fn accept_binary(path: PathBuf, source: AgentBinarySource) -> Result<(PathBuf, AgentBinarySource)> {
+    if !path.is_file() {
+        return Err(CoreError::config(format!(
+            "找不到 agent 可执行文件: {}",
+            path.display()
+        )));
     }
+    if !is_linux_binary(&path) {
+        return Err(CoreError::config(format!(
+            "{} 不是 Linux 可执行文件（文件头不是 ELF）。agent 跑在服务器上，本机编出来的 deploy-agent.exe 传过去也起不来。",
+            path.display()
+        )));
+    }
+    Ok((path, source))
+}
+
+/// 找 agent 可执行文件：`<数据目录>/agent/` 下手放的那份 → 安装包内置的那份。
+///
+/// 刻意没有「设置里指一个路径」这一档：那是这台机器上的文件位置，写进配置就会被导出/导入
+/// 带到别的机器上，而界面上早就没有输入框了，指错一路都清不掉。开发期要换一份测试，
+/// 就把它放到 `<数据目录>/agent/deploy-agent` —— 这一档排在内置之前，否则安装包里的
+/// 那份永远压着，本地新编的产物根本传不上去。谁在用哪个，界面的那一行会直接写出来，
+/// 所以「手放的旧文件赢了」不是静默降级。
+pub fn locate_binary(store: &Store) -> Result<(PathBuf, AgentBinarySource)> {
     let dir = store.base_dir().join(LOCAL_BINARY_SUBDIR);
     for name in ["deploy-agent", "deploy-agent.exe", "deploy-agent-linux"] {
         let path = dir.join(name);
         if path.is_file() {
-            return Ok(path);
+            return accept_binary(path, AgentBinarySource::Manual);
+        }
+    }
+    if let Some(bundled) = store.bundled_agent_binary() {
+        let bundled = bundled.to_path_buf();
+        if bundled.is_file() {
+            return accept_binary(bundled, AgentBinarySource::Bundled);
         }
     }
     Err(CoreError::config(format!(
-        "找不到 agent 可执行文件。请构建 Linux 版本后放到 {}：\n  cargo build -p deploy-agent --release --target x86_64-unknown-linux-musl\n（产物在 target/x86_64-unknown-linux-musl/release/deploy-agent）",
+        "本机没有可用的 agent 可执行文件：安装包没内置（旧版客户端会这样），{} 下也没有。装最新客户端，或构建一份放进去：\n  cargo build -p deploy-agent --release --target x86_64-unknown-linux-musl\n（产物在 target/x86_64-unknown-linux-musl/release/deploy-agent）",
         dir.display()
     )))
+}
+
+/// 界面用的只读视图：找不到不报错，`source` 会是 `missing`，让页面自己决定怎么提示。
+pub fn binary_info(store: &Store) -> AgentBinaryInfo {
+    match locate_binary(store) {
+        Ok((path, source)) => AgentBinaryInfo {
+            source,
+            size_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            path: path.display().to_string(),
+        },
+        Err(_) => AgentBinaryInfo {
+            source: AgentBinarySource::Missing,
+            path: String::new(),
+            size_bytes: 0,
+        },
+    }
+}
+
+/// 本机要用的 agent 可执行文件在哪：见 [`locate_binary`]。
+pub fn resolve_binary(store: &Store) -> Result<PathBuf> {
+    locate_binary(store).map(|(path, _)| path)
 }
 
 /// 控制机是哪台：`settings.agent_server_id`。
@@ -676,8 +751,7 @@ impl AgentControl {
 
     /// 安装或更新：上传二进制 + 写 unit + 起服务 + 下发一次配置。
     pub async fn install(&self, server_id: Option<&str>) -> Result<AgentStatus> {
-        let settings = self.settings()?;
-        let binary = resolve_binary(&settings, &self.store)?;
+        let binary = resolve_binary(&self.store)?;
         let server_id = self.resolve_server_id(server_id)?;
         let client = self.connect(Some(&server_id)).await?;
         let result = async {
@@ -1469,19 +1543,54 @@ mod tests {
     }
 
     #[test]
-    fn resolve_binary_prefers_explicit_path() {
+    fn locate_binary_prefers_the_hand_placed_copy_over_the_bundled_one() {
         let dir = tempfile();
         let store = Store::new(&dir);
-        let settings = Settings::default();
-        // 什么都没放：报错要点明该往哪放、怎么构建。
-        let err = resolve_binary(&settings, &store).unwrap_err().to_string();
+        // 两处都没有：报错要点明该往哪放、怎么构建，界面则按 missing 画一行提示。
+        let err = resolve_binary(&store).unwrap_err().to_string();
         assert!(err.contains("agent"), "{err}");
         assert!(err.contains("deploy-agent"), "{err}");
+        assert_eq!(binary_info(&store).source, AgentBinarySource::Missing);
 
+        let bundled = dir.join("bundle").join("deploy-agent");
+        write_fake_binary(&bundled);
+        store.set_bundled_agent_binary(&bundled);
+        assert_eq!(
+            locate_binary(&store).unwrap(),
+            (bundled.clone(), AgentBinarySource::Bundled)
+        );
+
+        // 开发期手放的那份必须压过安装包里的，否则本地新编的产物永远传不上去。
+        let manual = dir.join("agent").join("deploy-agent");
+        write_fake_binary(&manual);
+        assert_eq!(
+            locate_binary(&store).unwrap(),
+            (manual.clone(), AgentBinarySource::Manual)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn locate_binary_rejects_files_that_are_not_linux_binaries() {
+        let dir = tempfile();
+        let store = Store::new(&dir);
         let binary = dir.join("agent").join("deploy-agent");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
-        std::fs::write(&binary, b"fake").unwrap();
-        assert_eq!(resolve_binary(&settings, &store).unwrap(), binary);
+        // 本机 cargo build 出来的那份（PE）或随手放的占位文本，都不该被传上服务器。
+        std::fs::write(&binary, b"MZ\x90\x03 stub").unwrap();
+        let err = resolve_binary(&store).unwrap_err().to_string();
+        assert!(err.contains("ELF"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn agent_binary_info_field_names_match_the_typescript_mirror() {
+        let dir = tempfile();
+        let store = Store::new(&dir);
+        let json = serde_json::to_value(binary_info(&store)).unwrap();
+        assert_eq!(json["source"], "missing");
+        assert_eq!(json["path"], "");
+        assert!(json.get("sizeBytes").is_some(), "{json}");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1534,5 +1643,11 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// 写一份能过 ELF 头检查的假二进制。
+    fn write_fake_binary(path: &Path) {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"\x7fELF\x02\x01\x01fake").unwrap();
     }
 }

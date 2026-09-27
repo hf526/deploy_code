@@ -16,15 +16,15 @@ import {
   ConfirmModal,
   EmptyState,
   Field,
-  Input,
   Page,
   SectionTitle,
   Select,
+  inputClass,
 } from "../components/ui";
 import { api } from "../lib/api";
 import { diskLevel, splitByLocation, syncNeeded } from "../lib/agent";
 import { useApp } from "../lib/store";
-import type { AgentStatus, AgentSyncReport } from "../lib/types";
+import type { AgentBinaryInfo, AgentStatus, AgentSyncReport } from "../lib/types";
 import { cn, formatDuration, humanSize } from "../lib/utils";
 
 /** 控制机卡片上的记录来源。 */
@@ -44,6 +44,8 @@ export default function AgentPage() {
   const refreshContainerConfigs = useApp((state) => state.refreshContainerConfigs);
 
   const [status, setStatus] = useState<AgentStatus | null>(null);
+  // 本机这份 agent 二进制的来源：装不装得成取决于它，所以进页面就查一次，只读展示。
+  const [binary, setBinary] = useState<AgentBinaryInfo | null>(null);
   const [loading, setLoading] = useState(false);
   const [busy, setBusy] = useState<"install" | "sync" | "uninstall" | null>(null);
   const [report, setReport] = useState<AgentSyncReport | null>(null);
@@ -91,6 +93,14 @@ export default function AgentPage() {
   useEffect(() => {
     setRecords(null);
   }, [recordKind]);
+
+  // 二进制是本机盘上的东西，不会因远端而变，进页面读一次就够。
+  useEffect(() => {
+    void api
+      .agentBinaryInfo()
+      .then(setBinary)
+      .catch((error) => toast("error", String(error)));
+  }, [toast]);
 
   async function handleInstall() {
     if (!agentServerId) {
@@ -193,14 +203,16 @@ export default function AgentPage() {
     setReport(null);
   }
 
-  async function handleBinaryPath(value: string) {
-    try {
-      const saved = await api.saveSettings({ ...settings, agentBinaryPath: value });
-      setSettings(saved);
-    } catch (error) {
-      toast("error", String(error));
-    }
-  }
+  // 二进制信息是进页面之后才读到的，读到之前先画「检查中」，别拿红色的「未内置」闪一下。
+  const binarySource = binary?.source ?? "checking";
+  const binaryText = {
+    checking: t("agent.binaryChecking"),
+    bundled: t("agent.binaryBundled"),
+    manual: t("agent.binaryManual"),
+    missing: t("agent.binaryMissing"),
+  }[binarySource];
+  const binaryTone: "green" | "red" | "gray" =
+    binarySource === "bundled" ? "green" : binarySource === "missing" ? "red" : "gray";
 
   const remoteBackup = splitByLocation(backupConfigs).remote;
   const remoteContainer = splitByLocation(containerConfigs).remote;
@@ -264,12 +276,21 @@ export default function AgentPage() {
                 ))}
               </Select>
             </Field>
-            <Field label={t("agent.binaryLabel")} hint={t("agent.binaryHint")}>
-              <Input
-                value={settings.agentBinaryPath}
-                placeholder={t("agent.binaryPlaceholder")}
-                onChange={(event) => void handleBinaryPath(event.target.value)}
-              />
+            <Field
+              label={t("agent.binaryLabel")}
+              hint={
+                binarySource === "missing" ? t("agent.binaryMissingHint") : t("agent.binaryHint")
+              }
+            >
+              <div className={cn(inputClass, "flex items-center gap-2")}>
+                <Badge kind={binaryTone}>{binaryText}</Badge>
+                {binary && binary.source !== "missing" && (
+                  // 内置那份的路径在 Program Files 底下，报个长度就够；手动那份正是要确认指到了哪个文件。
+                  <span className="truncate text-ink-dim" title={binary.path}>
+                    {binary.source === "bundled" ? humanSize(binary.sizeBytes) : binary.path}
+                  </span>
+                )}
+              </div>
             </Field>
           </div>
           <p className="mt-3 text-[12px] leading-relaxed text-ink-dim">{t("agent.portless")}</p>

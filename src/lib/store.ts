@@ -77,7 +77,6 @@ export const defaultSettings: Settings = {
   scheduledContainerConfigIds: [],
   scheduledContainerLastRun: "",
   agentServerId: "",
-  agentBinaryPath: "",
 };
 
 let toastSeq = 0;

@@ -62,6 +62,17 @@ export interface AgentStatus {
   containerLastRun: string;
 }
 
+/** 本机这份 agent 可执行文件的来源（Rust: deploy_core::agent::AgentBinarySource）。 */
+export type AgentBinarySource = "bundled" | "manual" | "missing";
+
+/** 安装包/数据目录里那份 agent 二进制的只读信息（Rust: deploy_core::agent::AgentBinaryInfo）。 */
+export interface AgentBinaryInfo {
+  source: AgentBinarySource;
+  /** 绝对路径；source 为 "missing" 时是空串。 */
+  path: string;
+  sizeBytes: number;
+}
+
 /** 一次下发（注入）的结果（Rust: deploy_core::agent::AgentSyncReport）。 */
 export interface AgentSyncReport {
   servers: number;
@@ -351,8 +362,6 @@ export interface Settings {
   scheduledContainerLastRun: string;
   /** 控制机（跑备份 agent 的那台服务器）的 id；空表示未启用。 */
   agentServerId: string;
-  /** 待上传的 agent 可执行文件路径；空表示用 <数据目录>/agent/deploy-agent。 */
-  agentBinaryPath: string;
 }
 
 /** 关机计划的来源：每天定时排的那一次，或用户手动按下的倒计时。 */
@@ -561,6 +570,10 @@ export interface SecurityReport {
   guardEnabled: boolean;
   guardThreshold: number;
   guardWindowMins: number;
+  /** 免封白名单（服务器上的 ALLOW= 配置，单个 IP）。 */
+  whitelist: string[];
+  /** 本次扫描这条 SSH 连接的来源 IP，未知时为空。 */
+  selfIp: string;
   failed: FailedLogin[];
   success: LoginEvent[];
   sessions: OnlineSession[];
