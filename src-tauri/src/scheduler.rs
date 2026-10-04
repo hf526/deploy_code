@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use deploy_core::models::{AppConfig, BackupRequest, Settings};
 use deploy_core::schedule::{
     clock_jumped, format_date, has_crossed, parse_date, today_at, window_expired,
@@ -20,6 +20,10 @@ use crate::state::{AppState, PendingShutdown, ShutdownSource};
 const CHECK_INTERVAL: Duration = Duration::from_secs(20);
 /// 排定关机后的轮询间隔：20 秒的粒度会让关机点最多晚 20 秒，倒计时也会跳格。
 const COUNTDOWN_INTERVAL: Duration = Duration::from_secs(1);
+/// fire 侧的睡醒闸宽限。排定后轮询是 1 秒一次，正常到点的偏差远小于它；超过宽限还没
+/// 发出去，只可能是倒计时期间进程睡过去（合盖）或时钟前跳 —— 与 arm 侧 clock_jumped
+/// 挡的是同一件事（「唤醒电脑就被关机」），那种情况放弃这次关机，宁可错过不补发。
+const FIRE_GRACE_MS: i64 = 10_000;
 
 /// 定时任务通知（前端转成 toast）。
 #[derive(Clone, Serialize)]
@@ -352,11 +356,22 @@ pub fn spawn_container(app: AppHandle) {
 
 /// 倒计时到点的关机：先摘掉计划（与「取消」互斥），再下发系统关机请求并触发退出清理。
 fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) {
-    if app
-        .state::<AppState>()
-        .take_due_shutdown(now.timestamp_millis())
-        .is_none()
-    {
+    let now_ms = now.timestamp_millis();
+    let Some(plan) = app.state::<AppState>().take_due_shutdown(now_ms) else {
+        return;
+    };
+    // 计划在倒计时期间睡过去（合盖）或时钟前跳，唤醒后的第一个 tick 会发现它早已过期：
+    // 照发就是掀开盖子就开始关机。放弃时计划已摘走，arm 侧当天也记过日期不会再排，
+    // 剩下的只是把状态收敛、把「为什么没关」讲清楚。
+    if now_ms - plan.at_ms > FIRE_GRACE_MS {
+        // earliest 而不是 single：DST 回拨的歧义时刻 single 会落空，提示里就缺了时刻。
+        let planned = Local
+            .timestamp_millis_opt(plan.at_ms)
+            .earliest()
+            .map(|at| at.format("%H:%M").to_string())
+            .unwrap_or_default();
+        emit_status(app);
+        emit_notice(app, "shutdownMissed", Some(planned));
         return;
     }
     match request_shutdown(OS_GRACE_SECS) {

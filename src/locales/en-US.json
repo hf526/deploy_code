@@ -602,7 +602,8 @@
       "countdownDescription": "When the countdown ends DeployCode quits first (killing local builds and reclaiming deploy/backup scripts still running on servers), then hands over to the system shutdown; in-progress tasks are aborted.",
       "armedToast": "Shutdown scheduled: request sent at {{time}}, cancel from the status bar",
       "fired": "Shutdown request sent, DeployCode is finishing cleanup",
-      "failed": "Failed to send the shutdown request: {{error}}"
+      "failed": "Failed to send the shutdown request: {{error}}",
+      "missed": "Shutdown due at {{time}} was missed: the computer slept during the countdown. Skipped to avoid shutting down right after wake-up."
     },
     "dataDir": {
       "title": "Data Directory",

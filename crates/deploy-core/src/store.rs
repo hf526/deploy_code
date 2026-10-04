@@ -1496,9 +1496,17 @@ impl Store {
                         .as_deref()
                         .map(str::trim)
                         .filter(|value| !value.is_empty())
-                        .filter(|key| config.backup_targets.iter().any(|item| &item.id == *key))
                     {
-                        Some(id) => (Some(id.to_string()), None),
+                        // 全局默认目标在场：搬它，与老链解析到的是同一个库。
+                        Some(key) if config.backup_targets.iter().any(|item| item.id == *key) => {
+                            (Some(key.to_string()), None)
+                        }
+                        // 全局默认指向已被删掉的目标：老链在这一级就直接报错、从不落旧版连接串
+                        // （`backup.rs::resolve_target` 的 find_target 失败即返回）。把 DSN 搬过去，
+                        // 每晚的 DROP SCHEMA + 导入就打在一个老链从没碰过的库上 —— 静默换库。
+                        // 什么都不搬，让运行时报「没有可用的备份目标」。
+                        Some(_) => (None, None),
+                        // 没配全局默认目标：老链落到旧版全局连接串，把它搬成配置自己的连接串。
                         None => {
                             let legacy = config.settings.supabase_url.trim().to_string();
                             (None, (!legacy.is_empty()).then_some(legacy))
@@ -3154,6 +3162,21 @@ mod tests {
         config.backup_configs.clear();
         config.backup_targets.clear();
         config.settings.default_backup_target_id = Some("t-gone".to_string());
+        store.save_config(&config).unwrap();
+        assert_eq!(store.migrate_backup_configs().unwrap(), 1);
+        let saved = store.load_config().unwrap();
+        assert_eq!(saved.backup_configs[0].target_id, None);
+        assert_eq!(saved.backup_configs[0].supabase_url, None);
+
+        // 四：全局默认悬空、但旧版全局连接串还在 —— 最容易走错的组合。老链在悬空那一级
+        // 就报错、从不落 DSN，把 DSN 搬过去等于每晚对老链从没碰过的库做 DROP SCHEMA + 导入；
+        // 必须什么都不搬，让运行时明确报「没有可用的备份目标」。
+        let mut config = store.load_config().unwrap();
+        config.backup_configs_migrated = false;
+        config.backup_configs.clear();
+        config.backup_targets.clear();
+        config.settings.default_backup_target_id = Some("t-gone".to_string());
+        config.settings.supabase_url = "postgresql://u:p@h/legacy".to_string();
         store.save_config(&config).unwrap();
         assert_eq!(store.migrate_backup_configs().unwrap(), 1);
         let saved = store.load_config().unwrap();

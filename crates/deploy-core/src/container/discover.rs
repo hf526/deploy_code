@@ -321,6 +321,14 @@ impl ComposeService {
 pub(crate) const PROBE_TEMPLATE: &str = r#"
 project="$1"; wd="$2"; images="$3"
 docker volume ls -q >/dev/null 2>&1 || { echo 'docker 命令不可用或当前用户没有 docker 权限' >&2; exit 3; }
+# 匿名卷的名字是 64 位十六进制且不带任何 compose 标签；只用 shell 内建判长度与字符集，不另起进程。
+is_anonymous() {
+  n="$1"
+  case "$n" in
+    *[!0-9a-f]*) return 1 ;;
+    *) [ "${#n}" -eq 64 ] ;;
+  esac
+}
 printf 'P\t%s\n' "$wd"
 if [ -n "$wd" ] && [ -d "$wd" ]; then
   printf 'S\t%s\n' "$(du -sk "$wd" 2>/dev/null | cut -f1)"
@@ -328,17 +336,46 @@ if [ -n "$wd" ] && [ -d "$wd" ]; then
 else
   printf 'S\t0\n'
 fi
-for v in $(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null); do
+ids=$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)
+# 卷的清单要以「本项目的容器实际挂了什么」为准，不能只认本项目的 project 标签：
+# external: true 的卷、与别的项目共用的卷、daemon 自建的匿名卷都没有这个标签，
+# 只按标签枚举会让它们既进不了备份包也进不了告警 —— 恢复出来就是一个空库，而任务报成功。
+mounted=""
+if [ -n "$ids" ]; then
+  # docker 的 Go 模板对动作外的文本逐字输出（本机实测 docker 29.x）：把 `\n` 写在
+  # `.Name}}` 与 `{{end}}` 之间，输出的是字面量反斜杠 n，卷名带着这个后缀去 inspect
+  # 查不到、整份枚举报废。换行必须写进动作内 printf 的格式串才会被转义；bind 行的
+  # `B` 与路径之间同理，`\t` 字面量会让解析端切不出列。
+  mounted=$(docker inspect -f '{{range .Mounts}}{{if eq .Type "volume"}}{{printf "%s\n" .Name}}{{end}}{{end}}' $ids 2>/dev/null)
+fi
+labeled=$(docker volume ls -q --filter "label=com.docker.compose.project=$project" 2>/dev/null)
+# 卷名只含字母数字与 _ . -，按空白拆词是安全的；去重在 shell 内做，不为这一步依赖 coreutils 的 sort。
+seen=""
+for v in $labeled $mounted; do
+  case " $seen " in *" $v "*) continue ;; esac
+  seen="$seen $v"
   mp=$(docker volume inspect -f '{{.Mountpoint}}' "$v" 2>/dev/null)
   short=$(docker volume inspect -f '{{ with index .Labels "com.docker.compose.volume" }}{{.}}{{ end }}' "$v" 2>/dev/null)
+  vproj=$(docker volume inspect -f '{{ with index .Labels "com.docker.compose.project" }}{{.}}{{ end }}' "$v" 2>/dev/null)
   size=$(du -sk "$mp" 2>/dev/null | cut -f1)
   if [ -n "$mp" ] && [ -r "$mp" ]; then read=1; else read=0; fi
-  if [ -n "$short" ]; then kind=N; else kind=A; fi
-  printf '%s\t%s\t%s\t%s\t%s\n' "$kind" "$v" "$mp" "${size:-0}" "$read"
+  if [ "$vproj" = "$project" ]; then
+    # 本项目创建的卷：带 volume 短名的是命名卷（进包），只有 project 标签的是匿名卷。
+    if [ -n "$short" ]; then kind=N; else kind=A; fi
+  elif [ -n "$vproj" ]; then
+    # 标签属于别的项目：external 卷最常见的形态，带不走，指名报出来。
+    # 这一级要排在匿名判定之前：别的项目的匿名卷也是 64 位十六进制名字，按名字判会漏报。
+    kind=X
+  elif is_anonymous "$v"; then
+    kind=A
+  else
+    # 挂上了但完全没有 compose 标签的具名卷（手工 docker volume create）：带不走，指名说清楚。
+    kind=X
+  fi
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$kind" "$v" "$mp" "${size:-0}" "$read" "$vproj"
 done
-ids=$(docker ps -aq --filter "label=com.docker.compose.project=$project" 2>/dev/null)
 if [ -n "$ids" ]; then
-  docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}B\t{{.Source}}\n{{end}}{{end}}' $ids 2>/dev/null
+  docker inspect -f '{{range .Mounts}}{{if eq .Type "bind"}}{{printf "B\t%s\n" .Source}}{{end}}{{end}}' $ids 2>/dev/null
 fi
 for img in $images; do
   size=$(docker image inspect -f '{{.Size}}' "$img" 2>/dev/null)
@@ -363,6 +400,9 @@ pub(crate) struct ProbeResult {
     pub(crate) image_bytes: u64,
     pub(crate) project_bytes: u64,
     pub(crate) anonymous_volumes: usize,
+    /// 被本项目的容器挂上、但不由本项目创建的卷（`external: true`、与别的项目共用、
+    /// 或手工 `docker volume create`）：卷名 + 它自己那份 project 标签（空 = 没有 compose 标签）。
+    pub(crate) external_volumes: Vec<(String, String)>,
     pub(crate) bind_mounts: Vec<String>,
     pub(crate) env_files: Vec<String>,
     pub(crate) warnings: Vec<String>,
@@ -373,6 +413,7 @@ pub(crate) fn parse_probe(output: &str, services: &[ComposeService]) -> ProbeRes
     let mut bind_mounts = Vec::new();
     let mut env_files = Vec::new();
     let mut anonymous_volumes = 0usize;
+    let mut external_volumes: Vec<(String, String)> = Vec::new();
     let mut volume_bytes = 0u64;
     let mut image_bytes = 0u64;
     let mut project_bytes = 0u64;
@@ -408,6 +449,14 @@ pub(crate) fn parse_probe(output: &str, services: &[ComposeService]) -> ProbeRes
                 });
             }
             "A" => anonymous_volumes += 1,
+            // X 卷名 mountpoint size_kb readable owner_project —— 带不走，但必须指名报出来，
+            // 否则勾了「包含数据卷」备份出来的包里没有它，恢复后是个空库而任务写着成功。
+            "X" => {
+                let name = field(0).to_string();
+                if !name.is_empty() && !external_volumes.iter().any(|(item, _)| *item == name) {
+                    external_volumes.push((name, field(4).to_string()));
+                }
+            }
             "B" => {
                 let source = field(0);
                 // 「在项目目录内」必须带上分隔符再比：只比前缀的话 /opt/app 会把同级的
@@ -446,6 +495,7 @@ pub(crate) fn parse_probe(output: &str, services: &[ComposeService]) -> ProbeRes
         image_bytes,
         project_bytes,
         anonymous_volumes,
+        external_volumes,
         bind_mounts,
         env_files,
         warnings,
@@ -528,6 +578,45 @@ mod tests {
 
     fn probe(rows: &[&str]) -> ProbeResult {
         parse_probe(&rows.join("\n"), &[])
+    }
+
+    /// 容器挂上了、但不由本项目创建的卷必须被指名报出来：只按 project 标签枚举时它既进不了
+    /// 卷清单也进不了告警，等于备份包缺这份数据而任务写着成功、恢复到目标机是个空库。
+    #[test]
+    fn mounted_volume_from_elsewhere_is_reported_by_name() {
+        let result = probe(&[
+            "P\t/opt/blog",
+            "N\tblog_pgdata\t/var/lib/docker/volumes/blog_pgdata/_data\t10\t1\tblog",
+            "X\tshared_pgdata\t/var/lib/docker/volumes/shared_pgdata/_data\t20\t1\tother",
+            "X\tmanual_vol\t/var/lib/docker/volumes/manual_vol/_data\t5\t1\t",
+            "A\t0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        ]);
+        // 只有本项目那份卷进包；带不走的按名字与归属列出来，匿名卷照旧计数。
+        assert_eq!(result.volumes.len(), 1);
+        assert_eq!(result.volumes[0].name, "blog_pgdata");
+        assert_eq!(
+            result.external_volumes,
+            vec![
+                ("shared_pgdata".to_string(), "other".to_string()),
+                ("manual_vol".to_string(), String::new()),
+            ]
+        );
+        assert_eq!(result.anonymous_volumes, 1);
+    }
+
+    /// docker 的 Go 模板对动作外的文本逐字输出（本机实测 docker 29.x：`\n`/`\t` 原样出现在
+    /// 输出里，每个对象末尾才补一个真实换行）。换行与制表符必须写进动作内 printf 的格式串：
+    /// 写在动作外时卷名带字面量 `\n` 后缀、inspect 查不到卷，bind 行没有真实制表符、解析端
+    /// 一行都匹配不上（bind 这条自上线以来一直静默失效，合成输入的单测看不出来）。
+    #[test]
+    fn probe_template_escapes_newlines_only_inside_actions() {
+        assert!(!PROBE_TEMPLATE.contains("\\n{{"));
+        assert!(!PROBE_TEMPLATE.contains("\\t{{"));
+        // 历史上真实的失效形状：`\n`/`\t` 写在动作**之后**（`...}}\n{{end}}`）。
+        assert!(!PROBE_TEMPLATE.contains("}}\\n{{"));
+        assert!(!PROBE_TEMPLATE.contains("}}\\t{{"));
+        assert!(PROBE_TEMPLATE.contains("{{printf \"%s\\n\" .Name}}"));
+        assert!(PROBE_TEMPLATE.contains("{{printf \"B\\t%s\\n\" .Source}}"));
     }
 
     /// 判定 bind mount 在不在项目目录里必须带分隔符：/opt/app 不能把 /opt/application/data 算进来，

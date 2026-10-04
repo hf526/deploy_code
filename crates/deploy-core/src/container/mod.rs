@@ -203,6 +203,19 @@ impl ContainerEngine {
                 probe.anonymous_volumes
             ));
         }
+        // 容器挂上了、但不由本项目创建的卷：以前它连「带不走」这句话都说不出口 ——
+        // 只按 project 标签枚举时它既不在卷清单也不在告警里，等于静默交出一份缺数据的备份包，
+        // 而 external 卷最常见的用法恰恰就是把数据库的数据放在项目之外。
+        for (name, owner) in &probe.external_volumes {
+            let owned = if owner.is_empty() {
+                "不属于任何 compose 项目（external 卷或手工 docker volume create 建的）".to_string()
+            } else {
+                format!("属于项目 {owner}")
+            };
+            warnings.push(format!(
+                "容器挂载了带不走的卷 {name}：{owned}，它不会被打包，恢复到目标机后这一份是空的 —— 请把数据写进本项目的命名卷，或在目标机自备同名卷"
+            ));
+        }
         for bind in &probe.bind_mounts {
             warnings.push(format!(
                 "挂载了项目目录之外的路径 {bind}：它不会被打包，目标机需要自备"
@@ -603,6 +616,11 @@ impl ContainerEngine {
         logger: &mut TaskLogger<ContainerEvent>,
     ) -> Result<(BundleManifest, u64)> {
         let manifest = build_manifest(plan, detail, compose, &plan.source);
+        // 这些「带不走」的话原本只在扫项目时显示在界面上，而定时那晚没人看页面：
+        // 不写进记录，同一份配置就会每晚导出一份缺数据的包而日志里一个字都没有。
+        for warning in &detail.warnings {
+            logger.warn(warning.clone());
+        }
         let id_dir = format!("{root}/{record_id}");
         let remote_tar = format!("{root}/{record_id}.tar");
         let script_path = format!("{id_dir}/snapshot.sh");

@@ -230,16 +230,35 @@ impl BackupEngine {
         let remote_script = format!("/tmp/deploycode-backup-{}.sh", record.id);
         let remote_dump = remote_dump_path(&record.id);
         let result = async {
-            let size = self
+            let size = match self
                 .run_script(
                     &client,
+                    &server,
+                    settings.connect_timeout_secs,
                     &remote_script,
                     &script,
                     timeout,
                     logger,
                     &record.id,
                 )
-                .await?;
+                .await
+            {
+                Ok(size) => size,
+                // KEEP=1 时脚本刻意放过导出文件（等本机来下载），所以失败路径必须由调用方来删它。
+                // 最常见的失败是 STAGE:3/4 导入阶段非零退出 —— 那时全库 gzip 已经躺在源机 /tmp 上，
+                // 而控制机那边 `db_bundle_keep` 兜底成 2，等于每晚失败一次就留一份、没人收。
+                Err(err) => {
+                    if keep {
+                        let _ = client
+                            .exec_capture(
+                                &format!("rm -f {}", shell_quote(&remote_dump)),
+                                30,
+                            )
+                            .await;
+                    }
+                    return Err(err);
+                }
+            };
             if !keep {
                 return Ok(BackupOutcome {
                     dump_size: size,
@@ -416,6 +435,8 @@ impl BackupEngine {
     async fn run_script(
         &self,
         client: &SshClient,
+        server: &ServerConfig,
+        connect_timeout: u64,
         remote: &str,
         script: &str,
         timeout: u64,
@@ -465,7 +486,7 @@ impl BackupEngine {
             ))),
             Err(err) => {
                 // 超时/连接中断时远端脚本可能仍在执行破坏性的清空/导入，
-                // 尽力重新连上并终止其进程组，避免用户重试时并发写同一 schema。
+                // 尽力终止其进程组，避免用户重试时并发写同一 schema。
                 // kill_script 会删除 pidfile，这里一并删除脚本与导出文件。
                 let pidfile = format!("/tmp/deploycode-backup-{record_id}.pid");
                 let dump = remote_dump_path(record_id);
@@ -475,9 +496,24 @@ impl BackupEngine {
                     shell_quote(&dump),
                     shell_quote(remote)
                 );
-                match client.exec_capture(&kill, 15).await {
-                    Ok(_) => logger.warn("已尝试终止远端备份脚本，请确认服务器上没有残留进程"),
-                    Err(_) => logger.warn("无法终止远端备份脚本，请在服务器上检查残留进程"),
+                // 本地超时那条路上这条会话还活着；半开/断线那条路上它已经死了，
+                // 此时原来那句注释承诺的「重新连上」才是唯一出路 —— 所以第一条不通就另起一条，
+                // 而不是拿着注定失败的 exec 结果只留一行 warn。
+                let terminated = match client.exec_capture(&kill, 15).await {
+                    Ok(_) => true,
+                    Err(_) => match SshClient::connect(server, connect_timeout).await {
+                        Ok(retry) => {
+                            let sent = retry.exec_capture(&kill, 15).await.is_ok();
+                            retry.disconnect().await;
+                            sent
+                        }
+                        Err(_) => false,
+                    },
+                };
+                if terminated {
+                    logger.warn("已尝试终止远端备份脚本，请确认服务器上没有残留进程");
+                } else {
+                    logger.warn("无法终止远端备份脚本，请在服务器上检查残留进程");
                 }
                 Err(CoreError::backup(format!("{err}（已尝试终止远端脚本）")))
             }
@@ -584,7 +620,9 @@ impl BackupEngine {
         let settings = self.store.load_config()?.settings;
         let pidfile = format!("/tmp/deploycode-backup-{record_id}.pid");
         let script = format!("/tmp/deploycode-backup-{record_id}.sh");
-        let dump = format!("/tmp/deploycode-backup-{record_id}.sql.gz");
+        // 导出路径只认 remote_dump_path 一处：它必须与脚本模板里的 OUT= 同规则，
+        // 否则善后删的就是别的文件，源机上留一份没人收的全库导出。
+        let dump = remote_dump_path(record_id);
         let command = format!(
             "{}; rm -f {} {}",
             crate::engine::kill_script(&pidfile),
@@ -1095,7 +1133,13 @@ cleanup() {
     rm -f "$OUT" "$PID_FILE" "$0"
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# 信号那一路必须带着 exit，而且导出文件照删。只 trap cleanup INT TERM 时 bash 跑完 handler
+# 会接着往下执行（本机实测：cleanup 之后下一行照样打出来），而到这一步 pidfile 与脚本自身都已删掉，
+# 后面那句 DROP SCHEMA + 导入照跑 —— 本地却早已把这次算成失败，用户点重试就是两个脚本并发写同一个
+# 目标 schema。被信号打断时不会有谁来下载，所以这里连 KEEP=1 也删掉导出。
+# HUP 也要接：任务被 abort 时本地会话先没，远端收到的是 SIGHUP 而不是 TERM（与容器脚本同一口径）。
+trap 'rm -f "$OUT" "$PID_FILE" "$0"; exit 1' INT TERM HUP
 echo $$ > "$PID_FILE"
 
 # Supabase 等托管服务在公网访问，需要 psql 客户端：优先用服务器本机的，退回数据库容器自带的。
@@ -1505,6 +1549,17 @@ mod tests {
         let discard = build_backup_script(&record(), &source(), url, None, false);
         assert!(discard.contains("KEEP=0"));
         assert!(discard.contains("rm -f \"$OUT\" \"$PID_FILE\" \"$0\""));
+    }
+
+    /// 信号那一路必须既删导出又停下：handler 不含 exit 时 bash 跑完清理还会继续往下执行，
+    /// 那时 pidfile 与脚本自身都已删掉，而 DROP SCHEMA + 导入照跑 —— 本地早已把这次算成失败，
+    /// 用户点重试就是两个脚本并发写同一个目标 schema。被信号打断时没人来下载，导出也一并删。
+    #[test]
+    fn signal_trap_deletes_the_dump_and_stops_the_script() {
+        let script = build_backup_script(&record(), &source(), "postgresql://u@h:5432/db", None, true);
+        assert!(script.contains("trap 'rm -f \"$OUT\" \"$PID_FILE\" \"$0\"; exit 1' INT TERM HUP"));
+        // 老写法把 EXIT 与信号合用一个不含 exit 的 handler，等于「清完照跑」。
+        assert!(!script.contains("trap cleanup EXIT INT TERM"));
     }
 
     /// 导出包轮转：同一个（服务器 + 库 + schema）只留最近 keep 个，多出来的删文件并把记录里的

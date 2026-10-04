@@ -136,6 +136,11 @@ export default function App() {
       case "shutdownFired":
         toast("info", i18n.t("settings.shutdown.fired"));
         break;
+      // 倒计时期间电脑睡眠（或时钟前跳），唤醒后计划已过期：放弃是刻意的安全行为，
+      // 不是下发失败 —— 但要让用户知道为什么没关。
+      case "shutdownMissed":
+        toast("info", i18n.t("settings.shutdown.missed", { time: notice.message ?? "" }));
+        break;
       case "shutdownFailed":
         toast("error", i18n.t("settings.shutdown.failed", { error: notice.message ?? "" }));
         break;

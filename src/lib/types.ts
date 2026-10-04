@@ -451,6 +451,8 @@ export interface SchedulerNotice {
     | /** 执行位已改回本机的配置，控制机那份里还留着：今晚两边各跑一次。 */
       "agentStranded"
     | "shutdownFired"
+    | /** 倒计时期间电脑睡眠（或时钟前跳），唤醒后计划已过期：刻意放弃这次关机，不是失败。 */
+      "shutdownMissed"
     | "shutdownFailed";
   message?: string;
 }
