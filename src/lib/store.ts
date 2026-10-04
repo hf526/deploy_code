@@ -543,6 +543,17 @@ export const useApp = create<AppStore>((set, get) => ({
   },
 
   handleDeployEvent: (event) => {
+    if (event.type === "batchAborted") {
+      // 中止那台没有记录，也就不会有 record 级的 announce（刷新列表 + 弹提示）；
+      // 不补这一句就等于一批里静默少发了几台机器。
+      get().toast(
+        "error",
+        i18n.t("deploy.toast.batchAborted", {
+          succeeded: event.succeeded,
+          total: event.total,
+        }),
+      );
+    }
     applyTaskEvent<DeployRecord>(event, {
       getLive: () => get().live,
       setLive: (live) => set({ live }),

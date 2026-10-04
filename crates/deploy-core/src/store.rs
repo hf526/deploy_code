@@ -10,11 +10,22 @@ use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
 use crate::schedule::ScheduleState;
 use crate::models::{
-    now_string, new_id, AppConfig, BackupConfig, BackupRecord, ContainerConfig, ContainerRecord,
-    DbBackupSource, DeployConfig, DeployRecord, DeployStatus, EnvFileConfig, ExportData,
-    ImportCounts, ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig, RunLocation,
-    ServerConfig, SshAuth,
+    now_string, new_id, AppConfig, BackupConfig, BackupRecord, BackupTarget, ContainerConfig,
+    ContainerRecord, DbBackupSource, DeployConfig, DeployRecord, DeployStatus, EnvFileConfig,
+    ExportData, ImportCounts, ImportPreview, PagesConfigEntry, PagesDeployRecord, RepoConfig,
+    RunLocation, ServerConfig, SshAuth,
 };
+
+/// 一个「盘上有文件、记录里已经没有指向它」的本地备份包。见 [`Store::orphan_bundles`]。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanBundle {
+    /// `"database"` 或 `"container"`：两个目录分开列，用户才知道删的是哪一类。
+    pub kind: String,
+    pub file_name: String,
+    pub path: String,
+    pub size_bytes: u64,
+}
 
 /// 配置与部署记录的本地存储（JSON 文件）。
 ///
@@ -223,6 +234,32 @@ impl Store {
         )
     }
 
+    /// 还有哪些台机器「已经不是控制机、但上面可能还装着 agent」需要收回。
+    pub fn orphan_agent_servers(&self) -> Vec<String> {
+        self.load_agent_sync().orphan_server_ids
+    }
+
+    /// 记一台收回失败的旧控制机。它还在自行执行定时，盘上也还留着全部源机的明文口令，
+    /// 这笔待办要一直挂在界面上，直到 [`Store::forget_orphan_agent`] 把它撤掉。
+    pub fn remember_orphan_agent(&self, server_id: &str) -> Result<()> {
+        let mut state = self.load_agent_sync();
+        if state.orphan_server_ids.iter().any(|item| item == server_id) {
+            return Ok(());
+        }
+        state.add_orphan(server_id);
+        self.save_agent_sync(&state)
+    }
+
+    /// 撤掉一笔待收回（那台的 agent 真的卸掉了，或这台服务器被删了）。
+    pub fn forget_orphan_agent(&self, server_id: &str) -> Result<()> {
+        let mut state = self.load_agent_sync();
+        if !state.orphan_server_ids.iter().any(|item| item == server_id) {
+            return Ok(());
+        }
+        state.remove_orphan(server_id);
+        self.save_agent_sync(&state)
+    }
+
     /// 收回指向某台控制机的本机状态：执行位退回本机、指向清空、同步指纹作废；返回改回本机的条数。
     ///
     /// 「卸载 agent」与「删除这台服务器」共用这一条。两条判据都要有：
@@ -255,7 +292,17 @@ impl Store {
         if mine {
             let mut state = self.load_agent_sync();
             state.clear();
+            state.remove_orphan(server_id);
             self.save_agent_sync(&state)?;
+        } else if self
+            .load_agent_sync()
+            .orphan_server_ids
+            .iter()
+            .any(|item| item == server_id)
+        {
+            // 待收回那台被卸载成功、或整台服务器被删掉了：这条待办到此为止，
+            // 留着只会指着一个不存在（或已经干净）的目标一直红着。
+            self.forget_orphan_agent(server_id)?;
         }
         Ok(moved)
     }
@@ -572,6 +619,128 @@ impl Store {
         write_records::<ContainerRecord>(&self.containers_path(), &[])
     }
 
+    /// 列出两个备份包目录里「盘上有文件、记录中已经没有指向它」的包，按大小从大到小。
+    ///
+    /// 出现的原因有两个，都不是 bug：记录列表按 `*_history_limit` 裁剪（[`upsert_record`]），
+    /// 以及界面上的删除记录 / 清空刻意不带走备份包。问题是轮转的候选集完全来自记录，
+    /// 所以这些包从此再没有代码路径会去删 —— 这个视图把它们显出来，交给用户手动清。
+    /// 正在写的半截包（`*.part`）不算，那属于进行中的任务。
+    pub fn orphan_bundles(&self) -> Result<Vec<OrphanBundle>> {
+        let referenced = self.referenced_bundle_keys()?;
+        let mut found = Vec::new();
+        for (kind, dir) in [
+            ("database", self.db_bundle_dir()),
+            ("container", self.container_bundle_dir()),
+        ] {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let file_name = entry.file_name().to_string_lossy().into_owned();
+                if !path.is_file() || file_name.ends_with(".part") {
+                    continue;
+                }
+                let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+                if referenced.0.contains(&canonical) || referenced.1.contains(&file_name) {
+                    continue;
+                }
+                found.push(OrphanBundle {
+                    kind: kind.to_string(),
+                    file_name,
+                    path: path.display().to_string(),
+                    size_bytes: path.metadata().map(|m| m.len()).unwrap_or(0),
+                });
+            }
+        }
+        found.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+        Ok(found)
+    }
+
+    /// 删掉这些孤儿包，返回删掉的个数与释放的字节数。
+    ///
+    /// 三条硬边界：① 只认这两个目录的**直接子文件**，路径不对就整批拒绝（不静默跳过，
+    /// 免得界面以为清干净了）；② 删之前重新核一遍记录，已经被人补回去的包不许删；
+    /// ③ 备份或容器任务在跑时拒绝执行 —— 刚生成的包还没写进记录，此刻会被当成孤儿删掉。
+    pub fn delete_orphan_bundles(&self, paths: &[String]) -> Result<(usize, u64)> {
+        let _backup = self
+            .try_task_lock("backup")?
+            .ok_or_else(|| CoreError::busy("数据库备份正在进行，请等它结束后再清理备份包"))?;
+        let _container = self
+            .try_task_lock("container")?
+            .ok_or_else(|| CoreError::busy("容器备份 / 迁移正在进行，请等它结束后再清理备份包"))?;
+        let dirs = [self.db_bundle_dir(), self.container_bundle_dir()];
+        let referenced = self.referenced_bundle_keys()?;
+        let mut deleted = 0usize;
+        let mut freed = 0u64;
+        for raw in paths {
+            let path = PathBuf::from(raw.trim());
+            let parent = match path.parent() {
+                Some(parent) => parent.to_path_buf(),
+                None => {
+                    return Err(CoreError::config(format!(
+                        "只能删除备份包目录里的文件: {}",
+                        path.display()
+                    )))
+                }
+            };
+            if !dirs.iter().any(|dir| dir.as_path() == parent.as_path()) {
+                return Err(CoreError::config(format!(
+                    "只能删除备份包目录里的文件: {}",
+                    path.display()
+                )));
+            }
+            let file_name = path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            if referenced.0.contains(&canonical) || referenced.1.contains(&file_name) {
+                return Err(CoreError::config(format!(
+                    "「{file_name}」还挂在某条记录上，不能删。请先确认那条记录是否还在。"
+                )));
+            }
+            let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            match std::fs::remove_file(&path) {
+                Ok(_) => {
+                    deleted += 1;
+                    freed += size;
+                }
+                // 文件已经不在了（用户自己删了、或另一个进程收掉了）：不算失败，也不算释放。
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(err) => return Err(CoreError::io_path(&path, err)),
+            }
+        }
+        Ok((deleted, freed))
+    }
+
+    /// 现有记录指向的包：一份 canonical 路径集合 + 一份文件名集合。
+    ///
+    /// 两道判据是为了安全方向上保守：路径写法不一致（`/` 与 `\`、映射盘符）时按文件名也能认出
+    /// 「这不是孤儿」，宁可漏报孤儿，也不能把一个还有效的包摆到清理列表里。
+    fn referenced_bundle_keys(&self) -> Result<(std::collections::HashSet<PathBuf>, std::collections::HashSet<String>)> {
+        let mut paths = std::collections::HashSet::new();
+        let mut names = std::collections::HashSet::new();
+        let mut collect = |raw: &str| {
+            if raw.trim().is_empty() {
+                return;
+            }
+            let path = PathBuf::from(raw);
+            if let Some(name) = path.file_name() {
+                names.insert(name.to_string_lossy().into_owned());
+            }
+            paths.insert(path.canonicalize().unwrap_or_else(|_| path.clone()));
+        };
+        for record in self.load_backups()? {
+            collect(&record.bundle_path);
+        }
+        for record in self.load_containers()? {
+            collect(&record.bundle_path);
+        }
+        Ok((paths, names))
+    }
+
     /// 导出配置（JSON 格式，敏感字段已脱敏）。
     pub fn export_config(&self) -> Result<String> {
         let config = self.load_config()?;
@@ -671,6 +840,127 @@ impl Store {
             .iter()
             .find(|item| item.id == key || item.name == key)
             .ok_or_else(|| CoreError::not_found(format!("备份配置不存在: {key}")))
+    }
+
+    /// 哪些地方还在引用这些（即将被删除的）备份目标，返回可直接拼进报错的引用者名字。
+    ///
+    /// 删除必须过这一关：目标没了之后，绑定它的备份配置在解析目标时会一路往下兜底到
+    /// 服务器绑定 / 全局旧连接串，而那一步对新目标做的是 `DROP SCHEMA ... CASCADE` ——
+    /// 静默换库不是「备份到别处」那么轻。
+    pub fn backup_target_referrers(config: &AppConfig, dropped_ids: &[&str]) -> Vec<String> {
+        let mut who = Vec::new();
+        if config
+            .settings
+            .default_backup_target_id
+            .as_deref()
+            .is_some_and(|id| dropped_ids.contains(&id))
+        {
+            who.push("设置里的默认备份目标".to_string());
+        }
+        for server in &config.servers {
+            if server
+                .backup_target_id
+                .as_deref()
+                .is_some_and(|id| dropped_ids.contains(&id))
+            {
+                who.push(format!("服务器「{}」", server.name));
+            }
+        }
+        for item in &config.backup_configs {
+            if item
+                .target_id
+                .as_deref()
+                .is_some_and(|id| dropped_ids.contains(&id))
+            {
+                who.push(format!("备份配置「{}」", item.name));
+            }
+        }
+        who
+    }
+
+    /// 用新列表整体替换备份目标：规范化校验 → 拒绝删除仍被引用的目标 → 落盘。
+    ///
+    /// 界面的列表增删和 CLI 的 `backup target remove` 共用这一条，两边口径必须一致。
+    pub fn replace_backup_targets(&self, targets: &[BackupTarget]) -> Result<Vec<BackupTarget>> {
+        let mut normalized: Vec<BackupTarget> = Vec::with_capacity(targets.len());
+        for target in targets {
+            let mut target = target.clone();
+            target.name = target.name.trim().to_string();
+            target.url = target.url.trim().to_string();
+            if target.name.is_empty() {
+                return Err(CoreError::config("备份目标名称不能为空"));
+            }
+            if !target.url.starts_with("postgres://") && !target.url.starts_with("postgresql://")
+            {
+                return Err(CoreError::config(format!(
+                    "备份目标「{}」的连接串必须以 postgres:// 或 postgresql:// 开头",
+                    target.name
+                )));
+            }
+            if target.id.trim().is_empty() {
+                target.id = new_id();
+            }
+            normalized.push(target);
+        }
+        let mut names: Vec<&str> = normalized.iter().map(|item| item.name.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CoreError::config("备份目标名称不能重复"));
+        }
+        let mut ids: Vec<&str> = normalized.iter().map(|item| item.id.as_str()).collect();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(CoreError::config("备份目标 ID 不能重复"));
+        }
+
+        let kept: Vec<String> = normalized.iter().map(|item| item.id.clone()).collect();
+        let saved = normalized;
+        self.mutate_config(|config| {
+            let dropped: Vec<String> = config
+                .backup_targets
+                .iter()
+                .map(|item| item.id.clone())
+                .filter(|id| !kept.contains(id))
+                .collect();
+            if !dropped.is_empty() {
+                let dropped_refs: Vec<&str> = dropped.iter().map(String::as_str).collect();
+                let who = Self::backup_target_referrers(config, &dropped_refs);
+                if !who.is_empty() {
+                    let names: Vec<&str> = config
+                        .backup_targets
+                        .iter()
+                        .filter(|item| dropped.iter().any(|id| *id == item.id))
+                        .map(|item| item.name.as_str())
+                        .collect();
+                    return Err(CoreError::config(format!(
+                        "备份目标「{}」仍被引用，不能删除。请先解绑：{}",
+                        names.join("」「"),
+                        who.join("、")
+                    )));
+                }
+            }
+            config.backup_targets = saved.clone();
+            Ok(())
+        })?;
+        Ok(saved)
+    }
+
+    /// 把配置里保存的目标（id 或名称）解析成真实存在的目标 id。
+    ///
+    /// 解析不出来就报错，**不要**按「未绑定」清空：清空等于把这条配置交给备份时往下兜底，
+    /// 那一晚它会打到另一个库上（见 [`backup_target_referrers`]）。
+    pub fn resolve_backup_target_id(config: &AppConfig, raw: &str) -> Result<String> {
+        let key = raw.trim();
+        config
+            .backup_targets
+            .iter()
+            .find(|item| item.id == key || item.name == key)
+            .map(|item| item.id.clone())
+            .ok_or_else(|| {
+                CoreError::config(format!(
+                    "备份目标不存在: {key}，请在数据库备份页重新为这条配置选一个目标"
+                ))
+            })
     }
 
     /// 按 id / 名称查找部署配置；id 精确命中优先，避免与名称歧义。
@@ -1193,6 +1483,28 @@ impl Store {
                 } else {
                     server.supabase_url.clone()
                 };
+                // 服务器自己没绑目标的，旧行为是顺着「全局默认目标 → 旧版全局连接串」再往下找。
+                // 而走已保存配置的备份不许再顺这两级（`backup.rs::resolve_backup` 拦换库），
+                // 所以要把当时解析到的那一个搬成这条配置自己的目标：搬的是同一个库，不是换库；
+                // 不搬的话这批老用户的定时备份从迁移那次起就一夜都不跑。
+                let (target_id, supabase_url) = if target_id.is_some() || supabase_url.is_some() {
+                    (target_id, supabase_url)
+                } else {
+                    match config
+                        .settings
+                        .default_backup_target_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .filter(|key| config.backup_targets.iter().any(|item| &item.id == *key))
+                    {
+                        Some(id) => (Some(id.to_string()), None),
+                        None => {
+                            let legacy = config.settings.supabase_url.trim().to_string();
+                            (None, (!legacy.is_empty()).then_some(legacy))
+                        }
+                    }
+                };
                 additions.push(BackupConfig {
                     id: new_id(),
                     name,
@@ -1385,6 +1697,18 @@ fn keep_option_when_absent(
     }
 }
 
+/// 执行位是「本机把这活儿交给了控制机」的那根线，跟 `agent_server_id` 一样只属于本机。
+///
+/// 导出侧会把它抹成 `Local`（见 `models.rs` 的 `ExportData::new`），那是给**没有 agent 的机器**
+/// 准备的：照原样带过去就是一条指向不存在 agent 的死配置。同一台机器重新导入自己的配置时，
+/// 这个抹掉的值不能顶掉本机那份 —— 本机撒手回自己跑，而控制机上那份到点照跑，
+/// 同一晚出两份包、落在两台机器上，恢复时只找得到其中一份。
+fn keep_remote_location(incoming: &mut RunLocation, current: &RunLocation) {
+    if !incoming.is_remote() && current.is_remote() {
+        *incoming = *current;
+    }
+}
+
 /// env 文件按数组下标对齐：导出保留了顺序与条数，脱敏后只剩空串，只能按序回填。
 fn merge_env_files(incoming: &mut Vec<EnvFileConfig>, current: &[EnvFileConfig], kept: &mut usize) {
     for (index, file) in incoming.iter_mut().enumerate() {
@@ -1477,6 +1801,9 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
                 &current.supabase_url,
                 &mut kept,
             );
+            // 执行位跟本机走（见下面 agent_server_id 那段）：导出把它抹成本机是为了不让
+            // 新机继承一个没有 agent 的指向，而不是「这次要改回本机跑」。
+            keep_remote_location(&mut incoming.run_location, &current.run_location);
         },
     );
     preview.pages_configs = merge_by_id(
@@ -1490,7 +1817,9 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         &mut config.container_configs,
         &data.container_configs,
         |item| item.id.as_str(),
-        |_, _| {},
+        |incoming: &mut ContainerConfig, current: &ContainerConfig| {
+            keep_remote_location(&mut incoming.run_location, &current.run_location);
+        },
     );
 
     // 设置整体跟随导入文件（换机迁移主要靠它），但导出的空凭据一律保留本机值。
@@ -1511,6 +1840,12 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         &config.settings.cronjob_api_key,
         &mut kept,
     );
+    // 旧版全局备份连接串导出时是空串，本机有值就继续用本机的，否则那条老兜底会被导出的空值清掉。
+    keep_when_blank(
+        &mut settings.supabase_url,
+        &config.settings.supabase_url,
+        &mut kept,
+    );
     if settings.master_password_hash.is_none() && config.settings.master_password_hash.is_some() {
         settings.master_password_hash = config.settings.master_password_hash.clone();
         kept += 1;
@@ -1521,6 +1856,13 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
     settings.scheduled_backup_last_run = config.settings.scheduled_backup_last_run.clone();
     settings.scheduled_container_last_run = config.settings.scheduled_container_last_run.clone();
     settings.scheduled_shutdown_last_run = config.settings.scheduled_shutdown_last_run.clone();
+    // 控制机的指向同理跟本机走：导出把它抹空是给没装 agent 的机器准备的，
+    // 而本机重新导入自己的配置时被抹空的那份顶掉，等于静默拆掉这条线 ——
+    // 两条配置的执行位（上面按条保留）就成了无主状态，定时与手动都不再走控制机。
+    if settings.agent_server_id.trim().is_empty() && !config.settings.agent_server_id.trim().is_empty()
+    {
+        settings.agent_server_id = config.settings.agent_server_id.clone();
+    }
     config.settings = settings;
 
     preview.kept_local_secrets = kept;
@@ -1828,6 +2170,56 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 同一台机器重新导入自己的配置：不能把控制机那根线拆了。
+    ///
+    /// 拆掉的后果不是「报错」而是**两份包**：本机撒手回自己跑，而控制机上那份到点照跑，
+    /// 同一个库同一晚被导出两次、包落在两台机器上，恢复时只找得到其中一份。
+    #[test]
+    fn import_keeps_this_machines_agent_wiring() {
+        let (store, dir) = temp_store();
+        let mut config = AppConfig::default();
+        config.settings.agent_server_id = "ctrl".to_string();
+        let mut backup =
+            BackupConfig::new("夜间库".to_string(), "s1".to_string(), DbBackupSource::default());
+        backup.id = "b1".to_string();
+        backup.run_location = RunLocation::Remote;
+        config.backup_configs.push(backup);
+        config.container_configs.push(ContainerConfig {
+            id: "c1".to_string(),
+            name: "博客".to_string(),
+            server_id: "s1".to_string(),
+            project: "app".to_string(),
+            pause_source: false,
+            include_volumes: true,
+            include_images: false,
+            target: None,
+            created_at: String::new(),
+            run_location: RunLocation::Remote,
+        });
+        store.save_config(&config).unwrap();
+        let exported = store.export_config().unwrap();
+        // 导出侧确实抹掉了这两样，否则这条测试什么都没守住。
+        let payload: ExportData = serde_json::from_str(&exported).unwrap();
+        assert_eq!(payload.settings.agent_server_id, "");
+        assert_eq!(payload.backup_configs[0].run_location, RunLocation::Local);
+        assert_eq!(payload.container_configs[0].run_location, RunLocation::Local);
+
+        store.import_config(&exported).unwrap();
+        let after = store.load_config().unwrap();
+        assert_eq!(after.settings.agent_server_id, "ctrl");
+        assert_eq!(after.backup_configs[0].run_location, RunLocation::Remote);
+        assert_eq!(after.container_configs[0].run_location, RunLocation::Remote);
+
+        // 换到没装 agent 的机器才是导出抹掉它们的用途：本机没这根线时不能凭空长出来。
+        store.save_config(&AppConfig::default()).unwrap();
+        store.import_config(&exported).unwrap();
+        let on_fresh_machine = store.load_config().unwrap();
+        assert_eq!(on_fresh_machine.settings.agent_server_id, "");
+        assert_eq!(on_fresh_machine.backup_configs[0].run_location, RunLocation::Local);
+        assert_eq!(on_fresh_machine.container_configs[0].run_location, RunLocation::Local);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn export_blankout_does_not_erase_local_db_credentials() {
         let (store, dir) = temp_store();
@@ -1863,17 +2255,27 @@ mod tests {
         );
         backup.id = "b1".to_string();
         backup.supabase_url = Some("postgres://u:cfg_local@h/db".to_string());
+        let mut settings = crate::models::Settings::default();
+        // 旧版全局备份连接串：导出必须抹掉，导回必须保住本机这份（它仍是兜底解析用的一条）。
+        settings.supabase_url = "postgresql://u:legacy_local@host/legacydb".to_string();
         store
             .save_config(&AppConfig {
                 servers: vec![server],
                 backup_targets: vec![target],
                 backup_configs: vec![backup],
+                settings,
                 ..Default::default()
             })
             .unwrap();
 
         let exported = store.export_config().unwrap();
-        for secret in ["db_local", "tgt_local", "src_local", "cfg_local"] {
+        for secret in [
+            "db_local",
+            "tgt_local",
+            "src_local",
+            "cfg_local",
+            "legacy_local",
+        ] {
             assert!(!exported.contains(secret), "导出内容泄露了 {secret}");
         }
 
@@ -1891,8 +2293,12 @@ mod tests {
             after.backup_configs[0].supabase_url.as_deref(),
             Some("postgres://u:cfg_local@h/db")
         );
-        // 服务器 2 + 目标 1 + 备份配置 2
-        assert_eq!(preview.kept_local_secrets, 5);
+        // 服务器 1 + 目标 1 + 备份配置 2 + 旧版全局连接串 1
+        assert_eq!(preview.kept_local_secrets, 6);
+        assert_eq!(
+            after.settings.supabase_url,
+            "postgresql://u:legacy_local@host/legacydb"
+        );
 
         // 换机导入（本机没有对应值）：不能落进 Some("")，那会被下游当成一条可用连接串。
         let (fresh, fresh_dir) = temp_store();
@@ -2678,6 +3084,86 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 只配了「全局默认目标」（或旧版全局连接串）的老用户：迁移要把当时解析到的那一个搬进配置。
+    ///
+    /// 走已保存配置的备份不许再顺全局兜底（那是换库风险，`backup.rs::resolve_backup` 拦），
+    /// 不搬的话这批人从迁移那一夜起一次都备份不成，而界面上看着一切正常。
+    /// 搬的是同一个库，不是换库。
+    #[test]
+    fn migrate_backup_configs_carries_the_resolved_global_target() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-store-migrate-global-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::new(&dir);
+        let source = || DbBackupSource {
+            database: "app".to_string(),
+            username: "postgres".to_string(),
+            ..DbBackupSource::default()
+        };
+        let server = |name: &str| {
+            let mut item = ServerConfig::new(
+                name.to_string(),
+                "10.0.0.1".to_string(),
+                "u".to_string(),
+                SshAuth::Password {
+                    password: "x".to_string(),
+                },
+            );
+            item.db_backup = Some(source());
+            item
+        };
+
+        // 一：全局默认目标在场 → 搬成这条配置自己的目标。
+        let mut config = AppConfig::default();
+        config.backup_targets.push(BackupTarget {
+            id: "t-global".to_string(),
+            name: "仓库库".to_string(),
+            url: "postgresql://u:p@h/warehouse".to_string(),
+        });
+        config.settings.default_backup_target_id = Some("t-global".to_string());
+        config.servers.push(server("prod"));
+        store.save_config(&config).unwrap();
+        assert_eq!(store.migrate_backup_configs().unwrap(), 1);
+        let saved = store.load_config().unwrap();
+        assert_eq!(saved.backup_configs[0].target_id.as_deref(), Some("t-global"));
+        assert_eq!(saved.backup_configs[0].supabase_url, None);
+
+        // 二：只有旧版全局连接串 → 搬成这条配置自己的连接串。
+        let dir2 = std::env::temp_dir().join(format!(
+            "deploycode-store-migrate-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store2 = Store::new(&dir2);
+        let mut config = AppConfig::default();
+        config.settings.supabase_url = "postgresql://u:p@h/legacy".to_string();
+        config.servers.push(server("prod"));
+        store2.save_config(&config).unwrap();
+        assert_eq!(store2.migrate_backup_configs().unwrap(), 1);
+        let saved = store2.load_config().unwrap();
+        assert_eq!(saved.backup_configs[0].target_id, None);
+        assert_eq!(
+            saved.backup_configs[0].supabase_url.as_deref(),
+            Some("postgresql://u:p@h/legacy")
+        );
+
+        // 三：全局默认指向一个已被删掉的目标 → 不搬（搬过去只会得到一条解析不了的绑定），
+        // 让运行时明确报「这条配置没有可用的备份目标」，而不是悄悄连到别的库上。
+        let mut config = store.load_config().unwrap();
+        config.backup_configs_migrated = false;
+        config.backup_configs.clear();
+        config.backup_targets.clear();
+        config.settings.default_backup_target_id = Some("t-gone".to_string());
+        store.save_config(&config).unwrap();
+        assert_eq!(store.migrate_backup_configs().unwrap(), 1);
+        let saved = store.load_config().unwrap();
+        assert_eq!(saved.backup_configs[0].target_id, None);
+        assert_eq!(saved.backup_configs[0].supabase_url, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+    }
+
     fn history_record(id: &str, status: DeployStatus) -> DeployRecord {
         let status = serde_json::to_string(&status).unwrap();
         serde_json::from_str(&format!(
@@ -2841,6 +3327,147 @@ mod tests {
         );
         // 收敛过之后再次调用不应产生变更。
         assert_eq!(store.mark_interrupted().unwrap(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 仍被引用的备份目标不许删：静默解绑之后那次备份会沿兜底链路打到另一个库上，
+    /// 而备份脚本对新库的第一步是 `DROP SCHEMA ... CASCADE`。
+    #[test]
+    fn replace_backup_targets_refuses_to_drop_a_referenced_target() {
+        let dir =
+            std::env::temp_dir().join(format!("deploycode-store-targets-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+
+        let mut target =
+            BackupTarget::new("Aiven".to_string(), "postgresql://a@h/db".to_string());
+        target.id = "t1".to_string();
+        let mut saved = BackupConfig::new(
+            "每晚".to_string(),
+            "s1".to_string(),
+            DbBackupSource {
+                database: "app".to_string(),
+                ..DbBackupSource::default()
+            },
+        );
+        saved.id = "b1".to_string();
+        saved.target_id = Some("t1".to_string());
+        store
+            .save_config(&AppConfig {
+                backup_targets: vec![target.clone()],
+                backup_configs: vec![saved],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let err = store
+            .replace_backup_targets(&[])
+            .expect_err("被引用的目标不许删");
+        let text = err.to_string();
+        assert!(
+            text.contains("Aiven") && text.contains("每晚"),
+            "报错要同时点出目标与引用者：{text}"
+        );
+        let after = store.load_config().unwrap();
+        assert_eq!(after.backup_targets.len(), 1, "被拒绝的删除不该落盘");
+        assert_eq!(after.backup_configs[0].target_id.as_deref(), Some("t1"));
+
+        // 解绑之后就放行 —— 拦的是静默换库，不是删目标本身。
+        store
+            .mutate_config(|config| {
+                config.backup_configs[0].target_id = None;
+                Ok(())
+            })
+            .unwrap();
+        store.replace_backup_targets(&[]).unwrap();
+        assert!(store.load_config().unwrap().backup_targets.is_empty());
+
+        // 名称首尾空格照旧清掉，重名照旧拒绝。
+        let renamed = store
+            .replace_backup_targets(&[BackupTarget::new(
+                "  目标库  ".to_string(),
+                "postgresql://b@h/db".to_string(),
+            )])
+            .unwrap();
+        assert_eq!(renamed[0].name, "目标库");
+        let mut same = renamed[0].clone();
+        same.id = "other-id".to_string();
+        assert!(store.replace_backup_targets(&[renamed[0].clone(), same]).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 记录被裁剪或手动删掉之后留在盘上的包要能看见、能清，同时越界路径与有记录的包一律不许删。
+    #[test]
+    fn orphan_bundles_lists_files_without_records_and_protects_the_rest() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-store-orphans-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Store::new(&dir);
+        let db_dir = store.db_bundle_dir();
+        let container_dir = store.container_bundle_dir();
+        std::fs::create_dir_all(&db_dir).unwrap();
+        std::fs::create_dir_all(&container_dir).unwrap();
+
+        let kept = db_dir.join("app-keep.sql.gz");
+        std::fs::write(&kept, "x".repeat(10)).unwrap();
+        let orphan = db_dir.join("app-orphan.sql.gz");
+        std::fs::write(&orphan, "y".repeat(20)).unwrap();
+        // 进行中的半截包属于那次任务，不该被当成孤儿。
+        std::fs::write(db_dir.join("app-part.sql.gz.part"), "z").unwrap();
+        let tar = container_dir.join("blog-orphan.tar");
+        std::fs::write(&tar, "w".repeat(5)).unwrap();
+
+        let mut record = backup_record("b1", DeployStatus::Success);
+        record.bundle_path = kept.display().to_string();
+        store.upsert_backup(&record, 0).unwrap();
+
+        let orphans = store.orphan_bundles().unwrap();
+        let names: Vec<&str> = orphans
+            .iter()
+            .map(|item| item.file_name.as_str())
+            .collect();
+        assert!(names.contains(&"app-orphan.sql.gz"), "{names:?}");
+        assert!(names.contains(&"blog-orphan.tar"), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.contains("keep")),
+            "有记录指向的包不该出现：{names:?}"
+        );
+        assert!(
+            !names.iter().any(|name| name.ends_with(".part")),
+            "半截包不该进清理列表：{names:?}"
+        );
+        assert_eq!(orphans[0].size_bytes, 20, "按大小从大到小排");
+        assert_eq!(orphans[0].kind, "database");
+
+        // 目录外的路径整批拒绝，而且一个都不删。
+        let outside = dir.join("config.json");
+        let err = store
+            .delete_orphan_bundles(&[outside.display().to_string()])
+            .expect_err("越界路径必须拒绝");
+        assert!(err.to_string().contains("只能删除备份包目录"), "{err}");
+        assert!(orphan.is_file());
+        // 还挂在记录上的不许删。
+        assert!(store
+            .delete_orphan_bundles(&[kept.display().to_string()])
+            .is_err());
+        assert!(kept.is_file());
+
+        // 有任务在跑时拒绝：那次的包还没写进记录，此刻会被当成孤儿删掉。
+        let held = store.try_task_lock("backup").unwrap();
+        assert!(store
+            .delete_orphan_bundles(&[orphan.display().to_string()])
+            .is_err());
+        assert!(orphan.is_file());
+        drop(held);
+
+        let (count, freed) = store
+            .delete_orphan_bundles(&[orphan.display().to_string(), tar.display().to_string()])
+            .unwrap();
+        assert_eq!((count, freed), (2, 25));
+        assert!(!orphan.exists() && !tar.exists());
+        assert!(kept.is_file());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -1,4 +1,4 @@
-import type { AgentStatus, BackupConfig, ContainerConfig, RunLocation } from "./types";
+import type { AgentStaleness, AgentStatus, BackupConfig, ContainerConfig, RunLocation } from "./types";
 
 /** 磁盘水位三档：控制机一块盘要扛所有备份包，界面必须把「还能不能写得下」说清楚。 */
 export type DiskLevel = "ok" | "tight" | "low";
@@ -38,4 +38,22 @@ export function syncNeeded(status: AgentStatus | null, configs: { backup: Backup
     status.backupConfigs + status.containerConfigs !== remote ||
     status.servers !== configs.servers
   );
+}
+
+/**
+ * 后端那份陈旧结论拆成界面好用的形状。
+ *
+ * `syncNeeded` 只比配置条数：定时改了没下发、某条改回本机而控制机还留着它，这两种它都看不见，
+ * 而这两件事都会让控制机在夜里做出与界面上相反的动作，所以点名的部分要单独有一栏。
+ */
+export function stalenessHints(staleness: AgentStaleness | null): {
+  backupSchedule: boolean;
+  containerSchedule: boolean;
+  stragglers: string;
+} {
+  return {
+    backupSchedule: Boolean(staleness?.backupScheduleStale),
+    containerSchedule: Boolean(staleness?.containerScheduleStale),
+    stragglers: (staleness?.stragglers ?? []).join("、"),
+  };
 }

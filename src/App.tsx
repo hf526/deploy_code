@@ -126,6 +126,13 @@ export default function App() {
       case "remoteSkipped":
         toast("info", i18n.t("backup.schedule.remoteSkipped", { name: notice.message ?? "" }));
         break;
+      // 让位了、可控制机拿的是上次下发的那份定时：今晚跑的不是界面上这套，红色才对。
+      case "agentStale":
+        toast("error", i18n.t("agent.staleNotice", { detail: notice.message ?? "" }));
+        break;
+      case "agentStranded":
+        toast("error", i18n.t("agent.strandedNotice", { detail: notice.message ?? "" }));
+        break;
       case "shutdownFired":
         toast("info", i18n.t("settings.shutdown.fired"));
         break;

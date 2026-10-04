@@ -5,7 +5,9 @@ use deploy_core::models::{
 use deploy_core::{ContainerEngine, ContainerJob, ContainerPlan, CoreError, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::state::{ActiveContainer, AppState, ClaimGuard, ClaimKind, ContainerTaskGuard};
+use crate::state::{
+    ActiveContainer, AppState, ClaimGuard, ClaimKind, ContainerCleanupGuard, ContainerTaskGuard,
+};
 
 fn resolve_server(state: &AppState, server_id: &str) -> Result<deploy_core::ServerConfig> {
     let config = state.store.load_config()?;
@@ -210,6 +212,12 @@ pub async fn cancel_container(
     // 登记项刚被 take_container 摘掉：另记一份，保证下面这段清理期间退出应用
     // 仍会把两台服务器上的备份包收掉（否则 tar 就留在那台机器上了）。
     state.add_pending_container_cleanup(&record_id, active.clone());
+
+    // 名额随这条被 abort 的任务一起放了（守卫在事件转发那个任务里，它收到通道关闭就退出），
+    // 而下面这段清理还要跑最长两台 × 12 秒，里面那句 `docker start` 会把刚停下的容器拉回来。
+    // 这段时间必须自己把名额占住，否则新任务对同一批项目一边 stop 一边被旧清理 start，
+    // 那份快照就是对着运行中的数据库做的。
+    let _cleanup_guard = ContainerCleanupGuard::new(app.clone());
 
     active.abort.abort();
     // 留一点时间给任务退出，避免它与下面的记录写入互相覆盖。

@@ -68,7 +68,7 @@ pub use shutdown::{
     checked_delay_minutes, request_shutdown, shutdown_args, CANCEL_WINDOW_SECS,
     MAX_DELAY_MINUTES, MIN_DELAY_MINUTES, OS_GRACE_SECS,
 };
-pub use store::Store;
+pub use store::{OrphanBundle, Store};
 pub use tasklog::TaskLogger;
 pub use tunnel::{ServerTunnelStatus, TunnelManager, TunnelRuleStatus};
 pub use util::{format_duration, human_size};

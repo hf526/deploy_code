@@ -249,6 +249,32 @@ impl Drop for ContainerTaskGuard {
     }
 }
 
+/// 取消之后的那段远端清理的守卫：占住容器名额，直到清理结束（含提前 return / panic）。
+///
+/// 任务本身是被 `abort()` 掐掉的，随它一起析构的 `ContainerTaskGuard` 已经把名额放了，
+/// 而清理还在跑最长两台 × 12 秒 —— 那里面有一句 `docker start` 会把刚停下的容器拉回来。
+pub struct ContainerCleanupGuard {
+    app: AppHandle,
+    acquired: bool,
+}
+
+impl ContainerCleanupGuard {
+    /// 占住名额。没占到（另一场清理正在进行）也照样返回实例，只是不负责放开那一份 ——
+    /// 取消按钮不该因为别人先在清理就用不了。
+    pub fn new(app: AppHandle) -> Self {
+        let acquired = app.state::<AppState>().try_begin_container_cleanup();
+        Self { app, acquired }
+    }
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        if self.acquired {
+            self.app.state::<AppState>().end_container_cleanup();
+        }
+    }
+}
+
 impl PagesTaskGuard {
     pub fn new(claim: ClaimGuard) -> Self {
         Self { _claim: claim }
@@ -286,6 +312,9 @@ pub struct AppState {
     nginx_claim: AtomicBool,
     /// 容器任务抢占标记：同一时间只允许一个容器备份 / 迁移。
     container_claim: AtomicBool,
+    /// 取消之后的远端清理正在进行：那段时间里旧任务还会按 compose 标签把容器 `docker start`
+    /// 回来，而任务名额已经随被 abort 的那条任务一起放了（见 `ContainerCleanupGuard`）。
+    container_cleanup: AtomicBool,
     /// 部署跨进程任务锁（持有时禁止 CLI 等其他进程执行部署）。
     deploy_lock: Mutex<Option<TaskLock>>,
     /// 备份跨进程任务锁。
@@ -315,6 +344,7 @@ impl AppState {
             pages_claim: AtomicBool::new(false),
             nginx_claim: AtomicBool::new(false),
             container_claim: AtomicBool::new(false),
+            container_cleanup: AtomicBool::new(false),
             deploy_lock: Mutex::new(None),
             backup_lock: Mutex::new(None),
             pages_lock: Mutex::new(None),
@@ -411,7 +441,13 @@ impl AppState {
     }
 
     /// 尝试占用容器任务名额（备份 / 迁移 / 恢复共用一个）。
+    ///
+    /// 取消之后的那场远端清理也算「容器任务在进行」：那时旧任务的一句 `docker start` 会把
+    /// 刚被停下的容器拉起来，放新任务进去就是对同一批项目一边 stop 一边 start。
     pub fn try_claim_container(&self) -> Result<bool> {
+        if self.container_cleanup.load(Ordering::SeqCst) {
+            return Ok(false);
+        }
         self.try_claim(&self.container_claim, &self.container_lock, "container")
     }
 
@@ -419,9 +455,22 @@ impl AppState {
         self.release_claim(&self.container_claim, &self.container_lock);
     }
 
+    /// 占用「容器远端清理进行中」标记；已经有另一场清理在跑时返回 None。
+    pub fn try_begin_container_cleanup(&self) -> bool {
+        self.container_cleanup
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+    }
+
+    pub fn end_container_cleanup(&self) {
+        self.container_cleanup.store(false, Ordering::SeqCst);
+    }
+
     /// 容器任务是否仍在进行（退出时用于判断是否需要推迟退出）。
+    ///
+    /// 清理那一段也算：它同样在动远端的容器与文件。
     pub fn has_active_container(&self) -> bool {
-        self.container_claim.load(Ordering::SeqCst)
+        self.container_claim.load(Ordering::SeqCst) || self.container_cleanup.load(Ordering::SeqCst)
     }
 
     pub fn release_nginx_claim(&self) {

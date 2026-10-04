@@ -11,7 +11,9 @@ export type TaskEvent<TRecord extends TaskRecord> =
   | { type: "started"; recordId: string }
   | { type: "log"; level: LogLevel; message: string }
   | { type: "progress"; percent: number; message: string }
-  | { type: "finished"; record: TRecord };
+  | { type: "finished"; record: TRecord }
+  /** 只有批量部署会有：某台连准备都没过，剩下的机器不再部署，而那台没有自己的记录。 */
+  | { type: "batchAborted"; succeeded: number; total: number; reason: string };
 
 /** 事件归约需要的最小副作用集合（由 store 提供）。 */
 export interface TaskEventSink<TRecord extends TaskRecord> {
@@ -37,6 +39,7 @@ function runningTask<TRecord>(recordId: string): LiveTask<TRecord> {
     progressMessage: "",
     status: "running",
     record: null,
+    aborted: null,
   };
 }
 
@@ -53,6 +56,17 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
     // ⚠️ 注意：此时 event 可能还没携带完整 record，所以 log/progress 事件用 findRunningId() 兜底
     if (event.type === "started") {
       setLive(runningTask(event.recordId));
+      return;
+    }
+    if (event.type === "batchAborted") {
+      // 重载之后中止事件先到（那台没有记录可以对账）：照样把这一批定性成失败，
+      // 否则界面会停在上一台的绿色「成功」上。
+      setLive({
+        ...runningTask(findRunningId()),
+        status: "failed",
+        progress: 100,
+        aborted: { succeeded: event.succeeded, total: event.total, reason: event.reason },
+      });
       return;
     }
     if (event.type === "log") {
@@ -75,9 +89,22 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
   }
 
   switch (event.type) {
-    case "started":
-      // 新一轮任务开始：清空上一轮的日志 / 进度与结果状态。
-      setLive(runningTask(event.recordId));
+    case "started": {
+      // 新一轮任务开始：清掉上一轮的进度与结果状态。
+      // 批量部署每台各发一条 started，而上一台结束时已经把记录带进来了 —— 那种情况保留已有日志，
+      // 否则「[批次 2/3] 开始部署到 X」这类批次行会在自己出现的那一刻被清掉（N 台丢 N 行）。
+      const carried = live.record ? live.lines : [];
+      setLive({ ...runningTask(event.recordId), lines: carried });
+      break;
+    }
+    case "batchAborted":
+      // 中止那台没有自己的记录：上一条 finished 已把界面定成成功，批次性质只能由这条事件纠正回来。
+      setLive({
+        ...live,
+        status: "failed",
+        progress: 100,
+        aborted: { succeeded: event.succeeded, total: event.total, reason: event.reason },
+      });
       break;
     case "log": {
       const lines = [...live.lines, { level: event.level, message: event.message }];

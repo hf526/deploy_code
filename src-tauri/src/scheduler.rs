@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use chrono::Local;
 use deploy_core::models::{AppConfig, BackupRequest, Settings};
-use deploy_core::schedule::{format_date, has_crossed, parse_date, today_at, window_expired};
+use deploy_core::schedule::{
+    clock_jumped, format_date, has_crossed, parse_date, today_at, window_expired,
+};
 use deploy_core::shutdown::{request_shutdown, CANCEL_WINDOW_SECS, OS_GRACE_SECS};
 use deploy_core::{CoreError, Store};
 use serde::Serialize;
@@ -108,7 +110,19 @@ pub fn spawn(app: AppHandle) {
             match backup_owner(&app.state::<AppState>().store, &config, &config_id) {
                 BackupOwner::Agent(name) => {
                     pending = None;
-                    emit_notice(&app, "remoteSkipped", Some(name));
+                    // 让位本身是正常收尾，但控制机上那份定时可能是上次下发的旧值：
+                    // 今晚跑的不是用户以为的那一份，这一句必须讲出来（缺陷就藏在「看起来交给它了」）。
+                    if deploy_core::agent::staleness(&app.state::<AppState>().store)
+                        .backup_schedule_stale
+                    {
+                        emit_notice(
+                            &app,
+                            "agentStale",
+                            Some(format!("「{name}」这一晚控制机仍按上次下发的定时执行")),
+                        );
+                    } else {
+                        emit_notice(&app, "remoteSkipped", Some(name));
+                    }
                     continue;
                 }
                 BackupOwner::Unsynced(name) => {
@@ -124,7 +138,21 @@ pub fn spawn(app: AppHandle) {
                     );
                     continue;
                 }
-                BackupOwner::Local => {}
+                BackupOwner::Local => {
+                    // 执行位写着本机、控制机那份里却还留着同一条（改回来之后没有重新下发）：
+                    // 今晚两台各出一份包，落在两台机器上。本机照跑（那是用户要的），但要把另一头讲出来。
+                    let store = &app.state::<AppState>().store;
+                    let agent = config.settings.agent_server_id.trim().to_string();
+                    if store.load_agent_sync().holds_backup(&agent, &config_id) {
+                        let name = config
+                            .backup_configs
+                            .iter()
+                            .find(|item| item.id == config_id)
+                            .map(|item| item.name.clone())
+                            .unwrap_or_else(|| config_id.clone());
+                        emit_notice(&app, "agentStranded", Some(format!("「{name}」")));
+                    }
+                }
             }
 
             let request = BackupRequest {
@@ -229,6 +257,37 @@ pub fn spawn_container(app: AppHandle) {
                                 )),
                             );
                         }
+                        // 与数据库备份同一口径的两句话：控制机上那份定时是旧的（今晚跑的不是
+                        // 用户勾选的那批），以及某条已经改回本机而控制机还留着它（两边各出一份包）。
+                        let store = app.state::<AppState>().store.clone();
+                        if deploy_core::agent::staleness(&store).container_schedule_stale {
+                            emit_notice(
+                                &app,
+                                "agentStale",
+                                Some("容器定时（开关、时间或勾选）改动后没有重新下发".to_string()),
+                            );
+                        }
+                        let agent = config.settings.agent_server_id.trim().to_string();
+                        let sync = store.load_agent_sync();
+                        let stranded: Vec<String> = settings
+                            .scheduled_container_config_ids
+                            .iter()
+                            .filter_map(|id| {
+                                let item = config
+                                    .container_configs
+                                    .iter()
+                                    .find(|entry| &entry.id == id)?;
+                                (!item.run_location.is_remote() && sync.holds_container(&agent, id))
+                                    .then(|| item.name.clone())
+                            })
+                            .collect();
+                        if !stranded.is_empty() {
+                            emit_notice(
+                                &app,
+                                "agentStranded",
+                                Some(stranded.join("、")),
+                            );
+                        }
                         if queue.is_empty() && handed == 0 && unsynced.is_empty() {
                             // 只在真的没人可跑时说「未选择配置」。上面两条分支已经解释过原因时
                             // 再补一句「没配置」是错的，用户会去翻勾选框而不去点下发。
@@ -321,6 +380,9 @@ fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) {
 /// 每天定时关机：跨过设置的时间点就排一次可取消的倒计时。
 ///
 /// 和定时备份一样，应用启动前已错过的时间点不补跑 —— 唤醒电脑就被关机是不能接受的行为。
+/// 但这一条还得自己多挡一道：`has_crossed` 只认「进程停启之间错过」，认不出
+/// 「进程活着、中间睡过去」—— 那种情况下 `last_tick` 停在合盖之前，设置的时间点正好落在
+/// `(last_tick, now]` 里，掀开盖子就见底。定时备份照旧补跑，晚一点备份无害。
 fn arm_scheduled_shutdown(
     app: &AppHandle,
     settings: &Settings,
@@ -338,6 +400,11 @@ fn arm_scheduled_shutdown(
     let Some(scheduled) = today_at(&settings.scheduled_shutdown_time, &now) else {
         return;
     };
+    // 这一跳空转了太久：把这个点当成「已经错过」放掉，不写 last_run（明天到点照常排）。
+    // 放掉之后循环会把 last_tick 推到 now，同一个点不会再被判定为刚跨过。
+    if clock_jumped(last_tick, now) {
+        return;
+    }
 
     let state = app.state::<AppState>();
     if !has_crossed(scheduled, last_tick, now, *last_run) || state.pending_shutdown().is_some() {

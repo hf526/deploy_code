@@ -61,6 +61,9 @@ pub fn build_status(store: &Store) -> Result<AgentStatus> {
         container_time: settings.scheduled_container_time.clone(),
         container_queue: settings.scheduled_container_config_ids.len(),
         container_last_run: state.container_last_run.clone(),
+        // 「那份常驻服务活着没有」由客户端问 systemd 填：这个进程是临时 exec 出来的，
+        // 它活着证明不了调度循环在跑。
+        service_active: None,
     })
 }
 
@@ -176,6 +179,7 @@ mod tests {
             container_time: "03:30".to_string(),
             container_queue: 0,
             container_last_run: String::new(),
+            service_active: Some(true),
         }
     }
 
@@ -186,6 +190,8 @@ mod tests {
         assert_eq!(parsed.backup_config_name, "主库");
         assert_eq!(parsed.timezone, "+0800");
         assert_eq!(parsed.container_last_run, "");
+        // agent 自己填的是 None（这一份是 sample），关键是字段名与类型能过客户端。
+        assert_eq!(parsed.service_active, Some(true));
     }
 
     #[test]

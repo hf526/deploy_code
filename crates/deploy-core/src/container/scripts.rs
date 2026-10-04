@@ -73,8 +73,13 @@ RUN="$ROOT/$ID"
 STAGE="$RUN/bundle"
 OUT="$ROOT/$ID.tar"
 PID_FILE="$RUN/snapshot.pid"
+# 「这次备份停过源服务、还欠一次恢复」的凭据。放在 $RUN 之外：失败路径上 $RUN 会被整目录删掉，
+# 而 SIGKILL 那种下场 trap 根本跑不到；随 SSH 断开收到 HUP 时 trap 会跑，但 bash 要等当前那条
+# 前台命令（可能是一整份 tar）结束才处理信号，来不及是常态。只剩清理方能凭这个文件判断该不该拉起。
+PAUSE_MARK="$ROOT/$ID.pause"
 SCRIPT="$0"
 SUCCESS=0
+PAUSED=0
 
 cleanup() {
   rm -f "$PID_FILE" "$SCRIPT"
@@ -82,9 +87,22 @@ cleanup() {
     rm -rf "$STAGE"
   else
     rm -rf "$RUN" "$OUT"
+    # 暂停是这次备份替用户按下去的：中途失败或被打断时不能让站点一直停着，
+    # 而界面那句「卷导出完成后立即恢复」也只有在这里才真的成立。
+    if [ "$PAUSED" = "1" ]; then
+      if compose -p "$PROJECT" "${CF[@]}" start >/dev/null 2>&1; then
+        rm -f "$PAUSE_MARK"
+        echo '备份未成功，来源服务已恢复'
+      else
+        echo '备份未成功，且来源服务未能自动恢复，请到该服务器执行 compose up -d' >&2
+      fi
+    fi
   fi
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# HUP 也要接：任务被 abort 时本地会话先没，远端脚本收到的是 SIGHUP 而不是 TERM，
+# 不接就等于「停下来的站点没人负责拉起」——清理方那一道只有十几秒预算，撑不住整台机不可达。
+trap 'cleanup; exit 1' INT TERM HUP
 
 compose() {
   if [ "$COMPOSE_V2" = "1" ]; then docker compose "$@"; else docker-compose "$@"; fi
@@ -115,6 +133,11 @@ fi
 
 if [ "$PAUSE" = "1" ]; then
   echo '###STAGE:2:暂停来源服务（卷导出完成后立即恢复）...'
+  # 先留「欠一次恢复」的凭据，再按下停止键：从这一步起到 stage 5 之间，脚本可能报错退出、
+  # 被 SIGKILL、或随 SSH 断开一起没掉（这三种情况 trap 都跑不到），只有盘上的文件能说明该拉起。
+  printf '%s\n' "$PROJECT" > "$PAUSE_MARK"
+  # 先置标记再停服务：连 stop 本身失败（只停下了一半容器）也得让 trap 试着把它们起回来。
+  PAUSED=1
   compose -p "$PROJECT" "${CF[@]}" stop --timeout 30
 fi
 
@@ -146,6 +169,9 @@ fi
 if [ "$PAUSE" = "1" ]; then
   echo '###STAGE:5:恢复来源服务 ...'
   compose -p "$PROJECT" "${CF[@]}" start
+  PAUSED=0
+  # 起来了才销账：这条 start 若被下一步打断，凭据留着让清理方再试一次。
+  rm -f "$PAUSE_MARK"
 fi
 
 if [ "$INCLUDE_IMAGES" = "1" ]; then

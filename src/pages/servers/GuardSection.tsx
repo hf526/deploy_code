@@ -138,10 +138,9 @@ export function GuardSection({
               <Badge kind="green">{t("servers.guardWhitelistBadge")}</Badge>
             ) : (
               <>
-                {/* 防护没开时不存在"被自己封掉"的风险，别报警，只留入口。 */}
-                {report.guardEnabled && (
-                  <span className="text-warn">{t("servers.guardSelfNotWhitelisted")}</span>
-                )}
+                {/* 启用那一刻服务端会当场跑一遍守护，所以防护还没开时也要提醒：
+                    这一项不在白名单里，点「启用防护」会被直接拒绝。 */}
+                <span className="text-warn">{t("servers.guardSelfNotWhitelisted")}</span>
                 <Button
                   size="sm"
                   variant="secondary"

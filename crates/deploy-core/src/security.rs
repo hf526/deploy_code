@@ -90,7 +90,7 @@ if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then echo '###SU
 if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi 'Status: active'; then
   echo '###FW ufw'
   $SUDO ufw status 2>/dev/null | grep -Ei 'DENY|REJECT' || true
-elif command -v firewall-cmd >/dev/null 2>&1; then
+elif command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -qx running; then
   echo '###FW firewalld'
   $SUDO firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop || true
 elif command -v iptables >/dev/null 2>&1; then
@@ -178,6 +178,11 @@ async fn run_rule_command(
 }
 
 /// 服务器端守护脚本：由 cron 每分钟执行，统计窗口内失败登录并按阈值拉黑。
+///
+/// 脚本里查「已封」与下「封禁」只共用一个判据（`backend()`），三个后端都按「真在跑」来选：
+/// 曾经 `blocked_ips()` 按 `command -v firewall-cmd` 认 firewalld、`block()` 又是一条 elif 链，
+/// 于是「装了 firewalld 但没跑」的机器上守护每分钟失败一次，而界面读的是另一套后端 ——
+/// 两边各说各话，防护等于没开。改这里时要同步 `SCAN_SCRIPT` 与 `rule_script` 的判据。
 const GUARD_SCRIPT: &str = r#"#!/bin/sh
 # DeployCode server-side guard (installed by the DeployCode app).
 [ -f /etc/deploycode-guard.conf ] && . /etc/deploycode-guard.conf
@@ -227,14 +232,31 @@ whitelisted() {
   return 1
 }
 
-blocked_ips() {
+# 三个后端只在这里判一次：查已封与下封禁必须落在同一个后端上，否则界面与守护各说各话。
+backend() {
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw status 2>/dev/null | grep -i deny | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --list-rich-rules 2>/dev/null | grep -oE 'address="[^"]+"' | cut -d'"' -f2
+    echo ufw
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state 2>/dev/null | grep -qx running; then
+    echo firewalld
   else
-    { iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null; } | grep -Ei 'DROP|REJECT' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
+    echo iptables
   fi
+}
+
+blocked_ips() {
+  case "$(backend)" in
+    ufw)
+      ufw status 2>/dev/null | grep -i deny | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
+      ;;
+    firewalld)
+      # 只认 drop 那一条：富规则里 accept / log / masquerade 也带 source address，
+      # 少了这层过滤就会把「放行过谁」当成「已经封了谁」，那个 IP 从此再也封不掉。
+      firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop | grep -oE 'address="[^"]+"' | cut -d'"' -f2
+      ;;
+    *)
+      { iptables -S INPUT 2>/dev/null; ip6tables -S INPUT 2>/dev/null; } | grep -Ei 'DROP|REJECT' | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}|[0-9a-fA-F]{0,4}(:[0-9a-fA-F]{0,4}){2,}'
+      ;;
+  esac
 }
 
 block() {
@@ -243,16 +265,22 @@ block() {
     *:*) family=ipv6 ;;
     *) family=ipv4 ;;
   esac
-  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active'; then
-    ufw deny from "$ip" >/dev/null 2>&1
-  elif command -v firewall-cmd >/dev/null 2>&1; then
-    firewall-cmd --permanent --add-rich-rule="rule family=$family source address=$ip drop" >/dev/null 2>&1 &&
-      firewall-cmd --reload >/dev/null 2>&1
-  elif [ "$family" = "ipv6" ] && command -v ip6tables >/dev/null 2>&1; then
-    ip6tables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
-  else
-    iptables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
-  fi
+  case "$(backend)" in
+    ufw)
+      ufw deny from "$ip" >/dev/null 2>&1
+      ;;
+    firewalld)
+      firewall-cmd --permanent --add-rich-rule="rule family=$family source address=$ip drop" >/dev/null 2>&1 &&
+        firewall-cmd --reload >/dev/null 2>&1
+      ;;
+    *)
+      if [ "$family" = "ipv6" ] && command -v ip6tables >/dev/null 2>&1; then
+        ip6tables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
+      else
+        iptables -I INPUT -s "$ip" -j DROP >/dev/null 2>&1
+      fi
+      ;;
+  esac
 }
 
 BLOCKED=$(blocked_ips)
@@ -283,11 +311,28 @@ pub async fn enable_guard(
     run_rule_command(server, connect_timeout_secs, &command, "启用自动防护").await
 }
 
-/// 启用自动防护的远端脚本：守护脚本本体 + 配置（阈值 / 窗口 / 白名单）+ cron 任务。
+/// 启用自动防护的远端脚本：来源地址硬闸 + 守护脚本本体 + 配置（阈值 / 窗口 / 白名单）+ cron 任务。
 fn enable_script(threshold: u32, window_mins: u64, allow: &str) -> String {
+    let quoted = shell_quote(allow);
     format!(
         r#"SUDO=""
 [ "$(id -u)" != "0" ] 2>/dev/null && SUDO="sudo -n"
+# 自我封锁保护：下面最后一步会当场跑一遍守护（不等 cron 那一分钟），所以本次连接的来源
+# 地址没在白名单里时，点「启用」就是自己把自己封掉。这里直接拒绝、一个字节都不写，
+# 界面上那颗「加入白名单」按钮点完就能过。读不到 SSH_CLIENT 时不拒绝（与手动拉黑同口径），
+# 那种情况下界面上另有「来源地址未知」的告警。
+ALLOW={quoted}
+SELF="${{SSH_CLIENT%% *}}"
+if [ -n "$SELF" ]; then
+  hit=0
+  for entry in $(printf '%s' "$ALLOW" | tr ',' ' '); do
+    [ "$entry" = "$SELF" ] && hit=1
+  done
+  if [ "$hit" = "0" ]; then
+    echo "启用被拒绝：$SELF 是本次 SSH 连接的来源地址且不在免封白名单里，守护脚本一跑就会把它封掉。请先把它加入白名单。" >&2
+    exit 1
+  fi
+fi
 $SUDO tee /usr/local/bin/deploycode-guard >/dev/null <<'GUARD_EOF' || exit 1
 {GUARD_SCRIPT}
 GUARD_EOF
@@ -344,7 +389,7 @@ done=0
 if command -v ufw >/dev/null 2>&1 && $SUDO ufw status 2>/dev/null | grep -qi 'Status: active'; then
   $SUDO ufw deny from "$IP" >/dev/null 2>&1 && done=1
 fi
-if [ "$done" = "0" ] && command -v firewall-cmd >/dev/null 2>&1; then
+if [ "$done" = "0" ] && command -v firewall-cmd >/dev/null 2>&1 && $SUDO firewall-cmd --state 2>/dev/null | grep -qx running; then
   $SUDO firewall-cmd --permanent --add-rich-rule='rule family="{family}" source address="'"$IP"'" drop' >/dev/null 2>&1 && $SUDO firewall-cmd --reload >/dev/null 2>&1 && done=1
 fi
 if [ "$done" = "0" ]; then
@@ -384,14 +429,35 @@ if command -v ufw >/dev/null 2>&1; then
   $SUDO ufw status 2>/dev/null | grep -qwF "$IP" && still=1
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
-  $SUDO firewall-cmd --list-rich-rules 2>/dev/null | grep -qwF "$IP" && still=1
+  $SUDO firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop | grep -qwF "$IP" && still=1
 fi
 if command -v "$BIN" >/dev/null 2>&1; then
   $SUDO $BIN -S INPUT 2>/dev/null | grep -qwF "$IP" && still=1
 fi
-if [ "$still" = "0" ]; then echo "已解除 $IP"; exit 0; fi
-echo "解除失败：IP 仍在拦截列表中（权限不足或规则来源未知）" >&2
-exit 1
+if [ "$still" != "0" ]; then
+  echo "解除失败：IP 仍在拦截列表中（权限不足或规则来源未知）" >&2
+  exit 1
+fi
+echo "已解除 $IP"
+# 自动防护是每分钟一轮：刚放出来的人如果还在超阈值地失败，下一分钟就被原样封回去，
+# 而界面那句「已解除」早在弹过了 —— 用户看到的现象是「放出来又锁死」，得当场讲清楚。
+if [ -f /etc/cron.d/deploycode-guard ]; then
+  . /etc/deploycode-guard.conf 2>/dev/null
+  THRESHOLD=${{THRESHOLD:-5}}
+  WINDOW=${{WINDOW:-10}}
+  ALLOW="$(grep -E '^ALLOW=' /etc/deploycode-guard.conf 2>/dev/null | tail -n 1 | cut -d= -f2-)"
+  hit=0
+  for entry in $(printf '%s' "$ALLOW" | tr ',' ' '); do
+    [ "$entry" = "$IP" ] && hit=1
+  done
+  if [ "$hit" = "0" ]; then
+    cnt=$(journalctl -u sshd -u ssh --since=-${{WINDOW}}min --no-pager 2>/dev/null | grep -Ei 'Failed password|Invalid user' | grep -cF "from $IP")
+    if [ "${{cnt:-0}}" -ge "$THRESHOLD" ] 2>/dev/null; then
+      echo "注意：它在 $WINDOW 分钟内失败 $cnt 次，已达自动防护阈值 $THRESHOLD —— 下一轮守护会把它重新封掉。要长期放行，请把它加进免封白名单。"
+    fi
+  fi
+fi
+exit 0
 "#
         )
     }
@@ -978,6 +1044,64 @@ mod tests {
         assert!(GUARD_SCRIPT.contains("whitelisted \"$ip\" && continue"));
     }
 
+    /// 查「已封」与下「封禁」必须落在同一个后端，而且只认 drop 那一条。
+    ///
+    /// 曾经守护的 firewalld 分支没有 drop 过滤（accept / log / masquerade 富规则里的源地址
+    /// 也算「已封」），那个 IP 从此再也封不掉、还一行日志都不留；而 `block()` 只看
+    /// `command -v firewall-cmd`，「装了 firewalld 但没跑」的机器上它绝不退到 iptables。
+    #[test]
+    fn guard_scan_and_manual_rule_agree_on_the_backend() {
+        assert!(GUARD_SCRIPT
+            .contains("firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop | grep -oE"));
+        assert!(SCAN_SCRIPT.contains("firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop"));
+        // 三处都按 --state 判活：界面显示的后端必须就是守护真能下手的那个。
+        // 必须是 `-qx`：`firewall-cmd --state` 在没跑的时候打印 `not running`，
+        // 少了整行匹配就等于「没跑的 firewalld」被选中，而它每条命令都会失败。
+        assert!(GUARD_SCRIPT.contains("firewall-cmd --state 2>/dev/null | grep -qx running"));
+        assert!(SCAN_SCRIPT.contains("firewall-cmd --state 2>/dev/null | grep -qx running"));
+        let block = rule_script("203.0.113.9", true);
+        assert!(block.contains("firewall-cmd --state 2>/dev/null | grep -qx running"), "{block}");
+        // 选不中 firewalld 时要能退到 iptables/ip6tables（守护那条链同样要能退）。
+        assert!(block.contains("-I INPUT -s \"$IP\" -j DROP"), "{block}");
+        assert!(GUARD_SCRIPT.contains("-I INPUT -s \"$ip\" -j DROP"));
+    }
+
+    /// 脚本正文里绝不能混进 Rust 的 `///`：它会被原样 tee 到服务器上，而注释里的
+    /// `blocked_ips()` 那种写法直接把整份守护打成语法错误 —— 防护静默失效。
+    /// 同一条理由也约束 `SCAN_SCRIPT` 与 `enable_script`（后者整份嵌入 GUARD_SCRIPT）。
+    #[test]
+    fn shipped_scripts_carry_no_rust_doc_comments() {
+        for (name, text) in [
+            ("GUARD_SCRIPT", GUARD_SCRIPT),
+            ("SCAN_SCRIPT", SCAN_SCRIPT),
+            ("rule_script(block)", rule_script("1.2.3.4", true).as_str()),
+            ("rule_script(unblock)", rule_script("1.2.3.4", false).as_str()),
+            (
+                "enable_script",
+                enable_script(5, 10, "1.2.3.4").as_str(),
+            ),
+        ] {
+            assert!(!text.contains("///"), "{name} 里混进了 Rust 文档注释");
+            assert!(!text.contains("\\\\"), "{name} 里有反斜杠续行的可疑写法");
+        }
+    }
+
+    /// 解除拉黑不碰免封白名单，而守护是每分钟一轮：仍在窗口里超阈值的 IP 会被原样封回，
+    /// 界面上那句「已解除」就成了假象。这一层必须当场说出来。
+    #[test]
+    fn unblock_rule_warns_when_the_guard_will_reblock() {
+        let script = rule_script("203.0.113.9", false);
+        assert!(script.contains("/etc/cron.d/deploycode-guard"), "{script}");
+        assert!(script.contains("重新封"), "{script}");
+        // 已经在白名单里的那条不该吓用户：守护本来就封不了它。
+        assert!(script.contains("[ \"$entry\" = \"$IP\" ] && hit=1"), "{script}");
+        // 复核同样只认 drop 富规则：accept 里出现同一个地址不等于还在被封。
+        assert!(
+            script.contains("--list-rich-rules 2>/dev/null | grep -i drop | grep -qwF"),
+            "{script}"
+        );
+    }
+
     #[test]
     fn block_rule_refuses_self_and_whitelisted_before_touching_firewall() {
         let script = rule_script("1.2.3.4", true);
@@ -1003,6 +1127,26 @@ mod tests {
         // 清空白名单也必须写一行空的 ALLOW=：整份配置是重写而不是合并，
         // 否则服务器上残留的旧名单会继续给那批地址免封。
         assert!(enable_script(5, 10, "").contains("ALLOW=\n"));
+    }
+
+    /// 启用的最后一步会**当场**跑一遍守护脚本，所以来源地址硬闸必须排在写文件之前：
+    /// 拦下时一个字节都不该落到服务器上，否则防护照样装上了、只是没提示。
+    #[test]
+    fn enable_script_refuses_self_before_installing_anything() {
+        let script = enable_script(5, 10, "1.2.3.4");
+        assert!(script.contains("SELF=\"${SSH_CLIENT%% *}\""));
+        assert!(script.contains("启用被拒绝"));
+        // 名单里就有来源地址时才会放行到写文件那一步，闸读的就是本次要写进去的那份名单。
+        assert!(script.contains("ALLOW=1.2.3.4\nSELF="));
+        let refuse_at = script.find("启用被拒绝").unwrap();
+        let install_at = script.find("tee /usr/local/bin/deploycode-guard").unwrap();
+        let run_at = script.find("/usr/local/bin/deploycode-guard >/dev/null 2>&1 || true").unwrap();
+        assert!(
+            refuse_at < install_at && install_at < run_at,
+            "拒绝分支没排在安装与当场执行之前"
+        );
+        // 空白名单也要有这道闸：那时任何已知来源地址都不在名单里。
+        assert!(enable_script(5, 10, "").contains("ALLOW=''"));
     }
 
     /// Rust 与 TS 是手工镜像的，字段名对不上编译器不报错、界面静默拿到 undefined。

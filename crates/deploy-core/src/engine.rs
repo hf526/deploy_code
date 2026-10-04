@@ -55,9 +55,14 @@ pub type EventSender = UnboundedSender<DeployEvent>;
 ///
 /// `blocked` 只在「第一台连准备都没通过」时有值：此时没有任何记录写盘、也没有
 /// started/finished 事件发出，界面等不到收敛信号，必须由调用方把错误带回给请求方。
+///
+/// `aborted` 是另外半件事：**已经跑起来过**的批次被后面某台的准备失败掐断。界面靠
+/// [`DeployEvent::BatchAborted`] 就能定性，但命令行没有事件可等 —— 只看记录会得出
+/// 「第一台是 success，所以这批全发了」的结论并以 0 退出，脚本调用方就此把没部署的机器当成部署了。
 pub struct DeployBatch {
     pub records: Vec<DeployRecord>,
     pub blocked: Option<CoreError>,
+    pub aborted: Option<String>,
 }
 
 /// 部署引擎：组织“打包 -> 上传 -> 解压 -> 执行脚本”的完整流程。
@@ -180,6 +185,7 @@ impl DeployEngine {
         let total = server_ids.len();
         let mut results = Vec::with_capacity(total);
         let mut blocked = None;
+        let mut aborted = None;
         for (index, server_id) in server_ids.iter().enumerate() {
             let request = DeployRequest {
                 server_id: server_id.clone(),
@@ -203,6 +209,20 @@ impl DeployEngine {
                     // 它已经结束：把首台的准备错误带出去，由命令层像单台部署那样同步报错。
                     if results.is_empty() {
                         blocked = Some(err);
+                    } else {
+                        let reason = err.to_string();
+                        if let Some(sender) = &events {
+                            // 已经有机器成功时命令层在首台开始时就把台数返回了，之后全靠事件收敛界面；
+                            // 而那台成功的记录会把界面定成绿色「成功」，盖不住「这批还有机器没发出去」。
+                            // 这台没有记录可发 Finished，所以用一条独立的中止事件把批次定性。
+                            let _ = sender.send(DeployEvent::BatchAborted {
+                                succeeded: results.len(),
+                                total,
+                                reason: reason.clone(),
+                            });
+                        }
+                        // 没有事件通道的调用方（CLI）只能看返回值，否则它会拿着一份成功记录退 0。
+                        aborted = Some(reason);
                     }
                     break;
                 }
@@ -244,6 +264,7 @@ impl DeployEngine {
         DeployBatch {
             records: results,
             blocked,
+            aborted,
         }
     }
 
@@ -884,6 +905,15 @@ pub fn normalize_env_files(files: &[EnvFileConfig]) -> Result<Vec<EnvFileConfig>
         if local.is_empty() {
             return Err(CoreError::deploy("环境文件的本地路径不能为空"));
         }
+        // 必须是绝对路径。相对的 `.env` 会按「当前进程的工作目录」解释：CLI 从哪个目录起就不一样，
+        // 一份从别处拷来的 config.json 里写着 `.env` 时，可能静默把本机某个无关文件覆盖到服务器上
+        // 的部署目录里（非空即成功，看不出来）。仓库里其它地方的 env 路径语义也是绝对路径
+        // （`models.rs::rebase_env_files` 搬的就是绝对路径）。
+        if !std::path::Path::new(local).is_absolute() {
+            return Err(CoreError::deploy(format!(
+                "环境文件的本地路径必须是绝对路径（当前: {local}），请在仓库页面重新选一次这个文件"
+            )));
+        }
         if remote.is_empty() {
             return Err(CoreError::deploy("环境文件的远端路径不能为空"));
         }
@@ -1152,32 +1182,45 @@ mod tests {
 
     #[test]
     fn normalize_env_files_skips_empty_and_rejects_unsafe_paths() {
+        // 本地路径要绝对 —— 用 current_dir 造一条各平台都算绝对的，别把测试绑在 C:/ 上。
+        let absolute = std::env::current_dir()
+            .unwrap()
+            .join("root.env")
+            .to_string_lossy()
+            .into_owned();
         let files = normalize_env_files(&[
             EnvFileConfig {
-                local_path: " .env ".to_string(),
+                local_path: format!(" {absolute} "),
                 remote_path: " .env ".to_string(),
             },
             EnvFileConfig {
-                local_path: "C:/tmp/app.env".to_string(),
+                local_path: absolute.clone(),
                 remote_path: "docker\\app.env".to_string(),
             },
             EnvFileConfig {
-                local_path: "C:/tmp/root.env".to_string(),
+                local_path: absolute.clone(),
                 remote_path: "././.env".to_string(),
             },
             EnvFileConfig::default(),
         ])
         .unwrap();
         assert_eq!(files.len(), 3);
-        assert_eq!(files[0].local_path, ".env");
+        assert_eq!(files[0].local_path, absolute);
         assert_eq!(files[0].remote_path, ".env");
         assert_eq!(files[1].remote_path, "docker/app.env");
         // `./` 前缀会被去掉，但 `.env` 这类隐藏文件名不能被误伤。
         assert_eq!(files[2].remote_path, ".env");
 
+        // 相对本地路径拒绝：它按进程 CWD 解释，拷来的 config.json 会静默上传别的文件。
+        let relative = normalize_env_files(&[EnvFileConfig {
+            local_path: ".env".to_string(),
+            remote_path: ".env".to_string(),
+        }]);
+        assert!(matches!(relative, Err(CoreError::Deploy(_))));
+
         for bad in ["/etc/passwd", "../secret", "a/../b", "a//b", "./", "..", "a/"] {
             let files = vec![EnvFileConfig {
-                local_path: "x".to_string(),
+                local_path: absolute.clone(),
                 remote_path: bad.to_string(),
             }];
             assert!(normalize_env_files(&files).is_err(), "应拒绝远端路径 {bad}");

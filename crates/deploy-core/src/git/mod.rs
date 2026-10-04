@@ -866,7 +866,10 @@ fn describe_code(code: &str) -> String {
 }
 
 /// 按文件名判断是否疑似敏感文件（模板 / 示例 / 公钥文件除外）。
-fn is_sensitive_path(path: &str) -> bool {
+///
+/// 提交拦截与 Pages 发布共用这一条判据：gh-pages 带着 `--dotfiles` 直接建提交并推到发布分支，
+/// 那条路径不过 `commit_all`，所以要在源头用同一个标准扫一遍产物目录。
+pub fn is_sensitive_path(path: &str) -> bool {
     let name = path.rsplit('/').next().unwrap_or(path).to_ascii_lowercase();
     // 公钥与示例文件不敏感，避免误报阻断提交。
     if name.ends_with(".pub")

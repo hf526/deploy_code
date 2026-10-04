@@ -28,9 +28,11 @@ import {
   SelectBox,
 } from "../components/ui";
 import { api } from "../lib/api";
+import { stalenessHints } from "../lib/agent";
 import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
+import { useAgentStaleness } from "../lib/useAgentStaleness";
 import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
 import { BackupConfigModal } from "./backup/BackupConfigModal";
 
@@ -57,6 +59,8 @@ export default function BackupsPage() {
   const backupTargets = useApp((state) => state.backupTargets);
   const backupConfigs = useApp((state) => state.backupConfigs);
   const settings = useApp((state) => state.settings);
+  // 控制机上那份定时是不是旧的：这一栏的意义就是跟着刚改完的设置走。
+  const staleness = useAgentStaleness(settings);
   const liveBackup = useApp((state) => state.liveBackup);
   const startBackup = useApp((state) => state.startBackup);
   const refreshBackups = useApp((state) => state.refreshBackups);
@@ -133,32 +137,25 @@ export default function BackupsPage() {
 
   const running = liveBackup?.status === "running";
 
-  /** 列表展示用的目标（与后端 resolve_target 的优先级一致，仅用于展示）；未配置时为 null。 */
+  /**
+   * 这条配置**自己**的备份目标；没有时为 null。
+   *
+   * 不要在这里往下兜底到「服务器绑定 / 全局默认 / 旧版连接串」：后端对已保存的配置
+   * 只认这一条（`backup.rs::resolve_backup`，理由是那三级会换库，而脚本对新库第一步是
+   * `DROP SCHEMA ... CASCADE`）。界面替它兜底等于提前给出一个跑了必然被拒绝的目标。
+   */
   function resolveTarget(config: BackupConfig): { name: string; url: string } | null {
     if (config.supabaseUrl?.trim()) {
       return { name: t("backup.customUrl"), url: config.supabaseUrl.trim() };
     }
-    const bound = backupTargets.find((target) => target.id === config.targetId);
-    if (bound) return bound;
-    const server = servers.find((item) => item.id === config.serverId);
-    const serverBound = backupTargets.find((target) => target.id === server?.backupTargetId);
-    if (serverBound) return serverBound;
-    if (server?.supabaseUrl?.trim()) {
-      return { name: t("backup.serverCustomUrl"), url: server.supabaseUrl.trim() };
-    }
-    const global = backupTargets.find((target) => target.id === settings.defaultBackupTargetId);
-    if (global) return global;
-    if (settings.supabaseUrl.trim()) {
-      return { name: t("settings.backupTargets.legacyName"), url: settings.supabaseUrl.trim() };
-    }
-    return null;
+    return backupTargets.find((target) => target.id === config.targetId) ?? null;
   }
 
   /** 列表内的一键备份：直接用已保存配置执行，不经过表单。 */
   async function handleRunConfig(config: BackupConfig) {
     if (running) return;
     if (!resolveTarget(config)) {
-      toast("error", t("backup.noTarget"));
+      toast("error", t("backup.ownTargetRequired"));
       return;
     }
     // 不在这里清空 live：startBackup 会写入新的 running 状态，
@@ -297,7 +294,7 @@ export default function BackupsPage() {
                         icon={<Play className="size-3.5" />}
                         loading={runningConfigId === config.id && running}
                         disabled={running || !target}
-                        title={!target ? t("backup.noTarget") : undefined}
+                        title={!target ? t("backup.ownTargetRequired") : undefined}
                         onClick={() => void handleRunConfig(config)}
                       >
                         {t("backup.runConfig")}
@@ -405,6 +402,14 @@ export default function BackupsPage() {
                   ? t("backup.schedule.summary", { time: settings.scheduledBackupTime })
                   : t("backup.schedule.disabled")}
               </p>
+              {stalenessHints(staleness).backupSchedule && (
+                <p className="text-[11px] leading-relaxed text-neg">{t("agent.staleScheduleBackup")}</p>
+              )}
+              {stalenessHints(staleness).stragglers && (
+                <p className="text-[11px] leading-relaxed text-neg">
+                  {t("agent.stragglerList", { names: stalenessHints(staleness).stragglers })}
+                </p>
+              )}
             </Card>
           </section>
         </div>

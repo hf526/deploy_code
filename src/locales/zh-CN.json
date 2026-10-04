@@ -340,7 +340,7 @@
     "guardWhitelistDuplicate": "这个 IP 已经在白名单里",
     "guardWhitelistFull": "白名单最多 {{count}} 条，先清掉不再使用的地址",
     "guardConnectedFrom": "本次扫描的连接来源：",
-    "guardSelfNotWhitelisted": "不在白名单里，建议先加入",
+    "guardSelfNotWhitelisted": "不在白名单里，启用会被拒绝，先点旁边按钮加入",
     "guardAddSelf": "加入白名单",
     "guardSelfUnknown": "没读到本次连接的来源地址（服务端没回传 SSH_CLIENT），\"封不掉自己\"那道硬闸这次不生效，白名单请手工填。",
     "blockedWhitelisted": "白名单里的地址仍在拦截列表中，点「解除」恢复",
@@ -647,13 +647,23 @@
       "timeout": "单次任务超时（秒）",
       "bundleKeep": "每个项目保留的备份包数量",
       "bundleKeepHint": "定时备份每晚都会在本机落一个 GB 级的包：同一个（服务器 + compose 项目）只保留最近这些个，更早的在任务成功后删掉。填 0 表示不自动清理。"
-    }
+    },
+    "orphanBundles": "未认领的备份包",
+    "orphanBundlesHint": "备份包是按记录轮转的。记录被历史条数上限裁掉、或你手动删过记录之后，包还留在盘上但不再有任何记录指向它，也就没人会去删。下面列出的就是这些包，清理前请确认它们不再需要。",
+    "orphanBundlesNone": "没有未认领的备份包",
+    "orphanKindContainer": "容器",
+    "orphanKindDatabase": "数据库",
+    "orphanMore": "另有 {{count}} 个未列出",
+    "orphanTotal": "共 {{count}} 个 · {{size}}",
+    "orphanClean": "清理这些包",
+    "orphanCleaned": "已删除 {{count}} 个备份包，释放 {{size}}"
   },
   "deploy": {
     "toast": {
       "running": "已有部署正在进行，请等待其完成后再试",
       "success": "{{name}} 部署成功",
-      "failed": "{{name}} 部署失败：{{error}}"
+      "failed": "{{name}} 部署失败：{{error}}",
+      "batchAborted": "批量部署已中止：{{succeeded}}/{{total}} 台成功，剩余机器未部署"
     },
     "subtitle": "保存多套部署配置，一键部署到服务器或 Cloudflare / GitHub Pages",
     "repo": "仓库",
@@ -741,7 +751,8 @@
     "noRecords": "暂无部署记录",
     "noRecordsDescription": "在左侧配置上点击「部署」后，这里会显示结果。",
     "noPagesRecords": "暂无 Pages 部署记录",
-    "noPagesRecordsDescription": "部署一次 Pages 配置后，这里会显示结果与访问地址。"
+    "noPagesRecordsDescription": "部署一次 Pages 配置后，这里会显示结果与访问地址。",
+    "batchAborted": "本批已中止：{{succeeded}}/{{total}} 台成功，剩余机器未部署"
   },
   "backup": {
     "toast": {
@@ -783,11 +794,11 @@
     "passwordPlaceholder": "数据库密码",
     "useTarget": "使用目标",
     "useTargetHint": "在设置页可添加 Supabase / Aiven / Neon 等",
-    "globalDefault": "全局默认",
+    "unboundTarget": "未绑定（这条配置要自己选一个）",
     "overrideUrl": "自定义连接串",
     "overrideUrlHint": "可选，优先级最高",
     "writingTo": "将写入：",
-    "noTarget": "尚未配置备份目标，请到设置页添加，或在上方填写自定义连接串。",
+    "ownTargetRequired": "这条配置没有自己的备份目标：保存后运行会被拒绝，不会退回服务器绑定或全局默认",
     "liveLog": "实时日志",
     "liveLogRunning": "备份执行中，请勿关闭应用",
     "liveLogIdle": "最近一次备份的实时输出",
@@ -812,7 +823,6 @@
     "databaseRequired": "请先填写数据库名",
     "cleared": "已清空备份记录",
     "customUrl": "自定义连接串",
-    "serverCustomUrl": "服务器自定义连接串",
     "schedule": {
       "title": "定时备份",
       "description": "软件运行期间（含最小化到托盘），每天到点自动执行一次备份",
@@ -1087,6 +1097,7 @@
     "metricBundles": "已留备份包",
     "metricBundlesHint": "备份包只留在控制机上，按各自的保留份数轮转。",
     "diskLowWarning": "磁盘余量已低于水位线，控制机会拒绝新的备份任务。请先清理备份目录或调低保留份数。",
+    "serviceDownWarning": "控制机上常驻的那份 deploy-agent 服务当前没在 systemd 里运行（inactive / failed）：配置读得到，但到点不会跑。到那台机器上执行 systemctl status deploy-agent 与 journalctl -u deploy-agent 查原因，再 systemctl start deploy-agent。",
     "scheduleBackup": "定时数据库备份",
     "scheduleContainer": "定时容器备份",
     "scheduleOff": "未开启",
@@ -1099,6 +1110,11 @@
     "queueCount": "队列 {{count}} 条",
     "ownedTitle": "交给控制机的配置",
     "ownedHint": "这些配置的定时由控制机执行。改动之后要点「下发配置」，否则控制机上还是旧的那份。",
+    "staleNotice": "定时改动没有重新下发：{{detail}}；控制机上还是上次那份。",
+    "strandedNotice": "本机已不再交给控制机、它却还留着：{{detail}}；今晚两边各跑一次，请点「下发配置」收回。",
+    "staleScheduleBackup": "定时备份的改动还没有下发，控制机上仍是上次那份（开关、时间、选中的配置都算）。",
+    "staleScheduleContainer": "定时容器备份的改动还没有下发，控制机上仍是上次那份（开关、时间、勾选的配置都算）。",
+    "stragglerList": "控制机上还留着这些：{{names}}。它们在本机已改回本机执行或已被删除，不补一次下发它照旧每晚跑。",
     "ownedBackup": "数据库备份",
     "ownedContainer": "容器备份",
     "goBackups": "去备份配置",
@@ -1122,6 +1138,11 @@
     "logsLoad": "读取日志",
     "loading": "读取中…",
     "dangerTitle": "卸载",
-    "dangerHint": "卸载只停服务、删二进制，备份包与记录都留在控制机上。"
+    "dangerHint": "卸载只停服务、删二进制，备份包与记录都留在控制机上。",
+    "binaryUnusable": "不可用",
+    "orphanTitle": "待收回的旧控制机",
+    "orphanHint": "这些机器上装过 agent、我们也把活儿交给过它们，但换控制机时没能收回。它们仍按自己那份配置到点执行，上面还留着全部服务器的明文口令。逐台点「收回」把它们停掉。",
+    "reclaim": "收回",
+    "reclaimDone": "旧控制机上的 agent 已收回"
   }
 }

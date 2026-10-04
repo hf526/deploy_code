@@ -2,6 +2,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AgentBinaryInfo,
+  AgentStaleness,
   AgentStatus,
   AgentSyncReport,
   BackupConfig,
@@ -30,6 +31,8 @@ import type {
   NginxConfigContent,
   NginxConfigFile,
   NginxContainerInfo,
+  OrphanBundle,
+  OrphanCleanup,
   PagesConfig,
   PagesConfigEntry,
   PagesDeployRecord,
@@ -217,6 +220,10 @@ export const api = {
   listBackupTargets: () => invoke<BackupTarget[]>("list_backup_targets"),
   saveBackupTargets: (targets: BackupTarget[]) =>
     invoke<BackupTarget[]>("save_backup_targets", { targets }),
+  /** 备份包目录里没有记录指向的包（记录被裁剪或手动删掉之后留下的）。 */
+  listOrphanBundles: () => invoke<OrphanBundle[]>("list_orphan_bundles"),
+  deleteOrphanBundles: (paths: string[]) =>
+    invoke<OrphanCleanup>("delete_orphan_bundles", { paths }),
   listBackupConfigs: () => invoke<BackupConfig[]>("list_backup_configs"),
   saveBackupConfig: (config: BackupConfig) =>
     invoke<BackupConfig>("save_backup_config", { config }),
@@ -278,6 +285,10 @@ export const api = {
   agentBinaryInfo: () => invoke<AgentBinaryInfo>("agent_binary_info"),
   installAgent: (serverId: string) => invoke<AgentStatus>("install_agent", { serverId }),
   uninstallAgent: (serverId: string) => invoke<string>("uninstall_agent", { serverId }),
+  /** 换控制机时没能收回的旧机器 id 列表（只读本机那份待办，不连服务器）。 */
+  agentOrphans: () => invoke<string[]>("agent_orphans"),
+  /** 控制机上那份定时 / 执行位与本机设置是否已经不一致（只读本机，不连服务器）。 */
+  agentStaleness: () => invoke<AgentStaleness>("agent_staleness"),
   agentStatus: (serverId = "") => invoke<AgentStatus>("agent_status", { serverId }),
   agentSync: (serverId = "") => invoke<AgentSyncReport>("agent_sync", { serverId }),
   agentLogs: (lines = 200) => invoke<string[]>("agent_logs", { lines }),

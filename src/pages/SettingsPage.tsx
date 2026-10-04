@@ -19,7 +19,8 @@ import { api } from "../lib/api";
 import { applyLanguage, normalizeLanguagePreference } from "../lib/i18n";
 import { FALLBACK_CANCEL_WINDOW_SECS, formatClockTime } from "../lib/shutdown";
 import { useApp } from "../lib/store";
-import type { BackupTarget, ImportPreview, Settings } from "../lib/types";
+import { humanSize } from "../lib/utils";
+import type { BackupTarget, ImportPreview, OrphanBundle, Settings } from "../lib/types";
 
 export default function SettingsPage() {
   const { t } = useTranslation();
@@ -40,6 +41,44 @@ export default function SettingsPage() {
   const [draft, setDraft] = useState<Settings>(settings);
   const [targetDraft, setTargetDraft] = useState<BackupTarget[]>(backupTargets);
   const [fromServerOpen, setFromServerOpen] = useState(false);
+  // 备份包目录里「盘上有文件、记录里已没有指向它」的那部分：轮转的候选集来自记录，
+  // 记录被裁剪（历史条数上限）或被手动删掉之后，那些包再没有任何代码路径会去收，只能由用户清。
+  const [orphans, setOrphans] = useState<OrphanBundle[]>([]);
+  const [orphanBusy, setOrphanBusy] = useState(false);
+
+  async function loadOrphans() {
+    try {
+      setOrphans(await api.listOrphanBundles());
+    } catch (error) {
+      toast("error", String(error));
+    }
+  }
+
+  async function handleCleanOrphans() {
+    if (!orphans.length) return;
+    setOrphanBusy(true);
+    try {
+      const result = await api.deleteOrphanBundles(orphans.map((item) => item.path));
+      toast(
+        "success",
+        t("settings.orphanCleaned", {
+          count: result.deleted,
+          size: humanSize(result.freedBytes),
+        }),
+      );
+      await loadOrphans();
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setOrphanBusy(false);
+    }
+  }
+
+  useEffect(() => {
+    // 本机目录扫描，进页面读一次就够，不轮询。
+    void loadOrphans();
+  }, []);
+
   const [autostart, setAutostart] = useState(false);
   const [autostartBusy, setAutostartBusy] = useState(false);
   const [shutdownTime, setShutdownTime] = useState(settings.scheduledShutdownTime);
@@ -555,6 +594,57 @@ export default function SettingsPage() {
                 {t("settings.backupTargets.saveParams")}
               </Button>
             </div>
+          </Card>
+
+          <Card className="mt-4 p-4">
+            <SectionTitle title={t("settings.orphanBundles")} />
+            <p className="mt-2 text-[11px] leading-relaxed text-ink-dim">
+              {t("settings.orphanBundlesHint")}
+            </p>
+            {orphans.length === 0 ? (
+              <p className="mt-2 text-[11px] text-pos">{t("settings.orphanBundlesNone")}</p>
+            ) : (
+              <>
+                <div className="mt-3 space-y-1.5">
+                  {orphans.slice(0, 50).map((item) => (
+                    <div
+                      key={item.path}
+                      className="flex items-center justify-between gap-3 text-[11px]"
+                    >
+                      <span className="min-w-0 truncate text-ink" title={item.path}>
+                        {item.kind === "container"
+                          ? t("settings.orphanKindContainer")
+                          : t("settings.orphanKindDatabase")}{" "}
+                        · {item.fileName}
+                      </span>
+                      <span className="shrink-0 text-ink-dim">{humanSize(item.sizeBytes)}</span>
+                    </div>
+                  ))}
+                  {orphans.length > 50 && (
+                    <p className="text-[11px] text-ink-dim">
+                      {t("settings.orphanMore", { count: orphans.length - 50 })}
+                    </p>
+                  )}
+                </div>
+                <div className="mt-3 flex items-center justify-between gap-3 border-t border-line pt-3">
+                  <p className="text-[11px] text-warn">
+                    {t("settings.orphanTotal", {
+                      count: orphans.length,
+                      size: humanSize(orphans.reduce((sum, item) => sum + item.sizeBytes, 0)),
+                    })}
+                  </p>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    loading={orphanBusy}
+                    icon={<Trash2 className="size-3.5" />}
+                    onClick={() => void handleCleanOrphans()}
+                  >
+                    {t("settings.orphanClean")}
+                  </Button>
+                </div>
+              </>
+            )}
           </Card>
         </section>
 

@@ -83,6 +83,8 @@ pub fn run() {
             commands::agent::uninstall_agent,
             commands::agent::agent_status,
             commands::agent::agent_sync,
+            commands::agent::agent_orphans,
+            commands::agent::agent_staleness,
             commands::agent::agent_logs,
             commands::agent::agent_backup_records,
             commands::agent::agent_container_records,
@@ -177,6 +179,8 @@ pub fn run() {
             commands::backup::test_backup,
             commands::backup::list_backup_targets,
             commands::backup::save_backup_targets,
+            commands::backup::list_orphan_bundles,
+            commands::backup::delete_orphan_bundles,
             commands::backup::list_backup_configs,
             commands::backup::save_backup_config,
             commands::backup::delete_backup_config,
@@ -293,6 +297,20 @@ async fn cleanup_remote_tasks(
     let backup_engine = BackupEngine::new(store.clone());
     let container_engine = deploy_core::ContainerEngine::new(store);
 
+    // 容器排在最前：整段清理外面还有一个总预算（约 14s），而只有这条路关系到
+    // 「备份替用户按下去的那次停止」有没有人补回来。剩下两类只是删远端临时文件。
+    // 它自己带 12s 上限并把超时写进记录，这里不再套一层 —— 套薄了会把那条记录一起 drop 掉。
+    // 一台任务会碰两台机器（来源打包 + 目标恢复），逐台清。
+    for (_, active) in &containers {
+        for server_id in &active.server_ids {
+            let server = match Store::find_server(&config, server_id) {
+                Ok(server) => server.clone(),
+                Err(_) => continue,
+            };
+            let _ = container_engine.cleanup_remote(&server, &active.record_id).await;
+        }
+    }
+
     for (record_id, active) in &deploys {
         let server = match Store::find_server(&config, &active.server_id) {
             Ok(server) => server.clone(),
@@ -314,19 +332,5 @@ async fn cleanup_remote_tasks(
             backup_engine.cleanup_remote_script(&server, &active.record_id),
         )
         .await;
-    }
-    // 容器任务一台会碰两台机器（来源打包 + 目标恢复），逐台清。
-    for (_, active) in &containers {
-        for server_id in &active.server_ids {
-            let server = match Store::find_server(&config, server_id) {
-                Ok(server) => server.clone(),
-                Err(_) => continue,
-            };
-            let _ = tokio::time::timeout(
-                PER_TASK_TIMEOUT,
-                container_engine.cleanup_remote(&server, &active.record_id),
-            )
-            .await;
-        }
     }
 }

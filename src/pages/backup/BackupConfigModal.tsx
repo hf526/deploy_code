@@ -62,7 +62,6 @@ export function BackupConfigModal({
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
-  const selectedServer = servers.find((server) => server.id === serverId) ?? null;
   const agentConfigured = settings.agentServerId.trim() !== "";
   // 服务器列表晚于弹窗加载完成时补选第一台，避免表单一直无法提交。
   useEffect(() => {
@@ -73,27 +72,19 @@ export function BackupConfigModal({
   // 服务器 / 配置可能绑定了已被删除的目标：悬空 id 一律按未绑定处理。
   const validTargetId = backupTargets.some((target) => target.id === targetId) ? targetId : "";
 
-  // 与后端 resolve_target 的优先级保持一致：
-  // 表单连接串 > 表单目标 > 服务器绑定目标 > 服务器自定义连接串 > 全局默认 > 旧版连接串。
+  // 备份配置只认它**自己**的目标：服务器绑定 / 全局默认 / 旧版连接串那三级兜底，后端在
+  // 「走已保存的配置」这条路上直接拒了（`backup.rs::resolve_backup` —— 那三级会换库，
+  // 而备份脚本对新库第一步是 `DROP SCHEMA ... CASCADE`）。这里替它兜底就等于预览出一个
+  // 保存后必然跑不起来的目标，所以预览的必须是真正会用的那一个。
   const effectiveTarget = useMemo(() => {
     if (overrideUrl.trim()) {
       return { name: t("backup.customUrl"), url: overrideUrl.trim() };
     }
     const bound = targetById(validTargetId);
     if (bound) return { name: bound.name, url: bound.url };
-    const serverBound = targetById(selectedServer?.backupTargetId);
-    if (serverBound) return { name: serverBound.name, url: serverBound.url };
-    if (selectedServer?.supabaseUrl?.trim()) {
-      return { name: t("backup.serverCustomUrl"), url: selectedServer.supabaseUrl.trim() };
-    }
-    const global = targetById(settings.defaultBackupTargetId);
-    if (global) return { name: global.name, url: global.url };
-    if (settings.supabaseUrl.trim()) {
-      return { name: t("settings.backupTargets.legacyName"), url: settings.supabaseUrl.trim() };
-    }
     return null;
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [overrideUrl, validTargetId, selectedServer, settings, backupTargets, t]);
+  }, [overrideUrl, validTargetId, backupTargets, t]);
 
   /** 校验并保存；通过时返回保存后的配置。 */
   async function save(): Promise<BackupConfig | null> {
@@ -298,12 +289,8 @@ export function BackupConfigModal({
               onChange={(event) => setTargetId(event.target.value)}
               disabled={saving}
             >
-              <option value="">
-                {t("backup.globalDefault")}
-                {targetById(settings.defaultBackupTargetId)
-                  ? ` (${targetById(settings.defaultBackupTargetId)?.name})`
-                  : ""}
-              </option>
+              {/* 空值不再是「用全局默认」：已保存的配置必须有它自己的目标，兜到那一级会被后端拒掉。 */}
+              <option value="">{t("backup.unboundTarget")}</option>
               {backupTargets.map((target) => (
                 <option key={target.id} value={target.id}>
                   {target.name}
@@ -329,7 +316,7 @@ export function BackupConfigModal({
                 </span>
               </>
             ) : (
-              <span className="text-warn">{t("backup.noTarget")}</span>
+              <span className="text-warn">{t("backup.ownTargetRequired")}</span>
             )}
           </p>
         </div>

@@ -36,6 +36,9 @@ use crate::util::human_size;
 /// 一侧多了字段而另一侧不认识，整份 JSON 就解析失败 —— 与其让它以「控制机返回的内容无法解析」
 /// 收场，不如握手时就拦下来。给字段加 default 是另一种做法，但那会让真正写坏的输出被静默兜成
 /// 空值，这里宁可响亮地失败。
+///
+/// 唯一的例外是 `service_active`：它带 default，而且**从来不指望 agent 提供**（由客户端问
+/// systemd 填，见 [`parse_service_state`]），所以新旧 agent 都不会因为它而解析失败，不需要 +1。
 pub const PROTO: u32 = 1;
 
 /// systemd 服务名，同时是 journal 的过滤条件。
@@ -250,7 +253,9 @@ $SUDO mv -f {dir}/config.json.staging {dir}/config.json
     )
 }
 
-/// 卸载：停服务、删 unit 与二进制，**保留** `/var/lib/deploycode`（里面是备份包与记录）。
+/// 卸载：停服务、删 unit 与二进制，**保留** `/var/lib/deploycode` 里的备份包与记录，
+/// 但必须抹掉那份 `config.json` —— 它是下发时写进去的，含全部源机的明文 SSH 口令与数据库密码，
+/// 留着等于把一整套凭据丢在一台已经不再为我们工作的机器上。
 fn uninstall_script() -> String {
     format!(
         r#"set -e
@@ -259,6 +264,7 @@ SUDO=""
 $SUDO systemctl disable --now {service} 2>/dev/null || true
 $SUDO systemctl stop {service} 2>/dev/null || true
 $SUDO rm -f {unit_path} {bin}
+$SUDO rm -f {dir}/config.json {dir}/config.json.staging
 $SUDO systemctl daemon-reload
 echo 'kept:{dir}'
 "#,
@@ -267,6 +273,32 @@ echo 'kept:{dir}'
         bin = BIN_PATH,
         dir = DATA_DIR,
     )
+}
+
+/// 问 systemd：控制机上那份常驻服务在不在跑。
+///
+/// 没让 agent 的 `status` 自己报，有两个原因：这条命令是临时 exec 出来的进程，它对「那个
+/// 常驻进程活着没」天生答不了；而控制机上装的可能是没有这个能力的新旧二进制 —— 由客户端问
+/// systemd，答案与二进制版本无关。
+async fn service_state(client: &SshClient) -> Option<bool> {
+    let command = format!(
+        "if command -v systemctl >/dev/null 2>&1; then systemctl is-active {service} 2>/dev/null; fi",
+        service = SERVICE
+    );
+    let (_, out) = client.exec_capture(&command, 20).await.ok()?;
+    parse_service_state(&out)
+}
+
+/// 取 `systemctl is-active` 那一行状态词。
+fn parse_service_state(text: &str) -> Option<bool> {
+    let line = text.lines().rev().map(str::trim).find(|line| !line.is_empty())?;
+    match line {
+        "active" | "activating" | "reloading" => Some(true),
+        "inactive" | "failed" | "deactivating" => Some(false),
+        // 没有 systemctl 的机器什么都不印；登录 shell 的欢迎语、`[stderr] ...` 这类杂音一律
+        // 当「不知道」——不该让一句怪输出换来一个红色的「服务没跑」。
+        _ => None,
+    }
 }
 
 /// `deploy-agent status` 的返回。界面据此画控制机卡片。
@@ -299,6 +331,16 @@ pub struct AgentStatus {
     pub container_time: String,
     pub container_queue: usize,
     pub container_last_run: String,
+    /// 控制机上那份**常驻服务**活着没有（systemd 的 `is-active`）。
+    ///
+    /// 由客户端在同一条 SSH 会话里问 systemd，不由 agent 自己报：`status` 那条命令是临时
+    /// exec 起来的进程，它当然在跑，而「到点有没有人执行」问的正是那个 unit。缺了这一个字段，
+    /// 服务被 StartLimitBurst 打死在 failed 状态时界面照样一片绿。
+    /// `None` = 这台机器上读不到 systemd 答案，宁缺不猜。
+    ///
+    /// 它**不属于协议**：每一版 agent 都不会输出它（总是由客户端填），所以加它不需要动 [`PROTO`]。
+    #[serde(default)]
+    pub service_active: Option<bool>,
 }
 
 /// 一次下发（注入）的结果。
@@ -331,9 +373,35 @@ pub struct AgentSyncState {
     pub backup_config_ids: Vec<String>,
     #[serde(default)]
     pub container_config_ids: Vec<String>,
+    /// 下发那一刻的定时备份口径（**本机**写下的值，不是折算到控制机时区之后的 HH:MM）。
+    ///
+    /// 开关、时间点、选中项都被 `build_bundle` 烘进 config.json，可它们不是「几条配置」，
+    /// 所以条数对得上的时候界面一片绿，而控制机照旧跑上次那份：用户关掉的定时没关掉，
+    /// 换掉的那条永远不备份。指纹记下这一份，界面与调度才说得出「那份是旧的」。
+    #[serde(default)]
+    pub backup_schedule: String,
+    #[serde(default)]
+    pub container_schedule: String,
+    /// 已经不是当前控制机、但 agent 没收回来的那台（换控制机时旧那台连不上就会留在这里）。
+    /// 它读的是自己盘上那份 config.json，到点照跑，而且那里面有全部源机的明文口令 ——
+    /// 所以 [`AgentSyncState::clear`] 不动它，界面上要一直挂着直到收回成功。
+    #[serde(default)]
+    pub orphan_server_ids: Vec<String>,
 }
 
 impl AgentSyncState {
+    /// 记一台待收回的旧控制机（去重）。
+    pub fn add_orphan(&mut self, server_id: &str) {
+        let id = server_id.trim();
+        if !id.is_empty() && !self.orphan_server_ids.iter().any(|item| item == id) {
+            self.orphan_server_ids.push(id.to_string());
+        }
+    }
+
+    /// 收回成功（或那台服务器被删掉）之后撤掉这条待办。
+    pub fn remove_orphan(&mut self, server_id: &str) {
+        self.orphan_server_ids.retain(|item| item != server_id);
+    }
     /// 这份指纹是不是给当前那台控制机记的。
     pub fn is_for(&self, server_id: &str) -> bool {
         !self.server_id.trim().is_empty() && self.server_id == server_id
@@ -347,12 +415,127 @@ impl AgentSyncState {
         self.is_for(server_id) && self.container_config_ids.iter().any(|id| id == config_id)
     }
 
+    /// 控制机上那份定时（数据库备份）与本机当前设置不一致。
+    ///
+    /// 从没下发过（`backup_schedule` 是空）不算「陈旧」而是「未下发」，由
+    /// [`AgentSyncState::holds_backup`] 那条路报错，两头不重复提醒。
+    pub fn backup_schedule_stale(&self, server_id: &str, key: &str) -> bool {
+        self.is_for(server_id) && !self.backup_schedule.is_empty() && self.backup_schedule != key
+    }
+
+    pub fn container_schedule_stale(&self, server_id: &str, key: &str) -> bool {
+        self.is_for(server_id) && !self.container_schedule.is_empty() && self.container_schedule != key
+    }
+
+    /// 控制机还持有、本机却已经不再交给它的配置名（执行位改回本机，或配置已被删除）。
+    ///
+    /// 那台机器读的是自己盘上的 config.json，不会自己停：不补一次下发，改回本机的那条
+    /// 今晚两边各跑一次（两份包落在两台机器上，而跨机没有任务锁），被删掉的那条则继续
+    /// 每晚替一个本机已经没有的配置导出。
+    pub fn stragglers(&self, config: &AppConfig) -> Vec<String> {
+        let mut names = Vec::new();
+        for id in &self.backup_config_ids {
+            match config.backup_configs.iter().find(|item| &item.id == id) {
+                None => names.push(format!("已删除的备份配置 {id}")),
+                Some(item) if !item.run_location.is_remote() => {
+                    names.push(format!("「{}」已改回本机", item.name))
+                }
+                Some(_) => {}
+            }
+        }
+        for id in &self.container_config_ids {
+            match config.container_configs.iter().find(|item| &item.id == id) {
+                None => names.push(format!("已删除的容器配置 {id}")),
+                Some(item) if !item.run_location.is_remote() => {
+                    names.push(format!("「{}」已改回本机", item.name))
+                }
+                Some(_) => {}
+            }
+        }
+        names
+    }
+
     /// 清空（卸载时调用）：留着一个指向不存在的服务器的指纹，比没有指纹更容易骗过让位判定。
+    ///
+    /// `orphan_server_ids` 不在清空范围内：它不是指纹，而是「还有哪台机器上没收回 agent」的待办，
+    /// 卸载/换机把现役指纹清掉时那份待办得留着，否则旧控制机就悄悄没人管了。
     pub fn clear(&mut self) {
         self.server_id = String::new();
         self.synced_at = String::new();
         self.backup_config_ids = Vec::new();
         self.container_config_ids = Vec::new();
+        self.backup_schedule = String::new();
+        self.container_schedule = String::new();
+    }
+}
+
+/// 下发那一刻的定时备份口径（本机值）。参与指纹比较，不参与折算。
+pub fn backup_schedule_key(config: &AppConfig) -> String {
+    format!(
+        "{}|{}|{}",
+        config.settings.scheduled_backup_enabled,
+        config.settings.scheduled_backup_time.trim(),
+        config
+            .settings
+            .scheduled_backup_config_id
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+    )
+}
+
+/// 容器那边同理，只是选中项是一个列表（顺序即当晚执行顺序）。
+pub fn container_schedule_key(config: &AppConfig) -> String {
+    format!(
+        "{}|{}|{}",
+        config.settings.scheduled_container_enabled,
+        config.settings.scheduled_container_time.trim(),
+        config
+            .settings
+            .scheduled_container_config_ids
+            .iter()
+            .map(|id| id.trim())
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+/// 「控制机上那份与本机设置已经不一致」的本机视图：纯读盘，不连服务器。
+///
+/// 存在的理由：`syncNeeded` 只比配置条数，看不出定时设置的改动，也看不出某条配置被改回
+/// 本机 / 被删掉之后控制机还留着它那一半。这两类都会让控制机在夜里做出与界面相反的事。
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentStaleness {
+    /// 定时的数据库备份改动还没下发（控制机上跑的是上次那份）。
+    pub backup_schedule_stale: bool,
+    /// 定时的容器备份改动还没下发。
+    pub container_schedule_stale: bool,
+    /// 控制机还持有、本机已不再交给它的配置（点名是谁）。
+    pub stragglers: Vec<String>,
+    /// 上次成功下发的时刻；空串 = 从没下发过。
+    pub synced_at: String,
+}
+
+/// 只读本机的 config.json 与 agent-sync.json，供界面与调度提醒用。
+pub fn staleness(store: &Store) -> AgentStaleness {
+    let Ok(config) = store.load_config() else {
+        // 读不到本机配置就当没有可提醒的：这一栏是提示，不该把设置页拖成报错。
+        return AgentStaleness::default();
+    };
+    let sync = store.load_agent_sync();
+    let server_id = config.settings.agent_server_id.trim();
+    if !sync.is_for(server_id) {
+        // 指纹不是当前这台控制机的（没装、换过机器、刚卸载）：那时是「未下发」，
+        // 由让位判定报失败，这里不重复报陈旧。
+        return AgentStaleness::default();
+    }
+    AgentStaleness {
+        backup_schedule_stale: sync.backup_schedule_stale(server_id, &backup_schedule_key(&config)),
+        container_schedule_stale: sync
+            .container_schedule_stale(server_id, &container_schedule_key(&config)),
+        stragglers: sync.stragglers(&config),
+        synced_at: sync.synced_at.clone(),
     }
 }
 
@@ -376,23 +559,47 @@ pub struct AgentBinaryInfo {
     /// 绝对路径；[`AgentBinarySource::Missing`] 时是空串。
     pub path: String,
     pub size_bytes: u64,
+    /// 一份都没有、或放了却不能用时的原因；空串表示可用。
+    ///
+    /// 不能只报「没内置」：用户在 `<数据目录>/agent/` 手放了一份 `.exe` 时，真实原因是那份不能用的
+    /// 文件挡住了内置那份，把路径与原因写出来他才知道该删掉哪个（AGENTS.md：谁在用哪个要直接写出来）。
+    #[serde(default)]
+    pub error: String,
 }
 
-/// 上传之前先确认这是 Linux 可执行文件（ELF 头）。
+/// 这份文件能不能当 Linux agent 用：能用返回 `None`，不能用返回一句说明原因的话。
 ///
-/// Windows 上开发很容易顺手放一份 `deploy-agent.exe` 或占位文件：装到服务器上
-/// `install -m 755` 照装、systemd 照起，直到 `--version` 那一行打不出来才炸，
-/// 而那时旧服务已经被 stop 掉了。所以在源头就拦下来。
-fn is_linux_binary(path: &Path) -> bool {
+/// 只查 4 字节魔数是不够的 —— ARM 或 32 位的 ELF 也会通过，装上之后 systemd 起不来，
+/// 而那时旧服务已经被 stop 掉了（安装脚本先 stop 再落盘）。x86_64 Linux 的组合是固定的：
+/// ELFCLASS64 + 小端 + `e_machine = 0x3e`。
+fn binary_problem(path: &Path) -> Option<String> {
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(_) => return Some("文件读不出来（可能被别的进程占用）".to_string()),
     };
-    let mut magic = [0u8; 4];
-    std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == [0x7f, b'E', b'L', b'F']
+    let mut head = [0u8; 20];
+    if std::io::Read::read_exact(&mut file, &mut head).is_err() {
+        return Some("文件太短，不像可执行文件".to_string());
+    }
+    if head[..4] != [0x7f, b'E', b'L', b'F'] {
+        return Some("文件头不是 ELF（本机编出来的 deploy-agent.exe 或占位文件都是这样）".to_string());
+    }
+    if head[4] != 2 {
+        return Some("这是 32 位 ELF，控制机要 64 位".to_string());
+    }
+    if head[5] != 1 {
+        return Some("这是大端 ELF，控制机要小端（x86_64）".to_string());
+    }
+    let machine = u16::from_le_bytes([head[18], head[19]]);
+    if machine != 0x3e {
+        return Some(format!(
+            "这是架构 {machine:#04x} 的 ELF，控制机要 x86_64（0x3e）—— 用 --target x86_64-unknown-linux-musl 重新编一份"
+        ));
+    }
+    None
 }
 
-/// 一个候选路径的两道检查：在不在、是不是 Linux 二进制。
+/// 一个候选路径的两道检查：在不在、是不是能跑在 x86_64 Linux 上。
 fn accept_binary(path: PathBuf, source: AgentBinarySource) -> Result<(PathBuf, AgentBinarySource)> {
     if !path.is_file() {
         return Err(CoreError::config(format!(
@@ -400,9 +607,9 @@ fn accept_binary(path: PathBuf, source: AgentBinarySource) -> Result<(PathBuf, A
             path.display()
         )));
     }
-    if !is_linux_binary(&path) {
+    if let Some(problem) = binary_problem(&path) {
         return Err(CoreError::config(format!(
-            "{} 不是 Linux 可执行文件（文件头不是 ELF）。agent 跑在服务器上，本机编出来的 deploy-agent.exe 传过去也起不来。",
+            "{} 不能当 agent 用：{problem}。agent 跑在控制机（Linux）上，本机那份即使能双击也传不过去。",
             path.display()
         )));
     }
@@ -436,18 +643,21 @@ pub fn locate_binary(store: &Store) -> Result<(PathBuf, AgentBinarySource)> {
     )))
 }
 
-/// 界面用的只读视图：找不到不报错，`source` 会是 `missing`，让页面自己决定怎么提示。
+/// 界面用的只读视图：找不到不报错，`source` 会是 `missing`、`error` 里写清楚为什么，
+/// 让页面自己决定怎么提示。
 pub fn binary_info(store: &Store) -> AgentBinaryInfo {
     match locate_binary(store) {
         Ok((path, source)) => AgentBinaryInfo {
             source,
             size_bytes: std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
+            error: String::new(),
             path: path.display().to_string(),
         },
-        Err(_) => AgentBinaryInfo {
+        Err(err) => AgentBinaryInfo {
             source: AgentBinarySource::Missing,
             path: String::new(),
             size_bytes: 0,
+            error: err.to_string(),
         },
     }
 }
@@ -606,6 +816,30 @@ pub fn bundle_warnings(
     if bundle.backup_configs.is_empty() && bundle.container_configs.is_empty() {
         warnings.push("当前没有任何配置的执行位是「控制机」，下发过去只有服务器凭据，不会自动跑备份。".to_string());
     }
+    // 交给控制机的配置必须自带目标：`resolve_backup` 不许它兜底到服务器绑定 / 全局默认（那等于换库，
+    // 见 backup.rs），所以这种配置到点必失败。下发时就点名，别让用户从当晚的失败记录里倒推。
+    let ownerless: Vec<String> = bundle
+        .backup_configs
+        .iter()
+        .filter(|item| {
+            let has_target = item
+                .target_id
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            let has_url = item
+                .supabase_url
+                .as_deref()
+                .is_some_and(|value| !value.trim().is_empty());
+            !(has_target || has_url)
+        })
+        .map(|item| item.name.clone())
+        .collect();
+    if !ownerless.is_empty() {
+        warnings.push(format!(
+            "控制机上的备份配置「{}」没有自己的备份目标，到点会失败（不会退到服务器绑定或全局默认，那等于换库）。请在数据库备份页为它选一个目标再下发。",
+            ownerless.join("」「")
+        ));
+    }
     // 时间点折算过就要说出来：控制机的钟和本机的钟不一样时，用户设的 03:00 会落在别的时刻。
     if let Some(note) = shifted_note(
         "定时数据库备份",
@@ -628,6 +862,19 @@ pub fn bundle_warnings(
         warnings.push("没读到控制机的时区，定时时间按控制机当地解释；若两机时区不同，实际时刻会与设置里不同。".to_string());
     }
     warnings
+}
+
+/// 协议对不上就拒绝任何下发（装的是哪一份都得先过这一关）。
+///
+/// 下发过去的 config.json 是按当前语义写的：旧协议那份读它，字段含义可能已经改过，
+/// 而 `remember_sync` 一记上本机就撒手 —— 到点跑出一份谁也没预期的东西。
+/// 握手那两条命令（`sync` / `status`）都过这里，`install` 也必须过：它紧接着自己 push_bundle。
+fn check_proto(remote: &AgentVersion) -> Result<()> {
+    let local = local_version();
+    if remote.proto != local.proto {
+        return Err(CoreError::config(version_mismatch(&local, remote)));
+    }
+    Ok(())
 }
 
 /// 管理端：所有动作都以「一次 SSH 会话」为单位，用完即断。
@@ -742,10 +989,7 @@ impl AgentControl {
     /// 握手：远端协议必须与本机一致，否则拒绝后续任何下发。
     async fn handshake(&self, client: &SshClient) -> Result<AgentVersion> {
         let remote = self.fetch_version(client).await?;
-        let local = local_version();
-        if remote.proto != local.proto {
-            return Err(CoreError::config(version_mismatch(&local, &remote)));
-        }
+        check_proto(&remote)?;
         Ok(remote)
     }
 
@@ -782,6 +1026,9 @@ impl AgentControl {
             let _ = client
                 .exec_capture(&format!("rm -f {}", shell_quote(&tmp)), 30)
                 .await;
+            // 覆盖安装本身是允许的（用户要的就是这份新二进制），但下发不行：
+            // 手放在 `<数据目录>/agent/` 的旧协议产物，会走这条路收到新语义的配置。
+            check_proto(&version)?;
             let report = self.push_bundle(&client, &server_id).await?;
             Ok::<AgentStatus, CoreError>(AgentStatus {
                 version: version.version,
@@ -791,6 +1038,39 @@ impl AgentControl {
         .await;
         client.disconnect().await;
         result
+    }
+
+    /// 装好并设为控制机，同时把原来那台收回来。
+    ///
+    /// 顺序是有讲究的：先把 `agent_server_id` 换成新机、再对旧机下发卸载。因为
+    /// `Store::forget_agent_server` 只肯动「当前那台」（防止顺手清掉现役指纹），换过去之后
+    /// 卸旧机就不会把新机刚记下的指纹和执行位一起收掉；而旧机上那份 agent 读的是它自己
+    /// 盘上的 config.json，没人叫停的话它照旧每晚执行，上面还挂着全部源机的明文口令。
+    /// 收回失败（旧机重装过、口令改了）不拦这次切换 —— 拦了用户就卡在两台之间，
+    /// 改成记一笔待收回、界面红在那里，直到手动收回成功。
+    pub async fn promote(&self, server_id: &str) -> Result<AgentStatus> {
+        let previous = self
+            .store
+            .load_config()?
+            .settings
+            .agent_server_id
+            .trim()
+            .to_string();
+        let status = self.install(Some(server_id)).await?;
+        self.store.mutate_config(|config| {
+            config.settings.agent_server_id = server_id.to_string();
+            Ok(())
+        })?;
+        if !previous.is_empty() && previous != server_id {
+            if let Err(err) = self.uninstall(Some(&previous)).await {
+                self.store.remember_orphan_agent(&previous)?;
+                // 说清下一步做什么：那台机器现在既不在我们名下、又还在自行执行。
+                return Err(CoreError::ssh(format!(
+                    "已把控制机换成这台，但旧控制机上的 agent 没能收回（{err}）。已记下待办，请在控制机页面把它收回，或先解除那台机器的 agent 服务。"
+                )));
+            }
+        }
+        Ok(status)
     }
 
     /// 卸载：只停服务、删 unit 与二进制，备份包与记录留在 `/var/lib/deploycode`。
@@ -816,6 +1096,7 @@ impl AgentControl {
                 )));
             }
             let text = out.trim().to_string();
+            // forget_agent → Store::forget_agent_server 里会顺手撤掉这台的「待收回」记录。
             let moved = self.forget_agent(&server_id)?;
             // 条数只有本机侧关心（CLI 会原样打印出来）：不说的话，用户以为退回本机那部分还在跑。
             Ok(if moved > 0 {
@@ -900,7 +1181,7 @@ impl AgentControl {
             // 安装脚本返回 0 就是「控制机上那份已经存在」：指纹在这一刻记下才准。
             // 排在状态回读之后的话，status 一失败本机就不认这次下发（判成「未下发」而拒绝定时），
             // 可控制机当晚照跑 —— 用户看到的是一句和事实相反的报错。
-            self.remember_sync(server_id, &bundle)?;
+            self.remember_sync(server_id, &bundle, &config)?;
             let status = self.status_via(client).await.map_err(|err| {
                 CoreError::ssh(format!(
                     "配置已下发到控制机，但读不到它的状态（{err}）；本机按已下发处理，定时交给控制机执行"
@@ -938,8 +1219,11 @@ impl AgentControl {
     }
 
     /// 记下「控制机上现在有这些配置」，供定时循环判断该不该让位。
-    fn remember_sync(&self, server_id: &str, bundle: &AppConfig) -> Result<()> {
-        let state = AgentSyncState {
+    ///
+    /// 定时口径按**本机当前值**记（不是 bundle 里折算过的那份）：比较的对象是用户界面上
+    /// 看到的 HH:MM 与勾选，折算只影响控制机何时执行，不影响「改没改过」。
+    fn remember_sync(&self, server_id: &str, bundle: &AppConfig, config: &AppConfig) -> Result<()> {
+        let mut state = AgentSyncState {
             server_id: server_id.to_string(),
             synced_at: crate::models::now_string(),
             backup_config_ids: bundle.backup_configs.iter().map(|item| item.id.clone()).collect(),
@@ -948,7 +1232,12 @@ impl AgentControl {
                 .iter()
                 .map(|item| item.id.clone())
                 .collect(),
+            backup_schedule: backup_schedule_key(config),
+            container_schedule: container_schedule_key(config),
+            ..Default::default()
         };
+        // 待收回那份不是指纹：重新下发不该顺手把「旧那台还没收回 agent」这件事清掉。
+        state.orphan_server_ids = self.store.load_agent_sync().orphan_server_ids;
         self.store.save_agent_sync(&state)
     }
 
@@ -966,10 +1255,15 @@ impl AgentControl {
 
     async fn status_via(&self, client: &SshClient) -> Result<AgentStatus> {
         let command = format!("{BIN_PATH} status --data-dir {DATA_DIR}");
-        Self::exec_json(client, &command, 90, "读取控制机状态", |text| {
-            serde_json::from_str(text).map_err(|err| err.to_string())
-        })
-        .await
+        let mut status: AgentStatus =
+            Self::exec_json(client, &command, 90, "读取控制机状态", |text| {
+                serde_json::from_str(text).map_err(|err| err.to_string())
+            })
+            .await?;
+        // 上面那份是「这份 exec 出来的进程怎么描述自己」，回答不了「到点有没有人跑」。
+        // 常驻服务活着与否只能问 systemd —— 而且由客户端来问，老版本 agent 二进制不重装也报得准。
+        status.service_active = service_state(client).await;
+        Ok(status)
     }
 
     /// 回读 agent 自身的运行日志（journald）。
@@ -1202,9 +1496,34 @@ pub fn disk_summary(dir: &Path) -> Result<(u64, u64, u64)> {
 mod tests {
     use super::*;
     use crate::models::{
-        BackupConfig, ContainerConfig, ContainerTarget, DbBackupSource, DeployStatus, RunLocation,
-        ServerConfig, SshAuth,
+        BackupConfig, BackupTarget, ContainerConfig, ContainerTarget, DbBackupSource, DeployStatus,
+        RunLocation, ServerConfig, SshAuth,
     };
+
+    #[test]
+    fn service_state_only_answers_known_systemd_words() {
+        assert_eq!(parse_service_state("active\n"), Some(true));
+        assert_eq!(parse_service_state("  activating  "), Some(true));
+        // StartLimitBurst 打死之后停在这里 —— 这正是原来界面上看不见的那个状态。
+        assert_eq!(parse_service_state("failed\n"), Some(false));
+        assert_eq!(parse_service_state("inactive"), Some(false));
+        // 没有 systemctl 的机器什么都不印；shell 欢迎语与 [stderr] 行都不该被读成「没跑」。
+        assert_eq!(parse_service_state(""), None);
+        assert_eq!(parse_service_state("Welcome to Ubuntu 24.04\n"), None);
+        assert_eq!(parse_service_state("[stderr] Failed to connect to bus\n"), None);
+    }
+
+    /// 这一格是客户端填的，所以 agent 那份 JSON 里**没有**它也必须解得开（老二进制）。
+    #[test]
+    fn status_without_service_active_field_still_parses() {
+        let json = r#"{"proto":1,"version":"0.1.4","timezone":"+0800","localTime":"2026-10-04 03:00:00",
+            "dataDir":"/var/lib/deploycode","totalBytes":1,"freeBytes":1,"floorBytes":1,
+            "bundleBytes":0,"bundleCount":0,"servers":1,"backupConfigs":1,"containerConfigs":0,
+            "backupEnabled":true,"backupTime":"03:00","backupConfigName":"zhu","backupLastRun":"",
+            "containerEnabled":false,"containerTime":"","containerQueue":0,"containerLastRun":""}"#;
+        let status: AgentStatus = serde_json::from_str(json).expect("老 agent 的输出该照样解得开");
+        assert_eq!(status.service_active, None);
+    }
 
     fn server(id: &str, name: &str) -> ServerConfig {
         let mut item = ServerConfig::new(
@@ -1419,6 +1738,36 @@ mod tests {
         );
     }
 
+    /// 执行位交给控制机、却没给自己留备份目标的配置：控制机到点必失败（不许兜底换库），
+    /// 所以下发那一刻就要点名，而不是让用户从当晚的失败记录里倒推。
+    #[test]
+    fn bundle_warns_about_remote_configs_without_a_target() {
+        let mut config = AppConfig::default();
+        let mut with_target = backup_config("b1", "带目标", true);
+        with_target.target_id = Some("t1".to_string());
+        let mut with_url = backup_config("b2", "带连接串", true);
+        with_url.supabase_url = Some("postgres://u:p@h/db".to_string());
+        config.backup_configs = vec![with_target, with_url, backup_config("b3", "裸配置", true)];
+        config.backup_targets = vec![BackupTarget::new(
+            "目标库".to_string(),
+            "postgres://u:p@h/db".to_string(),
+        )];
+
+        let warnings = bundle_warnings(&config, &build_bundle(&config, None), None);
+        let flagged: Vec<&String> = warnings
+            .iter()
+            .filter(|item| item.contains("没有自己的备份目标"))
+            .collect();
+        assert_eq!(flagged.len(), 1, "{warnings:?}");
+        // 只点名缺目标的那条：另两条各有自己的来源，不该被牵连。
+        assert!(
+            flagged[0].contains("裸配置")
+                && !flagged[0].contains("带目标")
+                && !flagged[0].contains("带连接串"),
+            "{flagged:?}"
+        );
+    }
+
     #[test]
     fn bundle_keeps_the_users_own_db_bundle_keep_when_set() {
         let mut config = AppConfig::default();
@@ -1517,11 +1866,12 @@ mod tests {
 
     #[test]
     fn sync_state_only_answers_for_the_machine_it_was_recorded_on() {
-        let state = AgentSyncState {
+        let mut state = AgentSyncState {
             server_id: "s1".to_string(),
             synced_at: "2026-09-27 03:00:00".to_string(),
             backup_config_ids: vec!["b1".to_string()],
             container_config_ids: vec!["c1".to_string()],
+            ..Default::default()
         };
         assert!(state.holds_backup("s1", "b1"));
         assert!(state.holds_container("s1", "c1"));
@@ -1529,6 +1879,16 @@ mod tests {
         assert!(!state.holds_backup("s2", "b1"));
         assert!(!state.holds_backup("s1", "b9"));
         assert!(!AgentSyncState::default().holds_backup("s1", "b1"));
+
+        // 待收回那份是指纹之外的东西：作废指纹（卸载 / 换机）不该把「旧那台还没收回」一起清掉。
+        state.add_orphan("s0");
+        state.add_orphan("s0");
+        assert_eq!(state.orphan_server_ids, vec!["s0".to_string()]);
+        state.clear();
+        assert!(state.server_id.is_empty() && state.backup_config_ids.is_empty());
+        assert_eq!(state.orphan_server_ids, vec!["s0".to_string()]);
+        state.remove_orphan("s0");
+        assert!(state.orphan_server_ids.is_empty());
     }
 
     #[test]
@@ -1577,7 +1937,9 @@ mod tests {
         let binary = dir.join("agent").join("deploy-agent");
         std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
         // 本机 cargo build 出来的那份（PE）或随手放的占位文本，都不该被传上服务器。
-        std::fs::write(&binary, b"MZ\x90\x03 stub").unwrap();
+        let mut pe = x86_64_head();
+        pe[..4].copy_from_slice(b"MZ\x90\x03");
+        std::fs::write(&binary, pe).unwrap();
         let err = resolve_binary(&store).unwrap_err().to_string();
         assert!(err.contains("ELF"), "{err}");
         std::fs::remove_dir_all(&dir).ok();
@@ -1591,6 +1953,52 @@ mod tests {
         assert_eq!(json["source"], "missing");
         assert_eq!(json["path"], "");
         assert!(json.get("sizeBytes").is_some(), "{json}");
+        // 一处都没有时也要把原因写出来，界面那一行直接画这句话。
+        assert!(json["error"]
+            .as_str()
+            .unwrap()
+            .contains("本机没有可用的 agent 可执行文件"), "{json}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn x86_64_head() -> [u8; 20] {
+        let mut head = [0u8; 20];
+        head[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+        head[4] = 2; // ELFCLASS64
+        head[5] = 1; // 小端
+        head[18..20].copy_from_slice(&0x3eu16.to_le_bytes()); // EM_X86_64
+        head
+    }
+
+    /// 只看 4 字节魔数是不够的：ARM / 32 位 / 大端的 ELF 都会通过，装上之后 systemd 起不来，
+    /// 而安装脚本那时已经把旧服务 stop 掉了。
+    #[test]
+    fn binary_problem_rejects_elf_that_cannot_run_on_the_control_machine() {
+        let dir = tempfile();
+        let path = dir.join("deploy-agent");
+        let check = |head: [u8; 20]| -> Option<String> {
+            std::fs::write(&path, head).unwrap();
+            binary_problem(&path)
+        };
+
+        assert_eq!(check(x86_64_head()), None);
+
+        let mut arm = x86_64_head();
+        arm[18..20].copy_from_slice(&0xb7u16.to_le_bytes()); // EM_AARCH64
+        assert!(check(arm).unwrap().contains("架构"));
+
+        let mut ilp32 = x86_64_head();
+        ilp32[4] = 1; // ELFCLASS32
+        assert!(check(ilp32).unwrap().contains("32 位"));
+
+        let mut be = x86_64_head();
+        be[5] = 2; // 大端
+        assert!(check(be).unwrap().contains("大端"));
+
+        let mut not_elf = x86_64_head();
+        not_elf[..4].copy_from_slice(b"MZ\x90\x00"); // PE 头
+        assert!(check(not_elf).unwrap().contains("ELF"));
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1636,6 +2044,87 @@ mod tests {
     }
 
     /// 临时目录（deploy-core 的测试没有引 tempfile crate，这里用最直白的方式）。
+    /// 条数一样但内容已经变了：这一类改动以前两头都看不见（`syncNeeded` 只比条数），
+    /// 而控制机那一晚会跑出与界面上相反的东西。
+    #[test]
+    fn staleness_names_schedule_changes_and_configs_the_agent_still_holds() {
+        let dir = tempfile();
+        let store = Store::new(&dir);
+        let mut config = AppConfig::default();
+        config.settings.agent_server_id = "s1".to_string();
+        config.settings.scheduled_backup_enabled = true;
+        config.settings.scheduled_backup_time = "03:00".to_string();
+        config.settings.scheduled_backup_config_id = Some("b1".to_string());
+        config.settings.scheduled_container_enabled = true;
+        config.settings.scheduled_container_time = "04:00".to_string();
+        config.settings.scheduled_container_config_ids = vec!["c1".to_string()];
+        config.backup_configs = vec![backup_config("b1", "夜间库", true)];
+        config.container_configs = vec![container_config("c1", "远端项目", true)];
+        store.save_config(&config).unwrap();
+
+        // 下发那一刻：指纹由 remember_sync 写，两边都从它取，口径不会分叉。
+        let bundle = build_bundle(&config, Some(480));
+        let control = AgentControl::new(Arc::new(Store::new(&dir)));
+        control
+            .remember_sync("s1", &bundle, &store.load_config().unwrap())
+            .expect("写指纹");
+        let same = staleness(&store);
+        assert!(
+            !same.backup_schedule_stale && !same.container_schedule_stale,
+            "一模一样不该报陈旧：{same:?}"
+        );
+        assert!(same.stragglers.is_empty() && !same.synced_at.is_empty());
+
+        // 只改时间点：配置条数不变，界面上那个「与本机不一致」以前根本亮不起来。
+        let mut moved = config.clone();
+        moved.settings.scheduled_backup_time = "11:00".to_string();
+        store.save_config(&moved).unwrap();
+        let stale = staleness(&store);
+        assert!(stale.backup_schedule_stale, "改了时间要报陈旧：{stale:?}");
+        assert!(!stale.container_schedule_stale);
+
+        // 执行位改回本机、以及控制机还持有的容器配置被删掉：两份都要点名。
+        let mut revoked = moved.clone();
+        revoked.backup_configs = vec![backup_config("b1", "夜间库", false)];
+        revoked.container_configs = Vec::new();
+        store.save_config(&revoked).unwrap();
+        let names = staleness(&store).stragglers;
+        assert!(
+            names.iter().any(|item| item.contains("夜间库"))
+                && names.iter().any(|item| item.contains("c1")),
+            "改回本机与被删的都该点出来：{names:?}"
+        );
+
+        // 从没下发过 / 换了指向：那是「未下发」，由让位判定报失败，这里不重复报陈旧。
+        let mut other = revoked.clone();
+        other.settings.agent_server_id = "s9".to_string();
+        store.save_config(&other).unwrap();
+        let none = staleness(&store);
+        assert!(
+            !none.backup_schedule_stale && none.stragglers.is_empty(),
+            "指纹不属于当前控制机时不该报陈旧：{none:?}"
+        );
+    }
+
+    /// 旧协议的那份不能拿去执行新语义的配置，哪怕它是 install 刚装上去的。
+    #[test]
+    fn check_proto_refuses_mismatched_agent() {
+        let same = AgentVersion {
+            proto: PROTO,
+            version: "0.0.1".to_string(),
+        };
+        assert!(check_proto(&same).is_ok());
+        for proto in [PROTO - 1, PROTO + 1] {
+            let err = check_proto(&AgentVersion {
+                proto,
+                version: "0.0.1".to_string(),
+            })
+            .expect_err("协议不一致必须拒绝");
+            let text = err.to_string();
+            assert!(text.contains("升级") || text.contains("版本"), "{text}");
+        }
+    }
+
     fn tempfile() -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "deploycode-agent-test-{}",
@@ -1645,9 +2134,9 @@ mod tests {
         dir
     }
 
-    /// 写一份能过 ELF 头检查的假二进制。
+    /// 写一份能过 ELF 检查的假二进制（够 20 字节，`e_machine` 是 x86_64）。
     fn write_fake_binary(path: &Path) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, b"\x7fELF\x02\x01\x01fake").unwrap();
+        std::fs::write(path, x86_64_head()).unwrap();
     }
 }

@@ -701,6 +701,16 @@ export default function DeployPage() {
               </div>
             )}
 
+            {live?.aborted && (
+              <p className="mt-3 rounded-md border border-warn/30 bg-warn-soft px-3 py-2 text-[11px] leading-relaxed text-warn">
+                {t("deploy.batchAborted", {
+                  succeeded: live.aborted.succeeded,
+                  total: live.aborted.total,
+                })}
+                {live.aborted.reason ? `：${live.aborted.reason}` : ""}
+              </p>
+            )}
+
             {activeLive?.record && (
               <div
                 className={cn(

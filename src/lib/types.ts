@@ -60,6 +60,9 @@ export interface AgentStatus {
   containerTime: string;
   containerQueue: number;
   containerLastRun: string;
+  /** 控制机上那份常驻 systemd 服务活着没有。由客户端问 systemd，不由 agent 自报；
+   *  读不到（这台机器没有 systemctl）为 null。 */
+  serviceActive: boolean | null;
 }
 
 /** 本机这份 agent 可执行文件的来源（Rust: deploy_core::agent::AgentBinarySource）。 */
@@ -71,6 +74,23 @@ export interface AgentBinaryInfo {
   /** 绝对路径；source 为 "missing" 时是空串。 */
   path: string;
   sizeBytes: number;
+  /** 用不了的原因（没内置、或放的那份不是 x86_64 Linux 可执行文件）；空串表示可用。 */
+  error: string;
+}
+
+/** 盘上有文件、记录里已没有指向它的本地备份包（Rust: deploy_core::store::OrphanBundle）。 */
+export interface OrphanBundle {
+  /** "database" 走 backups 目录，"container" 走 containers 目录。 */
+  kind: "database" | "container";
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+}
+
+/** 一次孤儿包清理的结果（Rust: commands::backup::OrphanCleanup）。 */
+export interface OrphanCleanup {
+  deleted: number;
+  freedBytes: number;
 }
 
 /** 一次下发（注入）的结果（Rust: deploy_core::agent::AgentSyncReport）。 */
@@ -80,6 +100,19 @@ export interface AgentSyncReport {
   containerConfigs: number;
   warnings: string[];
   status: AgentStatus;
+}
+
+/** 控制机上那份与本机设置是否已经不一致（Rust: deploy_core::agent::AgentStaleness）。
+ * 纯本机读盘：条数对得上时，界面也需要这一层来说出「那份是旧的」。 */
+export interface AgentStaleness {
+  /** 定时数据库备份（开关 / 时间 / 选中项）改动后没有重新下发。 */
+  backupScheduleStale: boolean;
+  /** 定时容器备份同上。 */
+  containerScheduleStale: boolean;
+  /** 执行位已改回本机、或配置已删除，但控制机那份里还留着它们（点名）。 */
+  stragglers: string[];
+  /** 上次成功下发的时刻；空串 = 从没下发过。 */
+  syncedAt: string;
 }
 
 export interface NginxContainerInfo {
@@ -413,6 +446,10 @@ export interface SchedulerNotice {
     | "containerFailed"
     | /** 到点了，但这条配置今晚由控制机执行：本机让位（正常收尾，不是失败）。 */
       "remoteSkipped"
+    | /** 让位给控制机，可它拿的是上次下发的那份定时：今晚跑的不是用户以为的设置。 */
+      "agentStale"
+    | /** 执行位已改回本机的配置，控制机那份里还留着：今晚两边各跑一次。 */
+      "agentStranded"
     | "shutdownFired"
     | "shutdownFailed";
   message?: string;
@@ -422,7 +459,9 @@ export type DeployEvent =
   | { type: "started"; recordId: string }
   | { type: "log"; level: LogLevel; message: string }
   | { type: "progress"; percent: number; message: string }
-  | { type: "finished"; record: DeployRecord };
+  | { type: "finished"; record: DeployRecord }
+  /** 批量部署被中止：某台连准备都没过，剩下的机器不再部署。那台没有自己的记录。 */
+  | { type: "batchAborted"; succeeded: number; total: number; reason: string };
 
 export interface LogLine {
   level: LogLevel;
@@ -438,6 +477,8 @@ export interface LiveTask<TRecord> {
   progressMessage: string;
   status: DeployStatus;
   record: TRecord | null;
+  /** 只有批量部署会有：中止那台没有记录，卡片靠这条说明「这批没跑完」。 */
+  aborted?: { succeeded: number; total: number; reason: string } | null;
 }
 
 export type LiveDeploy = LiveTask<DeployRecord>;

@@ -28,6 +28,8 @@ const STABLE_SESSION_SECS: u64 = 60;
 const HEALTH_CHECK_SECS: u64 = 2;
 /// 退出前等在途转发任务收口的最长时间，超时直接 abort。
 const DRAIN_TIMEOUT_SECS: u64 = 2;
+/// 本机 accept 失败后回到 accept 之前的间隔：只在连续失败时挡空转，正常连接感觉不到。
+const ACCEPT_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// 一条规则的监听状态。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -497,13 +499,29 @@ async fn accept_loop(
     status: Arc<Mutex<ServerTunnelStatus>>,
 ) -> Result<()> {
     loop {
+        if *stop.borrow_and_update() {
+            return Ok(());
+        }
         let accepted = tokio::select! {
             result = listener.accept() => result,
             _ = stop.changed() => return Ok(()),
         };
-        let (stream, _) = accepted.map_err(|err| {
-            CoreError::ssh(format!("本机端口 {} 接受连接失败: {err}", rule.local_port))
-        })?;
+        let (stream, _) = match accepted {
+            Ok(pair) => pair,
+            // 一次 accept 失败不许把整条隧道拆了重来：会话是全部连接共用的那一条 SSH 连接，
+            // 重来会掐掉其它正在转发的连接，而这种失败多半只关系到刚那一个连接
+            // （本机那端在握手完成前就被重置、进程句柄一时不够）。端口真被抢走的场合
+            // 也只需跳过这一轮，绑定由 `supervise` 的下一轮补齐。
+            Err(err) => {
+                let message = format!("本机端口 {} 接受连接失败: {err}", rule.local_port);
+                with_status(&status, move |current| {
+                    current.last_error = Some(message);
+                });
+                // 歇一小会儿再回去 accept：持续失败时不至于空转把 CPU 吃满。
+                tokio::time::sleep(ACCEPT_RETRY_DELAY).await;
+                continue;
+            }
+        };
 
         {
             let mut guard = lock(&status);
@@ -514,9 +532,17 @@ async fn accept_loop(
         let host = rule.remote_host.clone();
         let remote_port = rule.remote_port;
         let counter = status.clone();
+        let mut conn_stop = stop.clone();
         // 每条连接独立一个任务：一条转发结束（或对端失败）不应影响别的连接。
         tokio::spawn(async move {
-            if let Err(err) = client.forward_tcp(stream, &host, remote_port).await {
+            // 但任务必须跟着这一轮一起收：攥着 `Arc<SshClient>` 不放的那条空连接
+            // （浏览器 keepalive 最典型）会让这轮作废的会话永远关不掉，
+            // 换控制机、点「重新连接」之后旧会话还挂在上面。
+            let outcome = tokio::select! {
+                result = client.forward_tcp(stream, &host, remote_port) => result,
+                _ = conn_stop.changed() => return,
+            };
+            if let Err(err) = outcome {
                 // 单条连接失败只记账到这台隧道的最近错误：会话还在，用户下次请求就能恢复。
                 let mut guard = lock(&counter);
                 guard.last_error = Some(err.to_string());

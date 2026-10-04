@@ -410,10 +410,13 @@ pub(crate) fn parse_probe(output: &str, services: &[ComposeService]) -> ProbeRes
             "A" => anonymous_volumes += 1,
             "B" => {
                 let source = field(0);
-                if !source.is_empty()
-                    && !source.starts_with(&working_dir)
-                    && !bind_mounts.iter().any(|item| item == source)
-                {
+                // 「在项目目录内」必须带上分隔符再比：只比前缀的话 /opt/app 会把同级的
+                // /opt/application/data 也算成项目内部，于是它既不进告警、也不进备份包
+                // （项目拷贝只走 $WORKING_DIR），数据就这么静默丢了。
+                // working_dir 为空时一律按「项目外」处理 —— 旧写法用空串比前缀会把所有挂载都判成内部。
+                let dir = working_dir.trim_end_matches('/');
+                let inside = !dir.is_empty() && (source == dir || source.starts_with(&format!("{dir}/")));
+                if !source.is_empty() && !inside && !bind_mounts.iter().any(|item| item == source) {
                     bind_mounts.push(source.to_string());
                 }
             }
@@ -510,8 +513,65 @@ pub(crate) fn pick_remote_root(home: &str, working_dir: &str) -> String {
     let project = working_dir.trim_end_matches('/');
     let candidate = format!("{home}/.deploycode/containers");
     // 项目目录就是 home（或其祖先）时，暂存目录会被自己复制进去，打包递归套娃。
-    if !project.is_empty() && candidate.starts_with(project) {
-        return "/var/tmp/deploycode-containers".to_string();
+    // 这里同样要带分隔符：只比前缀的话 /home/x.deploycode 这种同级目录会被误判成祖先。
+    let nested = !project.is_empty()
+        && (candidate == project || candidate.starts_with(&format!("{project}/")));
+    if nested {
+        return format!("/var/tmp/deploycode-containers");
     }
     candidate
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn probe(rows: &[&str]) -> ProbeResult {
+        parse_probe(&rows.join("\n"), &[])
+    }
+
+    /// 判定 bind mount 在不在项目目录里必须带分隔符：/opt/app 不能把 /opt/application/data 算进来，
+    /// 否则那份数据既不进告警也不进备份包（项目拷贝只走 $WORKING_DIR），静默丢数据。
+    #[test]
+    fn bind_mount_outside_project_is_reported_even_with_shared_prefix() {
+        let result = probe(&[
+            "P\t/opt/app",
+            "B\t/opt/app/data",
+            "B\t/opt/application/data",
+            "B\t/var/lib/pgsql",
+        ]);
+        assert_eq!(
+            result.bind_mounts,
+            vec!["/opt/application/data", "/var/lib/pgsql"]
+        );
+    }
+
+    #[test]
+    fn bind_mount_is_reported_when_working_dir_unknown() {
+        // 探测脚本没给出项目目录时，不能把所有挂载都判成「项目内部」而一声不吭。
+        let result = probe(&["B\t/opt/data"]);
+        assert_eq!(result.bind_mounts, vec!["/opt/data"]);
+    }
+
+    /// 只有项目目录真的包住了暂存目录（是它或它的祖先）才换地方；同级但共享前缀的不算。
+    #[test]
+    fn remote_root_only_moves_out_for_a_real_ancestor() {
+        assert_eq!(
+            pick_remote_root("/home/deploy", "/home/deploy"),
+            "/var/tmp/deploycode-containers"
+        );
+        assert_eq!(
+            pick_remote_root("/home/deploy", "/home"),
+            "/var/tmp/deploycode-containers"
+        );
+        // 旧写法用裸前缀会把 /home/deployer 判成 /home/deploy 的孩子，白跑一趟 /var/tmp。
+        assert_eq!(
+            pick_remote_root("/home/deploy", "/home/deployer"),
+            "/home/deploy/.deploycode/containers"
+        );
+        assert_eq!(
+            pick_remote_root("/home/deploy", "/home/deploy/blog"),
+            "/home/deploy/.deploycode/containers"
+        );
+    }
 }

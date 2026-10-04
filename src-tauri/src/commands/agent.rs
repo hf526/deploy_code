@@ -16,7 +16,9 @@
 use std::future::Future;
 use std::sync::Arc;
 
-use deploy_core::agent::{AgentBinaryInfo, AgentControl, AgentStatus, AgentSyncReport};
+use deploy_core::agent::{
+    AgentBinaryInfo, AgentControl, AgentStaleness, AgentStatus, AgentSyncReport,
+};
 use deploy_core::models::{BackupEvent, BackupRecord, ContainerEvent, ContainerRecord};
 use deploy_core::{CoreError, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -46,14 +48,24 @@ pub async fn install_agent(state: State<'_, AppState>, server_id: String) -> Res
     if key.is_empty() {
         return Err(CoreError::config("请选择一台服务器作为控制机"));
     }
-    let status = control_of(state.store.clone()).install(Some(&key)).await?;
+    // promote = 装新机 + 记成新控制机 + 收回原来那台。
     // 装成功才把它记成控制机：失败还留下一个 id，后面的「下发 / 回读」都会对着没装成的机器报错。
-    let store = state.store.clone();
-    store.mutate_config(|config| {
-        config.settings.agent_server_id = key.clone();
-        Ok(())
-    })?;
-    Ok(status)
+    control_of(state.store.clone()).promote(&key).await
+}
+
+/// 换控制机时没能收回的旧机器：只读本机状态，不连服务器、不占任务名额。
+#[tauri::command(async)]
+pub fn agent_orphans(state: State<AppState>) -> Vec<String> {
+    state.store.orphan_agent_servers()
+}
+
+/// 控制机上那份与本机设置是否已经不一致：只读本机的 agent-sync.json，不连服务器。
+///
+/// 界面那个「条数对得上就不提示」的口径看不见定时改动，也看不见某条配置已经改回本机，
+/// 而这两件事都会在夜里做出与界面上相反的动作，所以必须有一个能问的地方。
+#[tauri::command(async)]
+pub fn agent_staleness(state: State<AppState>) -> AgentStaleness {
+    deploy_core::agent::staleness(&state.store)
 }
 
 #[tauri::command]

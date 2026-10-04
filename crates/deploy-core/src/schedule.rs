@@ -67,11 +67,27 @@ pub fn shift_hhmm(value: &str, delta_minutes: i64) -> Option<String> {
     Some(format!("{:02}:{:02}", total / 60, total % 60))
 }
 
+/// 相邻两轮轮询之间允许的最大空档（秒）。
+///
+/// 调度循环正常是 20 秒一跳（排定关机后 1 秒一跳），留出十倍余量是把「一次卡顿」和
+/// 「睡了一觉」分开：超过它就只能认为进程当时没在跑。
+pub const CLOCK_JUMP_SECS: i64 = 90;
+
+/// 相邻两轮之间是否空转了太久 —— 只可能是进程睡了或者时钟被往前拨了。
+///
+/// [`has_crossed`] 只挡住「进程停启之间错过的点」，挡不住**进程活着但中间睡过去**的那种：
+/// 休眠时这一跳被拉长，唤醒后 `last_tick` 还停在睡前，设置的时间点就落在 `(last_tick, now]`
+/// 里，看起来像刚跨过。破坏性动作（定时关机）必须先过这道闸。
+pub fn clock_jumped(last_tick: DateTime<Local>, now: DateTime<Local>) -> bool {
+    now - last_tick > Duration::seconds(CLOCK_JUMP_SECS)
+}
+
 /// 本次轮询是否「首次跨过」`scheduled` 这个时刻。
 ///
 /// 三个条件缺一不可：只在本轮区间 `(last_tick, now]` 内跨过才算触发，因此进程停启之间
-/// 错过的时间点不补跑（唤醒电脑就被执行是不能接受的行为）；`last_run` 挡住时钟回拨
-/// 让同一个调度日二次触发。
+/// 错过的时间点不补跑；`last_run` 挡住时钟回拨让同一个调度日二次触发。
+/// 注意它不判断进程**活着但空转了一大段**（休眠唤醒、时钟前跳）的那种跨过，
+/// 需要「到点就得准时」的调用方要另外用 [`clock_jumped`] 排除。
 pub fn has_crossed(
     scheduled: DateTime<Local>,
     last_tick: DateTime<Local>,
@@ -191,6 +207,24 @@ mod tests {
             at(2026, 3, 9, 9, 0),
             None
         ));
+    }
+
+    /// 进程活着但中间睡过去了：`has_crossed` 会把它当成刚跨过，所以要靠 `clock_jumped` 认出来。
+    #[test]
+    fn clock_jump_is_read_from_the_gap_between_ticks() {
+        let last_tick = at(2026, 3, 9, 2, 0);
+        // 正常的一跳（20 秒）与阈值之内都不算跳变。
+        assert!(!clock_jumped(last_tick, last_tick + Duration::seconds(20)));
+        assert!(!clock_jumped(last_tick, last_tick + Duration::seconds(CLOCK_JUMP_SECS)));
+        // 合上盖子过夜：唤醒后这一跳跨了几个小时。
+        assert!(clock_jumped(last_tick, last_tick + Duration::hours(6)));
+        // 时钟回拨不算「跨过」，也不该被当成跳变（挡住它的是 last_run）。
+        assert!(!clock_jumped(last_tick, last_tick - Duration::hours(6)));
+        // 对照：那种跨过确实被 has_crossed 认成「刚跨过」—— 这就是要额外挡的原因。
+        let scheduled = at(2026, 3, 9, 3, 0);
+        let woke_up = last_tick + Duration::hours(6);
+        assert!(has_crossed(scheduled, last_tick, woke_up, None));
+        assert!(clock_jumped(last_tick, woke_up));
     }
 
     #[test]

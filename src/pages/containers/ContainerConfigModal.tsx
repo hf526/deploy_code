@@ -91,9 +91,16 @@ export function ContainerConfigModal({
   }, [targets, targetServerId]);
 
   /** 选中来源项目时顺手照抄它的项目目录：compose 项目与路径无关，同名换机即可跑。 */
+  // 只覆盖「空着」或「上一次自动填的那个」：换项目时留着上一项目的目录会把 B 项目恢复到 A 的路径下，
+  // 而直接无条件覆盖又会把编辑已有配置时存着的那个目录盖掉 —— 自动填过哪些值记在这里用来区分两者。
+  const autoDirsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const workingDir = stacks.find((stack) => stack.name === project)?.workingDir ?? "";
-    if (workingDir) setTargetDir((current) => (current.trim() ? current : workingDir));
+    if (!workingDir) return;
+    setTargetDir((current) =>
+      current.trim() === "" || autoDirsRef.current.has(current) ? workingDir : current,
+    );
+    autoDirsRef.current.add(workingDir);
   }, [stacks, project]);
 
   async function handleSave() {

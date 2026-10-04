@@ -129,6 +129,9 @@ export default function ContainersPage() {
     }
   }, [targets, targetServerId]);
 
+  // 用户手输过目标目录之后就不再自动覆盖；没动过则一直跟着当前项目走。
+  const dirTouchedRef = useRef(false);
+
   const loadDetail = useCallback(
     async (targetServer: string, targetProject: string) => {
       const seq = ++detailSeq.current;
@@ -138,7 +141,11 @@ export default function ContainersPage() {
         if (seq !== detailSeq.current) return;
         setDetail(result);
         // 目标目录默认照抄源机项目目录：compose 项目与路径无关，同名项目换机即可跑。
-        setTargetDir((current) => (current.trim() ? current : result.stack.workingDir));
+        // 必须每次跟着项目重填：只在为空时兜底的话，选完 A 项目再选 B 项目，提交的就是
+        // 「B 项目 + A 项目的目录」，而服务端照单全收（只校验是不是绝对路径），恢复会落错地方。
+        if (!dirTouchedRef.current) {
+          setTargetDir(result.stack.workingDir);
+        }
       } catch (error) {
         if (seq !== detailSeq.current) return;
         setDetail(null);
@@ -178,9 +185,11 @@ export default function ContainersPage() {
   useEffect(() => {
     stacksSeq.current += 1;
     detailSeq.current += 1;
+    dirTouchedRef.current = false;
     setStacks([]);
     setProject("");
     setDetail(null);
+    setTargetDir("");
     if (serverId) void loadStacks(serverId);
   }, [serverId, loadStacks]);
 
@@ -493,7 +502,10 @@ export default function ContainersPage() {
                     value={targetDir}
                     disabled={running}
                     placeholder="/opt/blog"
-                    onChange={(event) => setTargetDir(event.target.value)}
+                    onChange={(event) => {
+                      dirTouchedRef.current = true;
+                      setTargetDir(event.target.value);
+                    }}
                   />
                 </Field>
               </div>

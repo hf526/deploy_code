@@ -22,14 +22,33 @@ pub(super) async fn agent_command(cli: &Cli, command: &AgentCommand) -> Result<(
     match command {
         AgentCommand::Use { server } => {
             let id = lookup_server(&store, server)?.id;
+            // 与 GUI 那个下拉框（src-tauri commands/app.rs::save_settings）同一个口径：旧控制机读的
+            // 是它自己那份 config.json，不会自己停，而里面有全部源机的明文口令。换指向时把确实交接过
+            // 的那台记成待收回，否则它到点照跑、界面那一栏却是空的，「收回」按钮只指向新机。
+            let previous = store
+                .load_config()?
+                .settings
+                .agent_server_id
+                .trim()
+                .to_string();
+            let handed_off = store.load_agent_sync().is_for(&previous);
             store.mutate_config(|config| {
                 config.settings.agent_server_id = id.clone();
                 Ok(())
             })?;
+            if !previous.is_empty() && previous != id && handed_off {
+                store.remember_orphan_agent(&previous)?;
+            }
+            if !id.is_empty() {
+                store.forget_orphan_agent(&id)?;
+            }
             if cli.json {
                 return print_json(&id);
             }
             output::success(format!("已把 {server} 设为控制机"));
+            if !previous.is_empty() && previous != id && handed_off {
+                output::error("原来那台控制机还挂着 agent，请收回：`agent uninstall --server <旧机器>`");
+            }
             output::dim("下一步：`agent install` 上传并起服务，再 `agent sync` 下发配置");
             Ok(())
         }
@@ -42,15 +61,15 @@ pub(super) async fn agent_command(cli: &Cli, command: &AgentCommand) -> Result<(
             Ok(())
         }
         AgentCommand::Install { server } => {
-            let status = control.install(server.as_deref()).await?;
-            if let Some(key) = server.as_deref() {
-                let id = lookup_server(&store, key)?.id;
-                let store = store.clone();
-                store.mutate_config(|config| {
-                    config.settings.agent_server_id = id.clone();
-                    Ok(())
-                })?;
-            }
+            // 带 --server 就是「换成这台」：走 promote，装完顺手收回原来那台，
+            // 与 GUI 的 install_agent 同一条路径（旧机器上的 agent 不会自己停）。
+            let status = match server.as_deref() {
+                Some(key) => {
+                    let id = lookup_server(&store, key)?.id;
+                    control.promote(&id).await?
+                }
+                None => control.install(None).await?,
+            };
             if cli.json {
                 return print_json(&status);
             }

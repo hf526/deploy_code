@@ -49,7 +49,56 @@ describe("applyTaskEvent", () => {
       progressMessage: "",
       status: "running",
       record: null,
+      aborted: null,
     });
+  });
+
+  it("批量部署：下一台的 started 保留上一台的批次行", () => {
+    // 引擎在每台开始时先写「[批次 i/N] 开始部署到 X」再发 started，
+    // 上一台结束时带着记录 —— 这时候清行就会把批次行自己抹掉。
+    const { state, sink } = makeSink(
+      makeLive({
+        recordId: "r1",
+        status: "success",
+        record: makeRecord("r1", "success"),
+        lines: [
+          { level: "info", message: "[批次 1/3] 开始部署到 A" },
+          { level: "info", message: "[批次 2/3] 开始部署到 B" },
+        ],
+      }),
+    );
+    applyTaskEvent({ type: "started", recordId: "r2" }, sink);
+    expect(state.live?.lines.map((line) => line.message)).toEqual([
+      "[批次 1/3] 开始部署到 A",
+      "[批次 2/3] 开始部署到 B",
+    ]);
+    expect(state.live?.recordId).toBe("r2");
+    expect(state.live?.status).toBe("running");
+    expect(state.live?.record).toBeNull();
+  });
+
+  it("batchAborted 把界面从上一台的绿色成功改成失败", () => {
+    const { state, sink } = makeSink(
+      makeLive({
+        recordId: "r1",
+        status: "success",
+        record: makeRecord("r1", "success"),
+        lines: [{ level: "info", message: "[批次 1/2] 开始部署到 A" }],
+      }),
+    );
+    applyTaskEvent({ type: "batchAborted", succeeded: 1, total: 2, reason: "服务器已被删除" }, sink);
+    expect(state.live?.status).toBe("failed");
+    expect(state.live?.aborted).toEqual({ succeeded: 1, total: 2, reason: "服务器已被删除" });
+    // 已经跑过的那台记录留着：它确实是成功的，批次结论另说。
+    expect(state.live?.record).not.toBeNull();
+  });
+
+  it("无 live 时 batchAborted 也补建成失败状态（重载后事件先到）", () => {
+    const { state, sink } = makeSink(null, "r7");
+    applyTaskEvent({ type: "batchAborted", succeeded: 1, total: 3, reason: "准备失败" }, sink);
+    expect(state.live?.recordId).toBe("r7");
+    expect(state.live?.status).toBe("failed");
+    expect(state.live?.aborted).toEqual({ succeeded: 1, total: 3, reason: "准备失败" });
   });
 
   it("无 live 时 log 用记录列表里的运行 id 兜底补建", () => {
@@ -69,6 +118,7 @@ describe("applyTaskEvent", () => {
       progressMessage: "上传压缩包",
       status: "running",
       record: null,
+      aborted: null,
     });
   });
 
@@ -80,9 +130,11 @@ describe("applyTaskEvent", () => {
     expect(state.announced).toEqual([record]);
   });
 
-  it("started 清空上一轮日志与结果", () => {
+  it("started 清空上一轮日志与结果（store 发起新任务时不带记录）", () => {
+    // 界面上点「部署 / 重新部署」时 store 会把 live 重置成没有记录的形状，所以这一轮必须清空；
+    // 带着记录的那条路径是批量部署的下一台，见上面「保留批次行」的用例。
     const { state, sink } = makeSink(
-      makeLive({ recordId: "old", lines: [{ level: "info", message: "old" }], record: makeRecord("old") }),
+      makeLive({ recordId: "old", lines: [{ level: "info", message: "old" }], record: null }),
     );
     applyTaskEvent({ type: "started", recordId: "new" }, sink);
     expect(state.live).toEqual({
@@ -92,6 +144,7 @@ describe("applyTaskEvent", () => {
       progressMessage: "",
       status: "running",
       record: null,
+      aborted: null,
     });
   });
 

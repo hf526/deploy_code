@@ -340,7 +340,7 @@
     "guardWhitelistDuplicate": "This IP is already in the list",
     "guardWhitelistFull": "At most {{count}} entries, remove the ones you no longer use",
     "guardConnectedFrom": "This scan connected from:",
-    "guardSelfNotWhitelisted": "not in the list, add it first",
+    "guardSelfNotWhitelisted": "not in the list — enabling will be refused until you add it",
     "guardAddSelf": "Add to list",
     "guardSelfUnknown": "The source address of this connection is unknown (no SSH_CLIENT from the server), so the \"can't block yourself\" guard is off this time; fill the list by hand.",
     "blockedWhitelisted": "This allowlisted IP is still blocked, click unblock to restore it",
@@ -647,13 +647,23 @@
       "timeout": "Task timeout (seconds)",
       "bundleKeep": "Bundles Kept Per Project",
       "bundleKeepHint": "A nightly run drops another GB-scale bundle on this machine: each (server + compose project) keeps only this many, older ones are deleted after a successful run. 0 disables cleanup."
-    }
+    },
+    "orphanBundles": "Unclaimed backup bundles",
+    "orphanBundlesHint": "Bundles are pruned through their records. Once a record is trimmed by the history limit or deleted by hand, the bundle stays on disk with nothing pointing at it. The files below are those bundles — check you no longer need them before cleaning up.",
+    "orphanBundlesNone": "No unclaimed bundles",
+    "orphanKindContainer": "Container",
+    "orphanKindDatabase": "Database",
+    "orphanMore": "{{count}} more not listed",
+    "orphanTotal": "{{count}} bundles · {{size}}",
+    "orphanClean": "Clean these bundles",
+    "orphanCleaned": "Deleted {{count}} bundles, freed {{size}}"
   },
   "deploy": {
     "toast": {
       "running": "A deployment is already running. Please wait for it to finish.",
       "success": "{{name}} deployed successfully",
-      "failed": "{{name}} deployment failed: {{error}}"
+      "failed": "{{name}} deployment failed: {{error}}",
+      "batchAborted": "Batch deployment stopped: {{succeeded}}/{{total}} succeeded, rest skipped"
     },
     "subtitle": "Save deploy configs and run them with one click (server or Cloudflare / GitHub Pages)",
     "repo": "Repository",
@@ -741,7 +751,8 @@
     "noRecords": "No deployment records yet",
     "noRecordsDescription": "Click Deploy on a config to see the result here.",
     "noPagesRecords": "No Pages deployment records yet",
-    "noPagesRecordsDescription": "Deploy a Pages config to see results and URLs here."
+    "noPagesRecordsDescription": "Deploy a Pages config to see results and URLs here.",
+    "batchAborted": "Batch stopped: {{succeeded}}/{{total}} servers succeeded, the rest were not deployed"
   },
   "backup": {
     "toast": {
@@ -783,11 +794,11 @@
     "passwordPlaceholder": "Database password",
     "useTarget": "Target",
     "useTargetHint": "Add Supabase / Aiven / Neon targets in Settings",
-    "globalDefault": "Global default",
+    "unboundTarget": "Unbound (this config needs its own target)",
     "overrideUrl": "Custom connection string",
     "overrideUrlHint": "Optional, highest priority",
     "writingTo": "Writing to:",
-    "noTarget": "No backup target configured. Add one in Settings, or fill in a custom connection string above.",
+    "ownTargetRequired": "This config has no backup target of its own; running it after saving will be refused instead of falling back to the server binding or the global default.",
     "liveLog": "Live Log",
     "liveLogRunning": "Backup in progress; do not close the app",
     "liveLogIdle": "Live output of the latest backup",
@@ -812,7 +823,6 @@
     "databaseRequired": "Enter the database name first",
     "cleared": "Backup records cleared",
     "customUrl": "Custom connection string",
-    "serverCustomUrl": "Server custom connection string",
     "schedule": {
       "title": "Scheduled Backup",
       "description": "While the app is running (including minimized to the tray), run one backup daily at the selected time",
@@ -1087,6 +1097,7 @@
     "metricBundles": "Bundles kept",
     "metricBundlesHint": "Bundles live only on the control machine and rotate by their keep counts.",
     "diskLowWarning": "Free space is below the floor, so the control machine refuses new backup jobs. Clean the bundle directory or lower the keep count.",
+    "serviceDownWarning": "The resident deploy-agent service on the control machine is not running under systemd (inactive / failed): the config still reads back, but nothing will fire on schedule. Run systemctl status deploy-agent and journalctl -u deploy-agent there, then systemctl start deploy-agent.",
     "scheduleBackup": "Scheduled database backup",
     "scheduleContainer": "Scheduled container backup",
     "scheduleOff": "Not enabled",
@@ -1099,6 +1110,11 @@
     "queueCount": "Queue of {{count}}",
     "ownedTitle": "Configs handed to the control machine",
     "ownedHint": "The control machine runs these schedules. Press Push config after editing, or its copy stays on the old version.",
+    "staleNotice": "Schedule changes were not pushed: {{detail}}. The control machine still runs the previous copy.",
+    "strandedNotice": "The control machine still holds configs this machine no longer hands over: {{detail}}. Both will run tonight; press Push config to revoke them.",
+    "staleScheduleBackup": "Scheduled backup changes have not been pushed, so the control machine still has the previous copy (toggle, time and selected config all count).",
+    "staleScheduleContainer": "Scheduled container backup changes have not been pushed, so the control machine still has the previous copy (toggle, time and checked configs all count).",
+    "stragglerList": "The control machine still holds: {{names}}. On this machine they are back to local or deleted; without another push it keeps running them every night.",
     "ownedBackup": "Database backups",
     "ownedContainer": "Container backups",
     "goBackups": "Edit backup configs",
@@ -1122,6 +1138,11 @@
     "logsLoad": "Load logs",
     "loading": "Loading…",
     "dangerTitle": "Removal",
-    "dangerHint": "Removing the agent only stops the service and deletes the binary; bundles and records stay on the control machine."
+    "dangerHint": "Removing the agent only stops the service and deletes the binary; bundles and records stay on the control machine.",
+    "binaryUnusable": "Unusable",
+    "orphanTitle": "Old control machines to reclaim",
+    "orphanHint": "These machines had the agent installed and were handed work, but switching control machines failed to reclaim them. They still run their schedule from their own copy, which keeps every server's plaintext credentials. Reclaim them one by one.",
+    "reclaim": "Reclaim",
+    "reclaimDone": "Agent reclaimed on the old control machine"
   }
 }

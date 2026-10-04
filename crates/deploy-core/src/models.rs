@@ -691,6 +691,15 @@ pub enum DeployEvent {
     Progress { percent: u8, message: String },
     /// 部署结束（成功或失败）。
     Finished { record: DeployRecord },
+    /// 批量部署被中止：某台连准备都没过（服务器被删等），剩下的机器不再部署。
+    ///
+    /// 单独一个事件是因为这台没有记录 —— 上一条 `Finished` 已经把界面定成「成功」，
+    /// 只看日志行的话，绿色成功卡片和「其实有机器没发出去」这件事会同时留在界面上。
+    BatchAborted {
+        succeeded: usize,
+        total: usize,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1367,6 +1376,8 @@ impl ExportData {
             backup.supabase_url = None;
             // 执行位是「这台机器把这活儿交给了那台机器」的本机接线，跟着导出过去就是死局：
             // 新机没有 agent-sync.json，定时循环天天报「未下发」而本机又撒手，一次都不备份。
+            // 同一台机器重新导入自己时，导入侧会把本机的执行位换回来（`store::keep_remote_location`），
+            // 这里抹的只给新机看。
             backup.run_location = RunLocation::Local;
         }
 
@@ -1380,6 +1391,10 @@ impl ExportData {
         settings.cloudflare_account_id = String::new();
         settings.github_token = String::new();
         settings.cronjob_api_key = String::new();
+        // 旧版全局备份连接串也是凭据：它就是 postgres://user:密码@host/db，留着等于
+        // 导出一条能直接连库的串。它同样参与备份目标的兜底解析（backup.rs 的 resolve_target），
+        // 所以漏掉它不只是泄漏，还会把外机那份旧库地址顶到本机可用值上面。
+        settings.supabase_url = String::new();
         // 主密码哈希等价于主密码的可离线破解替身，导出的配置用不上它。
         settings.master_password_hash = None;
         // 控制机指向同属本机接线：换台机器就得重新指定，留着只会指向一台不存在 agent 的服务器。
@@ -1689,6 +1704,7 @@ mod tests {
         config.settings.cloudflare_api_token = marker.to_string();
         config.settings.github_token = marker.to_string();
         config.settings.cronjob_api_key = marker.to_string();
+        config.settings.supabase_url = format!("postgres://u:{marker}@h/db");
         config.settings.master_password_hash = Some(marker.to_string());
 
         let mut repo = RepoConfig::new("app".to_string(), "/srv/app".to_string());

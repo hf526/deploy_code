@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
 use deploy_core::models::{
-    BackupConfig, BackupTarget, DeployEvent, DeployRecord, DeployRequest, ServerConfig, SshAuth,
+    BackupConfig, BackupTarget, DeployEvent, DeployRecord, DeployRequest, LogLevel, ServerConfig,
+    SshAuth,
 };
 use deploy_core::{
     backup::mask_database_url, format_duration, human_size, CoreError, DeployEngine, Result, Store,
@@ -124,6 +125,15 @@ fn spawn_deploy_printer(
             match event {
                 DeployEvent::Log { level, message } => output::deploy_log(level, &message),
                 DeployEvent::Progress { message, .. } => output::progress(&message),
+                // 批次中止那台没有自己的记录，不打印就等于「看起来全成功」。
+                DeployEvent::BatchAborted {
+                    succeeded,
+                    total,
+                    reason,
+                } => output::deploy_log(
+                    LogLevel::Error,
+                    &format!("已停止：{succeeded}/{total} 台成功，剩余机器未部署（{reason}）"),
+                ),
                 _ => {}
             }
         }
@@ -158,6 +168,13 @@ async fn run_deploy_batch(
     // 只返回空列表会让脚本调用方误读成成功（退出码 0），错误必须原样带回。
     if let Some(err) = batch.blocked {
         return Err(err);
+    }
+    // 跑起来过又被后面某台的准备失败掐断：第一台的记录是 success，只看记录就会 0 退出，
+    // 而 GUI 那边同一批是红色失败。批次没发完就得是非零退出。
+    if let Some(reason) = batch.aborted {
+        return Err(CoreError::deploy(format!(
+            "批量部署未全部发出：{reason}"
+        )));
     }
     Ok(batch.records)
 }

@@ -21,13 +21,16 @@ use discover::{
     parse_probe, probe_script_command, remote_home, remote_root, DiscoveredProject,
     INSPECT_TIMEOUT_SECS, QUERY_TIMEOUT_SECS,
 };
-use scripts::{build_manifest, build_restore_script, build_snapshot_script, target_dir_or};
+use scripts::{
+    build_manifest, build_restore_script, build_snapshot_script, is_compose_v2, target_dir_or,
+};
 
 pub use discover::{ComposeService, ComposeStack, ComposeStackDetail, ComposeVolume};
 pub use scripts::{BundleManifest, BundleVolume, read_bundle_manifest};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -47,6 +50,15 @@ use crate::util::{format_duration, human_size};
 
 /// 容器任务事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
 pub type ContainerEventSender = UnboundedSender<ContainerEvent>;
+
+/// 一次远端清理的时间上限：建链（本机默认给 15s）+ 两次 kill_script（各带一次 `sleep 1`）
+/// + 一次按标签的 `docker start`，实测要 6–8 秒。原来外面套的 5 秒会把整条 future 半路 drop，
+/// 于是连「这里停过东西」都没写进记录 —— 站点停着而界面一声不吭。
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
+const RESUME_OK_NOTE: &str = "已替本次任务把来源服务重新拉起\n";
+const RESUME_FAILED_NOTE: &str = "来源服务未能自动拉起，请到该服务器执行 compose up -d\n";
+const RESUME_TIMEOUT_NOTE: &str =
+    "远端清理超时，未能确认来源服务是否已拉起；若这次勾了「暂停源服务」，请到该服务器执行 compose up -d\n";
 
 /// 已解析并登记好的容器任务。
 pub struct ContainerPlan {
@@ -377,8 +389,7 @@ impl ContainerEngine {
         // started_at 是 "%Y-%m-%d %H:%M:%S"，字典序就是时间序；本次任务自己不在候选里，
         // 所以窗口按 keep - 1 算，新下来的这个包永远不会被自己挤掉。
         stale.sort_by(|a, b| records[*b].started_at.cmp(&records[*a].started_at));
-        let mut removed = Vec::new();
-        let mut touched: Vec<ContainerRecord> = Vec::new();
+        let mut touched: Vec<(ContainerRecord, PathBuf, String, u64)> = Vec::new();
         for index in stale.into_iter().skip(keep - 1) {
             let path = PathBuf::from(&records[index].bundle_path);
             if path.parent().map(|parent| parent != bundle_dir).unwrap_or(true) {
@@ -388,20 +399,30 @@ impl ContainerEngine {
                 .file_name()
                 .map(|name| name.to_string_lossy().into_owned())
                 .unwrap_or_default();
-            if path.is_file() {
-                // 删不掉（被别的进程占着）就原样留着这条，下次任务收尾时再试一次。
-                if std::fs::remove_file(&path).is_err() {
-                    continue;
-                }
-                removed.push((name, records[index].bundle_size));
-            }
-            // 走到这里：要么刚删掉，要么文件早就不在了。两种情况这条路径都指不到东西了，
-            // 抹空它，界面的「恢复」入口会跟着收起。
+            let size = records[index].bundle_size;
             records[index].bundle_path = String::new();
-            touched.push(records[index].clone());
+            touched.push((records[index].clone(), path, name, size));
         }
-        for item in touched {
-            self.store.upsert_container(&item, limit)?;
+        if touched.is_empty() {
+            return Ok(Vec::new());
+        }
+        // 先把记录里的路径抹空，再删文件。反过来做的话，删完文件到写回记录之间崩了，盘上就留下一条
+        // 指向不存在文件的 bundle_path —— 而界面「恢复到目标服务器」判的正是它，用户点了才报错。
+        // 现在这个顺序最坏只是文件晚一步删除：它变成孤儿包，界面上的孤儿统计能看见它。
+        for (record, _, _, _) in &touched {
+            self.store.upsert_container(record, limit)?;
+        }
+        let mut removed = Vec::new();
+        for (_, path, name, size) in touched {
+            if !path.is_file() {
+                continue;
+            }
+            // 删不掉（被别的进程占着）就留下这个文件：记录里的路径已经抹空，轮转不会再回头看它，
+            // 但它会出现在设置页的「未认领的备份包」里，由用户手动清。
+            if std::fs::remove_file(&path).is_err() {
+                continue;
+            }
+            removed.push((name, size));
         }
         Ok(removed)
     }
@@ -654,10 +675,67 @@ impl ContainerEngine {
             .await;
         // 半截的 .part 由 cleanup 在 Drop 里收掉：Err、被取消（future 被 drop）、panic 三种下场都盖到。
         if let Err(err) = outcome {
+            // 失败那次要是把源服务停过，不能就这么让它停着走人。
+            if plan.pause_source {
+                Self::resume_paused_source(
+                    client,
+                    compose,
+                    &manifest,
+                    &format!("{root}/{record_id}.pause"),
+                    logger,
+                )
+                .await;
+            }
             return Err(err);
         }
         let size = std::fs::metadata(&plan.bundle).map(|m| m.len()).unwrap_or(0);
         Ok((manifest, size))
+    }
+
+    /// 备份没成功时尽力把被这次任务停掉的源项目重新拉起来。
+    ///
+    /// 脚本自己的 trap 盖住了「脚本报错退出」和「收到 TERM」两种下场，剩下两种只能在这里补：
+    /// 取消时紧随其后的那道 SIGKILL（trap 来不及跑），以及 SSH 断开后我们根本没执行过任何清理。
+    /// `compose start` 幂等，trap 那一道已经起来过也不会被这一道弄坏。
+    /// 拉起来了就把「欠一次恢复」的凭据销掉，起不来就留着 —— 那份文件是唯一能让后续清理
+    /// （[`ContainerEngine::cleanup_remote`]）知道「这里还停着东西」的东西。
+    async fn resume_paused_source(
+        client: &SshClient,
+        compose: &[String],
+        manifest: &BundleManifest,
+        pause_mark: &str,
+        logger: &mut TaskLogger<ContainerEvent>,
+    ) {
+        let binary = if is_compose_v2(compose) {
+            "docker compose"
+        } else {
+            "docker-compose"
+        };
+        let dir = manifest.working_dir.trim_end_matches('/');
+        let files: String = manifest
+            .config_files
+            .iter()
+            .map(|file| format!(" -f {}", shell_quote(&format!("{dir}/{file}"))))
+            .collect();
+        let command = format!(
+            "cd {} && {binary} -p {}{files} start 2>&1; code=$?; \
+             echo \"DEPLOYCODE_RESUME_EXIT:$code\"; \
+             if [ \"$code\" = \"0\" ]; then rm -f {}; fi",
+            shell_quote(&manifest.working_dir),
+            shell_quote(&manifest.project),
+            shell_quote(pause_mark),
+        );
+        match client.exec_capture(&command, 120).await {
+            Ok((_, text)) if text.contains("DEPLOYCODE_RESUME_EXIT:0") => {
+                logger.warn("备份未成功，来源服务已重新拉起");
+            }
+            Ok((_, _)) => {
+                logger.warn("来源服务未能自动恢复，请到该服务器执行 compose up -d");
+            }
+            Err(_) => {
+                logger.warn("来源服务未能自动恢复（这一次没能连上来源服务器），请到该服务器执行 compose up -d");
+            }
+        }
     }
 
     /// 上传备份包到目标机并执行恢复脚本。
@@ -762,7 +840,30 @@ impl ContainerEngine {
     }
 
     /// 应用退出 / 取消时清理某台服务器上本记录留下的远端文件。
+    ///
+    /// 顺手把「欠一次恢复」的那次快照收掉：脚本自己的 trap 现在接了 HUP，但 bash 要等当前
+    /// 那条前台命令（可能是一整份 tar）结束才处理信号，而任务被 abort 时紧随其后的
+    /// `kill_script` 从 TERM 到 SIGKILL 只留一秒，`compose start` 撑不完。站点就这么停着，
+    /// 而这是备份替用户按下去的停止键。
+    ///
+    /// 这一步自己带时间上限（[`CLEANUP_TIMEOUT`]）：调用方的预算比它小就会把整条 future 半路
+    /// drop 掉，那样连「这里停过东西」都没人写下过，界面上零提示。
     pub async fn cleanup_remote(&self, server: &ServerConfig, record_id: &str) -> Result<()> {
+        match tokio::time::timeout(CLEANUP_TIMEOUT, self.cleanup_remote_inner(server, record_id))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                self.note_source_resume(record_id, RESUME_TIMEOUT_NOTE);
+                Err(CoreError::ssh(format!(
+                    "容器远端清理超时（{} 秒），来源服务是否已恢复未能确认",
+                    CLEANUP_TIMEOUT.as_secs()
+                )))
+            }
+        }
+    }
+
+    async fn cleanup_remote_inner(&self, server: &ServerConfig, record_id: &str) -> Result<()> {
         let settings = self.store.load_config()?.settings;
         let client = SshClient::connect(server, settings.connect_timeout_secs).await?;
         let result = async {
@@ -775,20 +876,37 @@ impl ContainerEngine {
             .into_iter()
             .flatten()
             .collect();
+            let mut resumed = false;
+            let mut resume_failed = false;
             for root in roots {
                 let id_dir = format!("{root}/{record_id}");
-                client
+                let mark = format!("{root}/{record_id}.pause");
+                let (_, text) = client
                     .exec_capture(
                         &format!(
-                            "{}; {} ; rm -rf {} {}",
+                            "{}; {}; {}; rm -rf {} {}",
                             kill_script(&format!("{id_dir}/snapshot.pid")),
                             kill_script(&format!("{id_dir}/restore.pid")),
+                            resume_pause_mark(&mark),
                             shell_quote(&id_dir),
                             shell_quote(&format!("{root}/{record_id}.tar"))
                         ),
                         30,
                     )
                     .await?;
+                resumed |= text.contains("DEPLOYCODE_PAUSE_RESUMED");
+                resume_failed |= text.contains("DEPLOYCODE_PAUSE_RESUME_FAILED");
+            }
+            // 起没起来都要说出来：这条记录是取消之后用户唯一还能看到的地方。
+            if resumed || resume_failed {
+                self.note_source_resume(
+                    record_id,
+                    if resumed {
+                        RESUME_OK_NOTE
+                    } else {
+                        RESUME_FAILED_NOTE
+                    },
+                );
             }
             Ok::<(), CoreError>(())
         }
@@ -796,11 +914,51 @@ impl ContainerEngine {
         client.disconnect().await;
         result
     }
+
+    /// 把清理时拉起源服务的结果补进那条记录。
+    fn note_source_resume(&self, record_id: &str, line: &str) {
+        let Ok(mut record) = self.store.find_container_record(record_id) else {
+            return;
+        };
+        // 已经不是「进行中」的说明这一轮早就收敛过了，不必再改它的日志。
+        if record.status != DeployStatus::Running {
+            return;
+        }
+        record.log.push_str(line);
+        let limit = self
+            .store
+            .load_config()
+            .map(|config| config.settings.container_history_limit)
+            .unwrap_or(200);
+        let _ = self.store.upsert_container(&record, limit);
+    }
 }
 
 // ---------------------------------------------------------------------------
 // 远端执行
 // ---------------------------------------------------------------------------
+
+/// 按快照脚本留下的「欠一次恢复」凭据把源服务拉起来，并把凭据销掉；没有凭据时一声不吭。
+///
+/// 用 `docker start` 而不是 `compose start`：走到这条路上时手上只有记录 id 和文件里那个项目名，
+/// 没有项目目录与 compose 文件（那一次扫描随任务一起被 abort 了），而重新扫一次要在本就只有
+/// 十几秒的取消时间预算里多花一个来回。`compose stop` 停的正是这批带
+/// `com.docker.compose.project` 标签的容器，按同一个标签起回来就是同一批。
+/// 结果靠两行标记回传，由 [`ContainerEngine::note_source_resume`] 落到记录里。
+fn resume_pause_mark(mark: &str) -> String {
+    let file = shell_quote(mark);
+    format!(
+        "( if [ -f {file} ]; then \
+           p=$(head -n 1 {file} 2>/dev/null); rm -f {file}; ok=0; \
+           if [ -n \"$p\" ] && command -v docker >/dev/null 2>&1; then \
+             ids=$(docker ps -aq --filter \"label=com.docker.compose.project=$p\" 2>/dev/null); \
+             if [ -n \"$ids\" ] && docker start $ids >/dev/null 2>&1; then ok=1; fi; \
+           fi; \
+           if [ \"$ok\" = \"1\" ]; then echo DEPLOYCODE_PAUSE_RESUMED; \
+           else echo DEPLOYCODE_PAUSE_RESUME_FAILED; fi; \
+         fi )"
+    )
+}
 
 /// 上传脚本：base64 落盘（避开 here-doc 与引号的所有转义差异），再 0700。
 pub(crate) async fn put_script(client: &SshClient, remote: &str, script: &str) -> Result<()> {
@@ -1306,6 +1464,25 @@ mod tests {
         assert!(script.contains("PROJECT='b'\\''log'"), "项目名未被引用: {script}");
         // shell_quote 只在需要时加引号：纯安全字符按字面量写出即可。
         assert!(script.contains("PAUSE=1"));
+        // 暂停之后无论失败、收到 TERM、还是随本地会话断开收到 HUP，都要由 trap 补一次 start ——
+        // 一次失败的备份不能把站点一直停着（界面那句「卷导出完成后立即恢复」靠这几行才成立）。
+        assert!(script.contains("PAUSED=1"));
+        assert!(script.contains("trap 'cleanup; exit 1' INT TERM HUP"));
+        assert!(script.contains("if compose -p \"$PROJECT\" \"${CF[@]}\" start"));
+        // 「欠一次恢复」的凭据要在按下停止键*之前*落到盘上，而且要放在 $RUN 之外：
+        // 取消、SIGKILL、SSH 断开这三种下场 trap 都跑不到，而失败路径的 cleanup 会整目录删掉 $RUN。
+        let mark_write = script
+            .find("printf '%s\\n' \"$PROJECT\" > \"$PAUSE_MARK\"")
+            .expect("没有写「欠一次恢复」的凭据");
+        let stop_at = script.find("stop --timeout 30").expect("没有停服务那一步");
+        assert!(
+            mark_write < stop_at,
+            "凭据写在 stop 之后：从 stop 到这行之间被杀掉就没人知道这里停过东西"
+        );
+        assert!(script.contains("PAUSE_MARK=\"$ROOT/$ID.pause\""));
+        // 起来了才销账：trap 里那一次与 stage 5 各一次，两处都在 start 之后。
+        assert_eq!(script.matches("rm -f \"$PAUSE_MARK\"").count(), 2);
+        assert!(script.rfind("rm -f \"$PAUSE_MARK\"").unwrap() > stop_at);
         assert!(script.contains("ROOT=/root/.deploycode/containers"));
         assert!(script.contains("NEED_MB="));
         // 卷列表一行一项，制表符分隔名字与兜底镜像。
@@ -1314,6 +1491,26 @@ mod tests {
         assert!(script.contains("printf %s '{\"version\":1"));
         // 归档目标在工作目录之外，不会把 tar 自身打进去。
         assert!(script.contains("tar -cf \"$OUT\" -C \"$STAGE\" manifest.json project volumes images"));
+    }
+
+    /// 清理时补的那次拉起：没有凭据必须一声不吭，有凭据要把结果回传，并且两边都把凭据销掉
+    /// （否则下一次清理同一条记录又会再拉一遍）。
+    #[test]
+    fn resume_fragment_only_fires_on_the_pause_marker() {
+        let fragment = resume_pause_mark("/root/.deploycode/containers/abcd1234.pause");
+        assert!(
+            fragment.contains("/root/.deploycode/containers/abcd1234.pause"),
+            "{fragment}"
+        );
+        assert!(fragment.contains("label=com.docker.compose.project=$p"), "{fragment}");
+        assert!(fragment.contains("docker start $ids"));
+        assert!(fragment.contains("DEPLOYCODE_PAUSE_RESUMED"));
+        assert!(fragment.contains("DEPLOYCODE_PAUSE_RESUME_FAILED"));
+        // 只在文件在场时才动手：`[ -f ... ]` 是这段的唯一入口。
+        assert!(fragment.starts_with("( if [ -f "));
+
+        // 整段包在子 shell 里：它跟在 kill_script 之后，不能因为这里判false 就把后面的 rm 带走。
+        assert!(fragment.ends_with("fi )"), "{fragment}");
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use deploy_core::models::{new_id, BackupConfig, BackupEvent, BackupRecord, BackupRequest, BackupTarget};
-use deploy_core::{BackupEngine, CoreError, PreparedBackup, Result, Store};
+use deploy_core::{BackupEngine, CoreError, OrphanBundle, PreparedBackup, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use crate::state::{ActiveBackup, AppState, BackupTaskGuard, ClaimGuard, ClaimKind};
@@ -148,11 +148,11 @@ pub fn save_backup_config(
         let server = Store::find_server(app, &config.server_id)?.clone();
         config.server_id = server.id.clone();
 
-        // 悬空的目标 id 一律按未绑定处理，避免执行时找不到目标。
-        if let Some(target_id) = config.target_id.clone() {
-            if !app.backup_targets.iter().any(|item| item.id == target_id) {
-                config.target_id = None;
-            }
+        // 目标 id 必须解析得到真实存在的目标，解析不到就拒绝保存。
+        // 按「未绑定」清空看着省事，实际是把这条配置交给备份执行时的兜底链路 ——
+        // 那一晚它会打到服务器绑定或全局旧连接串的另一个库上，而脚本对新库做的是 DROP SCHEMA CASCADE。
+        if let Some(raw) = config.target_id.clone().filter(|raw| !raw.trim().is_empty()) {
+            config.target_id = Some(Store::resolve_backup_target_id(app, &raw)?);
         }
         if config
             .supabase_url
@@ -218,60 +218,34 @@ pub fn save_backup_targets(
     state: State<AppState>,
     targets: Vec<BackupTarget>,
 ) -> Result<Vec<BackupTarget>> {
-    let mut normalized = Vec::with_capacity(targets.len());
-    for mut target in targets {
-        target.name = target.name.trim().to_string();
-        target.url = target.url.trim().to_string();
-        if target.name.is_empty() {
-            return Err(CoreError::config("备份目标名称不能为空"));
-        }
-        if !target.url.starts_with("postgres://") && !target.url.starts_with("postgresql://") {
-            return Err(CoreError::config(format!(
-                "备份目标「{}」的连接串必须以 postgres:// 或 postgresql:// 开头",
-                target.name
-            )));
-        }
-        if target.id.trim().is_empty() {
-            target.id = deploy_core::models::new_id();
-        }
-        normalized.push(target);
-    }
+    // 规范化、重名校验、以及「仍被引用的目标不许删」都在 deploy-core：
+    // 界面的整表回写和 CLI 的 `backup target remove` 必须走同一条，否则删法比界面宽松。
+    state.store.replace_backup_targets(&targets)
+}
 
-    let mut names: Vec<&str> = normalized.iter().map(|target| target.name.as_str()).collect();
-    names.sort_unstable();
-    if names.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(CoreError::config("备份目标名称不能重复"));
-    }
+/// 一次本地备份包清理的结果（TS 侧镜像见 `src/lib/types.ts` 的 `OrphanCleanup`）。
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrphanCleanup {
+    pub deleted: usize,
+    pub freed_bytes: u64,
+}
 
-    let mut ids: Vec<&str> = normalized.iter().map(|target| target.id.as_str()).collect();
-    ids.sort_unstable();
-    if ids.windows(2).any(|pair| pair[0] == pair[1]) {
-        return Err(CoreError::config("备份目标 ID 不能重复"));
-    }
+/// 备份包目录里没有记录指向的那些包（记录被裁剪或被手动删掉之后留下的）。只读盘，不连服务器。
+#[tauri::command(async)]
+pub fn list_orphan_bundles(state: State<AppState>) -> Result<Vec<OrphanBundle>> {
+    state.store.orphan_bundles()
+}
 
-    state.store.mutate_config(|config| {
-        // 清理指向已删除目标的默认设置，避免解析时找不到目标。
-        if let Some(default_id) = config.settings.default_backup_target_id.clone() {
-            if !normalized.iter().any(|target| target.id == default_id) {
-                config.settings.default_backup_target_id = None;
-            }
-        }
-        for server in config.servers.iter_mut() {
-            if let Some(target_id) = server.backup_target_id.clone() {
-                if !normalized.iter().any(|target| target.id == target_id) {
-                    server.backup_target_id = None;
-                }
-            }
-        }
-        for saved in config.backup_configs.iter_mut() {
-            if let Some(target_id) = saved.target_id.clone() {
-                if !normalized.iter().any(|target| target.id == target_id) {
-                    saved.target_id = None;
-                }
-            }
-        }
-        config.backup_targets = normalized.clone();
-        Ok(())
-    })?;
-    Ok(normalized)
+/// 清掉指定的孤儿包。备份或容器任务在跑时返回 busy：那次的包还没写进记录，会被当成孤儿。
+#[tauri::command(async)]
+pub fn delete_orphan_bundles(
+    state: State<AppState>,
+    paths: Vec<String>,
+) -> Result<OrphanCleanup> {
+    let (deleted, freed_bytes) = state.store.delete_orphan_bundles(&paths)?;
+    Ok(OrphanCleanup {
+        deleted,
+        freed_bytes,
+    })
 }

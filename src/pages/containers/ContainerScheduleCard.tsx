@@ -4,8 +4,10 @@ import { CalendarClock } from "lucide-react";
 
 import { Card, Checkbox, Field, Input, SectionTitle } from "../../components/ui";
 import { api } from "../../lib/api";
+import { stalenessHints } from "../../lib/agent";
 import { useApp } from "../../lib/store";
 import type { Settings } from "../../lib/types";
+import { useAgentStaleness } from "../../lib/useAgentStaleness";
 
 /**
  * 容器定时备份：一个时间点 + 勾选若干配置，到点按勾选顺序排队，一次只跑一个。
@@ -15,6 +17,8 @@ import type { Settings } from "../../lib/types";
 export function ContainerScheduleCard() {
   const { t } = useTranslation();
   const settings = useApp((state) => state.settings);
+  // 与数据库备份那一栏同一个口径：勾选/时间改了没下发，控制机那晚跑的还是旧的一份。
+  const staleness = useAgentStaleness(settings);
   const configs = useApp((state) => state.containerConfigs);
   const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
@@ -123,6 +127,17 @@ export function ContainerScheduleCard() {
               })
             : t("containers.schedule.disabled")}
         </p>
+
+        {stalenessHints(staleness).containerSchedule && (
+          <p className="text-[11px] leading-relaxed text-neg">
+            {t("agent.staleScheduleContainer")}
+          </p>
+        )}
+        {stalenessHints(staleness).stragglers && (
+          <p className="text-[11px] leading-relaxed text-neg">
+            {t("agent.stragglerList", { names: stalenessHints(staleness).stragglers })}
+          </p>
+        )}
       </Card>
     </section>
   );

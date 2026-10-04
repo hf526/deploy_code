@@ -22,8 +22,9 @@ import {
   inputClass,
 } from "../components/ui";
 import { api } from "../lib/api";
-import { diskLevel, splitByLocation, syncNeeded } from "../lib/agent";
+import { diskLevel, splitByLocation, stalenessHints, syncNeeded } from "../lib/agent";
 import { useApp } from "../lib/store";
+import { useAgentStaleness } from "../lib/useAgentStaleness";
 import type { AgentBinaryInfo, AgentStatus, AgentSyncReport } from "../lib/types";
 import { cn, formatDuration, humanSize } from "../lib/utils";
 
@@ -47,7 +48,7 @@ export default function AgentPage() {
   // 本机这份 agent 二进制的来源：装不装得成取决于它，所以进页面就查一次，只读展示。
   const [binary, setBinary] = useState<AgentBinaryInfo | null>(null);
   const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState<"install" | "sync" | "uninstall" | null>(null);
+  const [busy, setBusy] = useState<"install" | "sync" | "uninstall" | "reclaim" | null>(null);
   const [report, setReport] = useState<AgentSyncReport | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
@@ -57,6 +58,21 @@ export default function AgentPage() {
     { kind: RecordKind; items: Array<AgentRecordRow> } | null
   >(null);
   const [recordsLoading, setRecordsLoading] = useState(false);
+  // 换控制机时没能收回的旧机器：它还在自行执行定时，盘上也还挂着全部源机的明文口令，
+  // 这条待办要一直显出来直到用户把它办掉（只读本机那份记录，不连服务器）。
+  const [orphans, setOrphans] = useState<string[]>([]);
+  const loadOrphans = useCallback(async () => {
+    try {
+      setOrphans(await api.agentOrphans());
+    } catch {
+      setOrphans([]);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadOrphans();
+  }, [loadOrphans]);
+
   // 页面切换 / StrictMode 双挂载都会带来迟到的响应，用它把过期的丢弃。
   const seq = useRef(0);
 
@@ -115,8 +131,12 @@ export default function AgentPage() {
       void reload(true);
     } catch (error) {
       toast("error", String(error));
+      // 「新机装好了、旧机没收回」也走这条：指向已经改了，界面不能还停在换机前。
+      setSettings(await api.getSettings().catch(() => settings));
+      void reload(true);
     } finally {
       setBusy(null);
+      void loadOrphans();
     }
   }
 
@@ -151,6 +171,8 @@ export default function AgentPage() {
     } finally {
       setBusy(null);
       setRemoving(false);
+      // 收回成功时后端会撤掉这台的待办，这一栏要跟着少一条。
+      void loadOrphans();
     }
   }
 
@@ -197,30 +219,78 @@ export default function AgentPage() {
   }
 
   async function handlePickServer(value: string) {
-    const saved = await api.saveSettings({ ...settings, agentServerId: value });
-    setSettings(saved);
-    setStatus(null);
-    setReport(null);
+    try {
+      const saved = await api.saveSettings({ ...settings, agentServerId: value });
+      setSettings(saved);
+      setStatus(null);
+      setReport(null);
+    } catch (error) {
+      // 没存上就是没换：不提示的话界面看着选中了，而下一次下发/回读仍对着另一台机器。
+      toast("error", String(error));
+    }
+    // 指向换走时后端可能把旧那台记成待收回，这一栏要跟着刷新。
+    void loadOrphans();
+  }
+
+  async function handleReclaim(serverId: string) {
+    setBusy("reclaim");
+    try {
+      await api.uninstallAgent(serverId);
+      toast("success", t("agent.reclaimDone"));
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBusy(null);
+      void loadOrphans();
+    }
   }
 
   // 二进制信息是进页面之后才读到的，读到之前先画「检查中」，别拿红色的「未内置」闪一下。
   const binarySource = binary?.source ?? "checking";
-  const binaryText = {
-    checking: t("agent.binaryChecking"),
-    bundled: t("agent.binaryBundled"),
-    manual: t("agent.binaryManual"),
-    missing: t("agent.binaryMissing"),
-  }[binarySource];
+  // 后端把「用不了」的具体原因写回来了：放的不是 x86_64 Linux 可执行文件，和一份都没有，
+  // 用户要做的事完全不同（前者删掉 <数据目录>/agent 下那个文件，后者补一份），不能都报「未内置」。
+  const binaryError = binary?.error?.trim() ?? "";
+  const binaryText = binaryError
+    ? t("agent.binaryUnusable")
+    : {
+        checking: t("agent.binaryChecking"),
+        bundled: t("agent.binaryBundled"),
+        manual: t("agent.binaryManual"),
+        missing: t("agent.binaryMissing"),
+      }[binarySource];
   const binaryTone: "green" | "red" | "gray" =
-    binarySource === "bundled" ? "green" : binarySource === "missing" ? "red" : "gray";
+    binaryError || binarySource === "missing"
+      ? "red"
+      : binarySource === "bundled"
+        ? "green"
+        : "gray";
 
   const remoteBackup = splitByLocation(backupConfigs).remote;
   const remoteContainer = splitByLocation(containerConfigs).remote;
-  const needsSync = syncNeeded(status, {
-    backup: backupConfigs,
-    container: containerConfigs,
-    servers: servers.length,
-  });
+  // 条数之外的陈旧（定时改动、某条改回本机 / 被删掉而控制机还留着）由后端那份指纹回答。
+  // watch 里放的是「会让结论改变的输入」：定时四项 + 两类配置的执行位与条数。
+  const staleness = useAgentStaleness(
+    [
+      settings.scheduledBackupEnabled,
+      settings.scheduledBackupTime,
+      settings.scheduledBackupConfigId ?? "",
+      settings.scheduledContainerEnabled,
+      settings.scheduledContainerTime,
+      settings.scheduledContainerConfigIds.join(","),
+      backupConfigs.map((item) => `${item.id}:${item.runLocation}`).join(","),
+      containerConfigs.map((item) => `${item.id}:${item.runLocation}`).join(","),
+    ].join("|"),
+  );
+  const staleHints = stalenessHints(staleness);
+  const needsSync =
+    syncNeeded(status, {
+      backup: backupConfigs,
+      container: containerConfigs,
+      servers: servers.length,
+    }) ||
+    staleHints.backupSchedule ||
+    staleHints.containerSchedule ||
+    Boolean(staleHints.stragglers);
   const room = status ? diskLevel(status) : "ok";
 
   if (!servers.length) {
@@ -279,7 +349,8 @@ export default function AgentPage() {
             <Field
               label={t("agent.binaryLabel")}
               hint={
-                binarySource === "missing" ? t("agent.binaryMissingHint") : t("agent.binaryHint")
+                binaryError ||
+                (binarySource === "missing" ? t("agent.binaryMissingHint") : t("agent.binaryHint"))
               }
             >
               <div className={cn(inputClass, "flex items-center gap-2")}>
@@ -295,6 +366,36 @@ export default function AgentPage() {
           </div>
           <p className="mt-3 text-[12px] leading-relaxed text-ink-dim">{t("agent.portless")}</p>
         </Card>
+
+        {orphans.length > 0 && (
+          <Card className="p-4">
+            <SectionTitle title={t("agent.orphanTitle")} />
+            <p className="mt-2 text-[11px] leading-relaxed text-warn">{t("agent.orphanHint")}</p>
+            <div className="mt-3 space-y-2">
+              {orphans.map((id) => {
+                const server = servers.find((item) => item.id === id);
+                return (
+                  <div
+                    key={id}
+                    className="flex items-center justify-between gap-3 rounded-md border border-warn/30 bg-warn-soft px-3 py-2 text-xs"
+                  >
+                    <span className="min-w-0 truncate text-warn">
+                      {server ? `${server.name} · ${server.host}` : id}
+                    </span>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      loading={busy === "reclaim"}
+                      onClick={() => void handleReclaim(id)}
+                    >
+                      {t("agent.reclaim")}
+                    </Button>
+                  </div>
+                );
+              })}
+            </div>
+          </Card>
+        )}
 
         {!status ? (
           <EmptyState
@@ -343,6 +444,11 @@ export default function AgentPage() {
                   lastRun={status.containerLastRun}
                 />
               </div>
+              {/* 上面那两行是「定时已开启」，而它们成立的前提是那份常驻服务活着。
+                  null = 这台机器上问不到 systemd（非 systemd 发行版），那种情况不报错也不报好。 */}
+              {status.serviceActive === false && (
+                <p className="mt-3 text-[12px] text-neg">{t("agent.serviceDownWarning")}</p>
+              )}
               {room === "low" && (
                 <p className="mt-3 text-[12px] text-neg">{t("agent.diskLowWarning")}</p>
               )}
@@ -365,6 +471,17 @@ export default function AgentPage() {
               />
               {needsSync && (
                 <p className="mt-3 text-[12px] text-warn">{t("agent.syncStale")}</p>
+              )}
+              {staleHints.backupSchedule && (
+                <p className="mt-2 text-[12px] text-warn">{t("agent.staleScheduleBackup")}</p>
+              )}
+              {staleHints.containerSchedule && (
+                <p className="mt-2 text-[12px] text-warn">{t("agent.staleScheduleContainer")}</p>
+              )}
+              {staleHints.stragglers && (
+                <p className="mt-2 text-[12px] text-neg">
+                  {t("agent.stragglerList", { names: staleHints.stragglers })}
+                </p>
               )}
               {report && report.warnings.length > 0 && (
                 <ul className="mt-3 space-y-1">

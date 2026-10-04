@@ -377,31 +377,25 @@ pub(super) async fn backup_command(cli: &Cli, command: &BackupCommand) -> Result
                 Ok(())
             }
             TargetCommand::Remove { target } => {
-                store.mutate_config(|config| {
-                    let id = config
-                        .backup_targets
-                        .iter()
-                        .find(|item| item.id == *target || item.name == *target)
-                        .map(|item| item.id.clone())
-                        .ok_or_else(|| {
-                            CoreError::not_found(format!("备份目标不存在: {target}"))
-                        })?;
-                    config.backup_targets.retain(|item| item.id != id);
-                    if config.settings.default_backup_target_id.as_deref() == Some(id.as_str()) {
-                        config.settings.default_backup_target_id = None;
-                    }
-                    for server in config.servers.iter_mut() {
-                        if server.backup_target_id.as_deref() == Some(id.as_str()) {
-                            server.backup_target_id = None;
-                        }
-                    }
-                    for saved in config.backup_configs.iter_mut() {
-                        if saved.target_id.as_deref() == Some(id.as_str()) {
-                            saved.target_id = None;
-                        }
-                    }
-                    Ok(())
-                })?;
+                // 与界面的 `save_backup_targets` 同一条路径：目标还被配置/服务器/默认值引用时
+                // 一律拒绝，不能像以前那样把引用静默清空 —— 清空之后那次备份会换库。
+                let config = store.load_config()?;
+                let target_id = config
+                    .backup_targets
+                    .iter()
+                    .find(|item| item.id == *target || item.name == *target)
+                    .map(|item| item.id.clone())
+                    .ok_or_else(|| {
+                        CoreError::not_found(format!("备份目标不存在: {target}"))
+                    })?;
+                let kept: Vec<_> = config
+                    .backup_targets
+                    .iter()
+                    .filter(|item| item.id != target_id)
+                    .cloned()
+                    .collect();
+                drop(config);
+                store.replace_backup_targets(&kept)?;
                 output::success(format!("已删除备份目标 {target}"));
                 Ok(())
             }
