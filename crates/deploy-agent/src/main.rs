@@ -7,6 +7,8 @@
 //! deploy-agent run    [--data-dir D]     常驻：两条定时循环（数据库备份 / 容器备份）
 //! deploy-agent status [--data-dir D]     回读状态（stdout 输出一个 JSON 文档）
 //! deploy-agent records [--data-dir D] --kind backup|container [--limit N]
+//! deploy-agent prune  [--list] [--data-dir D]
+//!                                        清理 / 列出未认领的备份包（孤儿包）
 //! deploy-agent trigger --kind backup|container --config <id> [--data-dir D]
 //! deploy-agent restore --record <id> --target <serverId> [--dir P] [--start 1]
 //! ```
@@ -19,6 +21,7 @@
 //!   `run` / `status` / `records` 反之：它们分别走 journald 与 JSON 文档通道，互不冲突。
 
 mod daemon;
+mod prune;
 mod report;
 mod tasks;
 
@@ -70,6 +73,7 @@ fn dispatch(args: &[String]) -> deploy_core::Result<()> {
         "run" => runtime()?.block_on(daemon::run_all(store)),
         "status" => report::status(&store),
         "records" => report::records(&store, args),
+        "prune" => prune::command(&store, args),
         "trigger" => runtime()?.block_on(tasks::trigger(store, args)),
         "restore" => runtime()?.block_on(tasks::restore(store, args)),
         // 命令名先认下来再说：拼错的人该看到用法，而不是一个为必然失败的调用起起来的运行时。
@@ -103,6 +107,7 @@ fn usage() -> String {
      \x20 run      [--data-dir D]                        常驻，按设置里的时间执行定时备份\n\
      \x20 status   [--data-dir D]                        输出一个 JSON 状态文档\n\
      \x20 records  [--data-dir D] --kind backup|container [--limit N]\n\
+     \x20 prune    [--list] [--data-dir D]                    清理（或 --list 只列出）未认领的备份包\n\
      \x20 trigger  --kind backup|container --config <配置 id 或名称>\n\
      \x20 restore  --record <容器记录 id> --target <服务器 id> [--dir 目录] [--start 1]\n\
      \x20 --version                                      打印协议与版本行"

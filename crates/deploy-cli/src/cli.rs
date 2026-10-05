@@ -637,6 +637,12 @@ pub enum AgentCommand {
         #[arg(short, long, default_value_t = 50)]
         lines: usize,
     },
+    /// 清理控制机上不被任何记录引用的备份包（先列出再删；任务在跑时拒绝）
+    Prune {
+        /// 临时指定服务器（默认用设置里那台）
+        #[arg(short, long)]
+        server: Option<String>,
+    },
     /// 把某条配置的执行位改成控制机（remote）或本机（local）
     Location {
         /// 配置 id / 名称

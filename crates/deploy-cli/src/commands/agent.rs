@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use deploy_core::agent::{AgentControl, AgentStatus};
+use deploy_core::agent::{AgentControl, AgentPruneReport, AgentStatus};
 use deploy_core::models::{BackupEvent, ContainerEvent, DeployStatus, RunLocation};
 use deploy_core::{format_duration, human_size, CoreError, Result, Store};
 use tokio::sync::mpsc;
@@ -170,6 +170,42 @@ pub(super) async fn agent_command(cli: &Cli, command: &AgentCommand) -> Result<(
             }
             for line in logs {
                 output::info(line);
+            }
+            Ok(())
+        }
+        AgentCommand::Prune { server } => {
+            // 先列后删：命令行也看得见删了什么。两步之间孤儿不可能重新被记录认领
+            // （记录只认自己生成的包），而删除那一步 agent 还会再核一遍并拿任务锁。
+            let orphans = control.prune_list(server.as_deref()).await?;
+            if !cli.json {
+                for item in &orphans {
+                    output::info(format!(
+                        "{:<10} {:<10} {}",
+                        item.kind,
+                        human_size(item.size_bytes),
+                        item.file_name
+                    ));
+                }
+            }
+            let report = if orphans.is_empty() {
+                AgentPruneReport {
+                    deleted: 0,
+                    freed_bytes: 0,
+                }
+            } else {
+                control.prune(server.as_deref()).await?
+            };
+            if cli.json {
+                return print_json(&report);
+            }
+            if report.deleted == 0 {
+                output::dim("控制机上没有未认领的备份包");
+            } else {
+                output::success(format!(
+                    "已删除 {} 个未认领备份包，释放 {}",
+                    report.deleted,
+                    human_size(report.freed_bytes)
+                ));
             }
             Ok(())
         }

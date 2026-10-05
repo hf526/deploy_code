@@ -49,7 +49,9 @@ export default function AgentPage() {
   // 本机这份 agent 二进制的来源：装不装得成取决于它，所以进页面就查一次，只读展示。
   const [binary, setBinary] = useState<AgentBinaryInfo | null>(null);
   const [loading, setLoading] = useState(false);
-  const [busy, setBusy] = useState<"install" | "sync" | "uninstall" | "reclaim" | null>(null);
+  const [busy, setBusy] = useState<"install" | "sync" | "uninstall" | "reclaim" | "prune" | null>(null);
+  // 清理未认领备份包的两步走：先拉清单看有多少，确认弹窗里给出个数与总大小再执行。
+  const [prunePreview, setPrunePreview] = useState<{ count: number; bytes: number } | null>(null);
   const [report, setReport] = useState<AgentSyncReport | null>(null);
   const [logs, setLogs] = useState<string[]>([]);
   const [logsLoading, setLogsLoading] = useState(false);
@@ -249,6 +251,44 @@ export default function AgentPage() {
     }
   }
 
+  // 清理未认领备份包的两步：先在控制机上跑 prune --list（只读），清单非空才弹确认；
+  // 执行成功后静默刷新一次状态卡，「已留备份包」那一格跟着变小。
+  async function handlePruneCheck() {
+    setBusy("prune");
+    try {
+      const orphans = await api.agentPruneList();
+      if (!orphans.length) {
+        toast("success", t("agent.pruneEmpty"));
+        return;
+      }
+      setPrunePreview({
+        count: orphans.length,
+        bytes: orphans.reduce((sum, item) => sum + item.sizeBytes, 0),
+      });
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function handlePrune() {
+    setBusy("prune");
+    try {
+      const report = await api.agentPrune();
+      setPrunePreview(null);
+      toast(
+        "success",
+        t("agent.pruned", { count: report.deleted, size: humanSize(report.freedBytes) }),
+      );
+      void reload(true);
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   // 二进制信息是进页面之后才读到的，读到之前先画「检查中」，别拿红色的「未内置」闪一下。
   const binarySource = binary?.source ?? "checking";
   // 后端把「用不了」的具体原因写回来了：放的不是 x86_64 Linux 可执行文件，和一份都没有，
@@ -410,7 +450,20 @@ export default function AgentPage() {
         ) : (
           <>
             <Card className="p-4">
-              <SectionTitle title={t("agent.statusTitle")} />
+              <SectionTitle
+                title={t("agent.statusTitle")}
+                actions={
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => void handlePruneCheck()}
+                    disabled={busy !== null}
+                  >
+                    <Trash2 size={14} />
+                    {t("agent.prune")}
+                  </Button>
+                }
+              />
               <div className="mt-3 grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
                 <Metric label={t("agent.metricVersion")} value={`${status.version} · proto ${status.proto}`} />
                 <Metric
@@ -599,6 +652,24 @@ export default function AgentPage() {
         loading={busy === "uninstall"}
         onCancel={() => setRemoving(false)}
         onConfirm={() => void handleUninstall()}
+      />
+
+      <ConfirmModal
+        open={prunePreview !== null}
+        title={t("agent.pruneTitle")}
+        description={
+          prunePreview
+            ? t("agent.pruneConfirm", {
+                count: prunePreview.count,
+                size: humanSize(prunePreview.bytes),
+              })
+            : ""
+        }
+        confirmText={t("common.confirm")}
+        danger
+        loading={busy === "prune"}
+        onCancel={() => setPrunePreview(null)}
+        onConfirm={() => void handlePrune()}
       />
     </Page>
   );

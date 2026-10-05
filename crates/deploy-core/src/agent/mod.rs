@@ -176,6 +176,17 @@ pub struct AgentStatus {
     pub service_active: Option<bool>,
 }
 
+/// `deploy-agent prune` 的返回：删掉的孤儿包个数与释放的字节数。
+///
+/// 客户端经 SSH exec 调起（见 [`AgentControl::prune`]），agent 往 stdout 打这一个 JSON 文档。
+/// 判据与本机设置页的「未认领备份包」一致：只认两个备份包目录的直接子文件、删前重核记录。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentPruneReport {
+    pub deleted: usize,
+    pub freed_bytes: u64,
+}
+
 /// 协议对不上就拒绝任何下发（装的是哪一份都得先过这一关）。
 ///
 /// 下发过去的 config.json 是按当前语义写的：旧协议那份读它，字段含义可能已经改过，

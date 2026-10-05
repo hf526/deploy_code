@@ -88,6 +88,8 @@ pub fn run() {
             commands::agent::agent_logs,
             commands::agent::agent_backup_records,
             commands::agent::agent_container_records,
+            commands::agent::agent_prune_list,
+            commands::agent::agent_prune,
             commands::agent::start_agent_backup,
             commands::agent::start_agent_container,
             commands::agent::restore_agent_container,

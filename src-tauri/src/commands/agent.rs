@@ -17,9 +17,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use deploy_core::agent::{
-    AgentBinaryInfo, AgentControl, AgentStaleness, AgentStatus, AgentSyncReport,
+    AgentBinaryInfo, AgentControl, AgentPruneReport, AgentStaleness, AgentStatus, AgentSyncReport,
 };
 use deploy_core::models::{BackupEvent, BackupRecord, ContainerEvent, ContainerRecord};
+use deploy_core::store::OrphanBundle;
 use deploy_core::{CoreError, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::sync::mpsc::UnboundedSender;
@@ -112,6 +113,27 @@ pub async fn agent_container_records(
     limit: usize,
 ) -> Result<Vec<ContainerRecord>> {
     control_of(state.store.clone()).container_records(limit, None).await
+}
+
+/// 列出控制机上不被任何记录引用的备份包（只读不动盘，给确认弹窗先看清单）。
+#[tauri::command]
+pub async fn agent_prune_list(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<Vec<OrphanBundle>> {
+    let target = explicit_server(&server_id);
+    control_of(state.store.clone()).prune_list(target.as_deref()).await
+}
+
+/// 清掉控制机上不被任何记录引用的备份包。判据在本机那一侧（`Store::delete_orphan_bundles`），
+/// 任务在跑时控制机会拒绝（busy 原样透传，前端按「稍后重试」提示）。
+#[tauri::command]
+pub async fn agent_prune(
+    state: State<'_, AppState>,
+    server_id: String,
+) -> Result<AgentPruneReport> {
+    let target = explicit_server(&server_id);
+    control_of(state.store.clone()).prune(target.as_deref()).await
 }
 
 /// 让控制机立刻跑一条数据库备份配置，事件实时转给前端。

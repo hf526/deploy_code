@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::process::shell_quote;
 use crate::ssh::{OutputKind, SshClient};
-use crate::store::Store;
+use crate::store::{OrphanBundle, Store};
 use crate::util::human_size;
 
 use super::binary::resolve_binary;
@@ -18,7 +18,10 @@ use super::scripts::{
     config_install_script, install_script, service_state, uninstall_script, unit_template,
 };
 use super::sync::{agent_server_id, backup_schedule_key, container_schedule_key, AgentSyncState};
-use super::{check_proto, parse_version, AgentStatus, AgentVersion, BIN_PATH, DATA_DIR, SERVICE};
+use super::{
+    check_proto, parse_version, AgentPruneReport, AgentStatus, AgentVersion, BIN_PATH, DATA_DIR,
+    SERVICE,
+};
 
 /// 一次下发（注入）的结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,14 +102,22 @@ impl AgentControl {
             } else {
                 stderr.trim()
             };
-            return Err(CoreError::ssh(format!(
+            let message = format!(
                 "{action}失败（退出码 {code}）: {}",
                 if detail.is_empty() {
                     "远端没有输出可读信息".to_string()
                 } else {
                     detail.to_string()
                 }
-            )));
+            );
+            // 退出码 3 是 agent 说的「名额被占」（deploy-agent main.rs 把 Busy 映射成 3）。
+            // 必须还原成 CoreError::busy，调用方才能按项目红线用 matches! 分辨「稍后重试」与
+            // 真失败；压成 ssh 错就等于把这条红线改成了「读文案」。
+            return Err(if code == 3 {
+                CoreError::busy(message)
+            } else {
+                CoreError::ssh(message)
+            });
         }
         parse(stdout.trim()).map_err(|err| {
             CoreError::ssh(format!(
@@ -483,6 +494,42 @@ impl AgentControl {
                 limit = limit.clamp(1, 1000)
             );
             Self::exec_json(&client, &command, 90, "读取控制机容器备份记录", |text| {
+                serde_json::from_str(text).map_err(|err| err.to_string())
+            })
+            .await
+        }
+        .await;
+        client.disconnect().await;
+        result
+    }
+
+    /// 列出控制机上「盘上有文件、记录里已没有指向它」的备份包（`prune --list`）。
+    ///
+    /// 只读不动盘，给确认弹窗一个先看清单的机会；真正删除走 [`AgentControl::prune`]。
+    pub async fn prune_list(&self, server_id: Option<&str>) -> Result<Vec<OrphanBundle>> {
+        let client = self.connect(server_id).await?;
+        let result = async {
+            let command = format!("{BIN_PATH} prune --list --data-dir {DATA_DIR}");
+            Self::exec_json(&client, &command, 90, "读取控制机未认领备份包", |text| {
+                serde_json::from_str(text).map_err(|err| err.to_string())
+            })
+            .await
+        }
+        .await;
+        client.disconnect().await;
+        result
+    }
+
+    /// 清掉控制机上不被任何记录引用的备份包（`prune`），返回删掉的个数与释放的字节数。
+    ///
+    /// 控制机是无头的：记录按上限裁掉之后残留的包没有任何界面可以清，这是它们唯一的出口。
+    /// 判据完全复用本机那套（[`Store::orphan_bundles`] / [`Store::delete_orphan_bundles`]），
+    /// 备份或容器任务在跑时 agent 会拒绝（退出码 3 → [`CoreError::busy`]，不许降级成别的错误类别）。
+    pub async fn prune(&self, server_id: Option<&str>) -> Result<AgentPruneReport> {
+        let client = self.connect(server_id).await?;
+        let result = async {
+            let command = format!("{BIN_PATH} prune --data-dir {DATA_DIR}");
+            Self::exec_json(&client, &command, 120, "清理控制机未认领备份包", |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await

@@ -51,6 +51,12 @@ export interface AgentSyncReport {
   status: AgentStatus;
 }
 
+/** 控制机孤儿备份包清理的结果（Rust: deploy_core::agent::AgentPruneReport）。 */
+export interface AgentPruneReport {
+  deleted: number;
+  freedBytes: number;
+}
+
 /** 控制机上那份与本机设置是否已经不一致（Rust: deploy_core::agent::AgentStaleness）。
  * 纯本机读盘：条数对得上时，界面也需要这一层来说出「那份是旧的」。 */
 export interface AgentStaleness {

@@ -2,11 +2,13 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AgentBinaryInfo,
+  AgentPruneReport,
   AgentStaleness,
   AgentStatus,
   AgentSyncReport,
   BackupRecord,
   ContainerRecord,
+  OrphanBundle,
 } from "../types";
 
 export const agentCommands = {
@@ -25,6 +27,9 @@ export const agentCommands = {
   agentBackupRecords: (limit = 50) => invoke<BackupRecord[]>("agent_backup_records", { limit }),
   agentContainerRecords: (limit = 50) =>
     invoke<ContainerRecord[]>("agent_container_records", { limit }),
+  /** 控制机上不被任何记录引用的备份包：先列出（只读）再清理，判据同本机「未认领备份包」。 */
+  agentPruneList: (serverId = "") => invoke<OrphanBundle[]>("agent_prune_list", { serverId }),
+  agentPrune: (serverId = "") => invoke<AgentPruneReport>("agent_prune", { serverId }),
   /** 让控制机立刻跑一条数据库备份配置；命令会等任务结束，进度走 backup://event。 */
   startAgentBackup: (configId: string) => invoke<string>("start_agent_backup", { configId }),
   startAgentContainer: (configId: string) => invoke<string>("start_agent_container", { configId }),

@@ -13,7 +13,9 @@ use crate::models::{
 };
 
 /// 一个「盘上有文件、记录里已经没有指向它」的本地备份包。见 [`Store::orphan_bundles`]。
-#[derive(Debug, Clone, serde::Serialize)]
+///
+/// agent 侧 `prune --list` 也用它回传清单（客户端按同一形状反序列化），所以要双向可序列化。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrphanBundle {
     /// `"database"` 或 `"container"`：两个目录分开列，用户才知道删的是哪一类。
