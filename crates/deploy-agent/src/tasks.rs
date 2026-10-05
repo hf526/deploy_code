@@ -26,6 +26,60 @@ use crate::EXIT_FAILED;
 /// 对端断开之后收拾远端脚本的时间上限：这一步不该把退出拖住。
 const CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 
+/// 客户端断开时 sshd 会**先**给 exec 出的进程送 SIGHUP（SIGTERM 是兜底），不拦的话默认动作
+/// 直接杀进程，EPIPE 那条收尾路根本轮不到跑——abandon 与 cleanup 全部跳过，记录永远挂在
+/// 「进行中」，半截 `.part` 也没人删。装上 handler 拦下来，走与 EPIPE 同一条中止路。
+/// 只在 Stream 模式武装：定时任务跑在 daemon 里，退出信号由 daemon 统一管。
+#[cfg(unix)]
+struct ClientSignals {
+    hangup: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl ClientSignals {
+    fn arm(sink: Sink) -> Option<Self> {
+        use tokio::signal::unix::{signal, SignalKind};
+        if sink != Sink::Stream {
+            return None;
+        }
+        Some(Self {
+            hangup: signal(SignalKind::hangup()).ok()?,
+            terminate: signal(SignalKind::terminate()).ok()?,
+        })
+    }
+
+    async fn fired(&mut self) {
+        tokio::select! {
+            _ = self.hangup.recv() => {}
+            _ = self.terminate.recv() => {}
+        }
+    }
+}
+
+/// Windows 上没有这套信号（agent 只在 Linux 上跑）：永不为 None 之外的值，保持类型可查。
+#[cfg(not(unix))]
+struct ClientSignals;
+
+#[cfg(not(unix))]
+impl ClientSignals {
+    fn arm(_sink: Sink) -> Option<Self> {
+        None
+    }
+
+    async fn fired(&mut self) {
+        std::future::pending().await
+    }
+}
+
+/// 信号闸：没武装（Journal 模式 / 非 unix）就永远不触发。
+async fn client_gone(signals: &mut Option<ClientSignals>) {
+    match signals {
+        Some(s) => s.fired().await,
+        None => std::future::pending().await,
+    }
+}
+
 /// 哪一类任务：决定用哪个引擎、哪把任务锁。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -216,6 +270,7 @@ async fn run_backup(store: &Arc<Store>, key: &str, sink: Sink) -> Result<BackupR
     // pump 自己成一个任务：它不在场（原来的写法）就没人写事件，客户端只能等任务整个结束才看到
     // 输出，「写不出去 = 客户端断开」这个判定也永远轮不到发生。
     let pump = tokio::spawn(pump(receiver, sink, gone_tx));
+    let mut client_signals = ClientSignals::arm(sink);
     let outcome = loop {
         // biased：引擎结束会顺手 drop 掉 sender，于是两条分支在同一次轮询里双双就绪；
         // 随机挑会把刚跑完的任务报成「客户端断开」，连带把成品当半成品清掉。
@@ -227,6 +282,9 @@ async fn run_backup(store: &Arc<Store>, key: &str, sink: Sink) -> Result<BackupR
                 break Ok(record);
             }
             Some(()) = gone_rx.recv(), if sink == Sink::Stream => {
+                break Err(CoreError::ssh("客户端已断开，控制机中止这次备份"));
+            }
+            _ = client_gone(&mut client_signals) => {
                 break Err(CoreError::ssh("客户端已断开，控制机中止这次备份"));
             }
         }
@@ -276,8 +334,9 @@ async fn run_job(
     let runner = engine.run(record, job, Some(sender));
     tokio::pin!(runner);
     let pump = tokio::spawn(pump(receiver, sink, gone_tx));
+    let mut client_signals = ClientSignals::arm(sink);
     let outcome = loop {
-        // 与 run_backup 同一套：pump 要在场，引擎优先。
+        // 与 run_backup 同一套：pump 要在场，引擎优先；信号与 EPIPE 走同一条中止路。
         tokio::select! {
             biased;
             done = &mut runner => {
@@ -285,6 +344,9 @@ async fn run_job(
                 break Ok(done);
             }
             Some(()) = gone_rx.recv(), if sink == Sink::Stream => {
+                break Err(CoreError::ssh("客户端已断开，控制机中止这次容器备份"));
+            }
+            _ = client_gone(&mut client_signals) => {
                 break Err(CoreError::ssh("客户端已断开，控制机中止这次容器备份"));
             }
         }

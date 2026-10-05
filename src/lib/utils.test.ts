@@ -9,6 +9,7 @@ import {
   formatDuration,
   githubTarget,
   inferEnvRemotePath,
+  maskRemoteUrl,
   maskUrlPassword,
   shortPath,
   statusBadgeKind,
@@ -94,6 +95,31 @@ describe("maskUrlPassword", () => {
 
   it("无 scheme 时原样返回", () => {
     expect(maskUrlPassword("not-a-url")).toBe("not-a-url");
+  });
+});
+
+describe("maskRemoteUrl", () => {
+  it("遮蔽 token 当口令与当用户名两种 HTTPS 形态（与 Rust 侧同一组用例）", () => {
+    expect(maskRemoteUrl("https://user:ghp_abc123@github.com/acme/app.git")).toBe(
+      "https://user:***@github.com/acme/app.git",
+    );
+    expect(maskRemoteUrl("https://ghp_abc123@github.com/acme/app.git")).toBe(
+      "https://***@github.com/acme/app.git",
+    );
+    expect(maskRemoteUrl("http://u:p@ss@192.168.1.5:8080/repo.git")).toBe(
+      "http://u:***@192.168.1.5:8080/repo.git",
+    );
+  });
+
+  it("无凭据的 https、scp 与 ssh 形态保持可读", () => {
+    expect(maskRemoteUrl("https://github.com/acme/app.git")).toBe(
+      "https://github.com/acme/app.git",
+    );
+    expect(maskRemoteUrl("git@github.com:acme/app.git")).toBe("git@github.com:acme/app.git");
+    expect(maskRemoteUrl("ssh://git@host.example/repo.git")).toBe(
+      "ssh://git@host.example/repo.git",
+    );
+    expect(maskRemoteUrl("/srv/git/app.git")).toBe("/srv/git/app.git");
   });
 });
 

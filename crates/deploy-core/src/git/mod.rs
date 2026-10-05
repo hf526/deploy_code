@@ -748,6 +748,47 @@ fn validate_remote_url(value: &str) -> Result<String> {
     Ok(value.to_string())
 }
 
+/// 把远端 URL 里内嵌的凭据遮成 `***`，供所有「给人看」的输出路径使用。
+///
+/// HTTPS 地址把 token 当口令或当用户名内嵌（`https://user:ghp_x@…`、`https://ghp_x@…`）是
+/// 常见配置，原样打进 CLI 输出 / 日志就是泄漏；所以口令段与「无冒号但挂在 http(s) 上的
+/// userinfo」一律遮掉。`git@host:path` 与 `ssh://git@host/…` 没有口令段，保持可读。
+/// 编辑入口不能吃这个值：调用方（CLI 输出、界面展示）只拿它给人看，改远端必须走原文。
+pub fn mask_remote_url(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_string();
+    };
+    let after_scheme = &url[scheme_end + 3..];
+    let head_end = match after_scheme.find('/') {
+        Some(slash) => scheme_end + 3 + slash,
+        None => url.len(),
+    };
+    // head = `scheme://[userinfo@]host[:port]`,tail = 首个 `/` 起的路径。
+    let head = &url[..head_end];
+    let tail = &url[head_end..];
+    let Some(at) = head.rfind('@') else {
+        return url.to_string();
+    };
+    let prefix = &head[..scheme_end + 3];
+    let userinfo = &head[scheme_end + 3..at];
+    let host = &head[at + 1..];
+    let masked = match userinfo.split_once(':') {
+        // 口令段整个遮掉（它自己可能还含 `:`）。
+        Some((user, _)) => format!("{user}:***"),
+        None => {
+            // 没有冒号的 http(s) userinfo 多半是「token 当用户名」（GitHub PAT 的常见配法），
+            // 整段遮；`ssh://git@host` 这类没有口令段，保持可读。
+            let is_web = prefix.starts_with("http://") || prefix.starts_with("https://");
+            if is_web {
+                "***".to_string()
+            } else {
+                return url.to_string();
+            }
+        }
+    };
+    format!("{prefix}{masked}@{host}{tail}")
+}
+
 /// 判断 git 失败输出是否表示"仓库还没有任何提交"。
 fn is_empty_repo_error(out: &CommandOutput) -> bool {
     let text = out.combined().to_ascii_lowercase();
@@ -918,6 +959,39 @@ mod tests {
     use std::fs::File;
 
     use super::*;
+
+    #[test]
+    fn mask_remote_url_hides_embedded_credentials_but_keeps_plain_remotes_readable() {
+        // token 当口令 / 当用户名是 HTTPS 配 GitHub 的两种常见形态，都必须遮。
+        assert_eq!(
+            mask_remote_url("https://user:ghp_abc123@github.com/acme/app.git"),
+            "https://user:***@github.com/acme/app.git"
+        );
+        assert_eq!(
+            mask_remote_url("https://ghp_abc123@github.com/acme/app.git"),
+            "https://***@github.com/acme/app.git"
+        );
+        // 口令自己含 `@` 时按最后一个 `@` 分界，不能把口令尾巴留在 host 里。
+        assert_eq!(
+            mask_remote_url("http://u:p@ss@192.168.1.5:8080/repo.git"),
+            "http://u:***@192.168.1.5:8080/repo.git"
+        );
+        // 没带凭据的 https、scp 形态与 ssh 形态没有口令段，原样返回（遮了反而没法看）。
+        assert_eq!(
+            mask_remote_url("https://github.com/acme/app.git"),
+            "https://github.com/acme/app.git"
+        );
+        assert_eq!(
+            mask_remote_url("git@github.com:acme/app.git"),
+            "git@github.com:acme/app.git"
+        );
+        assert_eq!(
+            mask_remote_url("ssh://git@host.example/repo.git"),
+            "ssh://git@host.example/repo.git"
+        );
+        // 本地路径没有 scheme，不处理。
+        assert_eq!(mask_remote_url("/srv/git/app.git"), "/srv/git/app.git");
+    }
 
     fn empty_status() -> RepoStatus {
         RepoStatus {

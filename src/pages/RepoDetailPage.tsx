@@ -35,7 +35,7 @@ import { useApp } from "../lib/store";
 import type { Branch, GraphCommit, RepoDetail } from "../lib/types";
 import { registerUnsavedGuard, runGuarded } from "../lib/unsavedGuard";
 import { useTauriEvent } from "../lib/useTauriEvent";
-import { cn } from "../lib/utils";
+import { cn, maskRemoteUrl } from "../lib/utils";
 import { EditorPane } from "./repoDetail/EditorPane";
 import { changeDir, changeFile, CommitBox, RailButton, Section } from "./repoDetail/Panels";
 import { SearchPanel } from "./repoDetail/SearchPanel";
@@ -629,8 +629,11 @@ export default function RepoDetailPage() {
           {repo.pathExists && (
             <p className="mt-0.5 flex min-w-0 items-center gap-1.5 text-[11px]">
               {repo.remote ? (
-                <span className="truncate font-mono text-ink-dim" title={repo.remote}>
-                  {repo.remote}
+                <span
+                  className="truncate font-mono text-ink-dim"
+                  title={maskRemoteUrl(repo.remote)}
+                >
+                  {maskRemoteUrl(repo.remote)}
                 </span>
               ) : (
                 <span className="text-ink-faint">{t("repos.noRemote")}</span>

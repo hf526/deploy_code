@@ -55,7 +55,7 @@ pub use container::{
 pub use cronjob::{CronHeader, CronJob, CronJobDraft, CronJobRun, CronSchedule, CRON_METHODS};
 pub use engine::{repo_info, DeployEngine, EventSender};
 pub use error::{CoreError, Result};
-pub use git::Git;
+pub use git::{mask_remote_url, Git};
 pub use models::*;
 pub use nginx::{NginxConfigContent, NginxConfigFile, NginxContainerInfo, NginxEngine};
 pub use pages::{PagesEngine, PagesEventSender, PreparedPagesDeploy};

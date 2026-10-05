@@ -1,10 +1,17 @@
-use deploy_core::models::RepoConfig;
-use deploy_core::{repo_info, CoreError, Git, Result, Store};
+use deploy_core::models::{RepoConfig, RepoInfo};
+use deploy_core::{mask_remote_url, repo_info, CoreError, Git, Result, Store};
 
 use crate::cli::*;
 use crate::output;
 
 use super::{open_store, print_json};
+
+/// 输出前把远端 URL 里的内嵌凭据遮掉：JSON 会被脚本消费、文本会进终端日志，
+/// 这里是红线（凭据不许出 stdout）。仓库配置本身保持原文，编辑远端走 `repo remote`。
+fn printable(mut info: RepoInfo) -> RepoInfo {
+    info.remote = info.remote.map(|url| mask_remote_url(&url));
+    info
+}
 
 pub(super) fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
     let store = open_store(cli)?;
@@ -47,14 +54,14 @@ pub(super) fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
             })?;
 
             if cli.json {
-                return print_json(&repo_info(&repo));
+                return print_json(&printable(repo_info(&repo)));
             }
             output::success(format!("已添加仓库 {} ({})", repo.name, repo.path));
             Ok(())
         }
         RepoCommand::List => {
             let config = store.load_config()?;
-            let infos: Vec<_> = config.repos.iter().map(repo_info).collect();
+            let infos: Vec<_> = config.repos.iter().map(|repo| printable(repo_info(repo))).collect();
             if cli.json {
                 return print_json(&infos);
             }
@@ -88,7 +95,7 @@ pub(super) fn repo_command(cli: &Cli, command: &RepoCommand) -> Result<()> {
         RepoCommand::Info { repo } => {
             let config = store.load_config()?;
             let repo = Store::find_repo(&config, repo)?.clone();
-            let info = repo_info(&repo);
+            let info = printable(repo_info(&repo));
             if cli.json {
                 return print_json(&info);
             }

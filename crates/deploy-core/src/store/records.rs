@@ -301,7 +301,34 @@ impl Store {
         if deploy.is_none() || backup.is_none() || pages.is_none() || container.is_none() {
             return Ok(0);
         }
-        self.mark_interrupted()
+        let converted = self.mark_interrupted()?;
+        self.sweep_orphan_part_files()?;
+        Ok(converted)
+    }
+
+    /// 被硬杀（SIGKILL / OOM / 断电）的任务没有任何 Drop 机会：它下到一半的 `*.part`
+    /// 半截包既进不了记录（轮转看不见），又被孤儿视图刻意排除，从此无人认领，控制机的
+    /// 数据目录会被几 GB 级的半成品慢慢吃满。借收敛这次机会顺手清掉：走到这里四把任务
+    /// 锁都在手上，盘上的 `.part` 必然没有活着的写手。删失败就留给下一轮。
+    fn sweep_orphan_part_files(&self) -> Result<usize> {
+        let mut swept = 0usize;
+        for dir in [self.db_bundle_dir(), self.container_bundle_dir()] {
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                // 目录还不存在（从没跑过备份）不算错。
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || !entry.file_name().to_string_lossy().ends_with(".part") {
+                    continue;
+                }
+                if std::fs::remove_file(&path).is_ok() {
+                    swept += 1;
+                }
+            }
+        }
+        Ok(swept)
     }
 
     /// 半路放弃一条数据库备份时，把本机（控制机）那条 Running 收成失败。
@@ -605,6 +632,34 @@ mod tests {
             store.load_history().unwrap()[0].status,
             DeployStatus::Failed
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 硬杀任务留下的 `.part` 半截包跟着收敛一起清掉，完整的备份包与别的文件不能碰。
+    #[test]
+    fn reconcile_sweeps_orphan_part_files_but_keeps_finished_bundles() {
+        let dir = std::env::temp_dir()
+            .join(format!("deploycode-store-part-sweep-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        std::fs::create_dir_all(store.db_bundle_dir()).unwrap();
+        std::fs::create_dir_all(store.container_bundle_dir()).unwrap();
+        let part_db = store.db_bundle_dir().join("record-1.sql.gz.part");
+        let part_container = store.container_bundle_dir().join("record-2.tar.part");
+        let finished = store.container_bundle_dir().join("record-3.tar");
+        let not_a_bundle = store.container_bundle_dir().join("notes.txt");
+        std::fs::write(&part_db, b"half").unwrap();
+        std::fs::write(&part_container, b"half").unwrap();
+        std::fs::write(&finished, b"done").unwrap();
+        std::fs::write(&not_a_bundle, b"keep").unwrap();
+
+        store.reconcile_interrupted().unwrap();
+
+        assert!(!part_db.exists(), "数据库半截包该被清扫");
+        assert!(!part_container.exists(), "容器半截包该被清扫");
+        assert!(finished.exists(), "完整的备份包不该被碰");
+        assert!(not_a_bundle.exists(), "非 .part 文件不该被碰");
+        // 再跑一轮也不能出事（幂等）。
+        store.reconcile_interrupted().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 

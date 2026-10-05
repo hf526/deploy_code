@@ -25,7 +25,7 @@ import { openRepoFolder } from "../lib/openRepo";
 import { useApp } from "../lib/store";
 import type { RepoInfo } from "../lib/types";
 import { useAutoRefresh } from "../lib/useAutoRefresh";
-import { cn, shortPath } from "../lib/utils";
+import { cn, maskRemoteUrl, shortPath } from "../lib/utils";
 
 /** 后台轮询间隔：每个仓库跑 3 个 git 只读命令，10s 足够跟上编辑器里的改动。 */
 const AUTO_REFRESH_MS = 10_000;
@@ -304,8 +304,11 @@ export default function ReposPage() {
                         {t("repos.repath")}
                       </button>
                     ) : repo.remote ? (
-                      <span className="truncate font-mono text-ink-dim" title={repo.remote}>
-                        {repo.remote}
+                      <span
+                        className="truncate font-mono text-ink-dim"
+                        title={maskRemoteUrl(repo.remote)}
+                      >
+                        {maskRemoteUrl(repo.remote)}
                       </span>
                     ) : (
                       <span className="text-ink-faint">

@@ -26,6 +26,9 @@ use crate::tasks::{execute, Kind, Sink, TaskOutcome};
 
 /// 定时检查间隔，与 GUI 的调度循环一致。
 const CHECK_INTERVAL: Duration = Duration::from_secs(20);
+/// 遗留记录收敛的巡检间隔：trigger 被 SIGKILL / OOM 杀掉时没有任何机会自己收尾，
+/// 而 daemon 是 `Restart=always` 的常驻进程可能几个月不重启，不能只靠启动那一次收敛。
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(600);
 /// 循环 panic 后的重启退避：基数 × 次数，封顶在 5 分钟。
 const PANIC_BACKOFF: Duration = Duration::from_secs(5);
 const PANIC_BACKOFF_MAX: Duration = Duration::from_secs(300);
@@ -46,10 +49,12 @@ pub async fn run_all(store: Arc<Store>) -> Result<()> {
     );
     let backup = tokio::spawn(supervised(store.clone(), "数据库备份", backup_loop));
     let container = tokio::spawn(supervised(store.clone(), "容器备份", container_loop));
+    let reconcile = tokio::spawn(supervised(store.clone(), "遗留记录收敛", reconcile_loop));
     let both = async {
         // 两条循环都不该正常返回：任何一条退出都要说清楚，否则 journald 里只剩一片安静。
         join_logged(backup, "数据库备份").await?;
-        join_logged(container, "容器备份").await
+        join_logged(container, "容器备份").await?;
+        join_logged(reconcile, "遗留记录收敛").await
     };
 
     // systemd 停服务发的是 SIGTERM。不接它就是「进程当场消失、journal 里一句为什么都没有」；
@@ -81,6 +86,23 @@ async fn wait_for_stop() -> Result<()> {
         tokio::signal::ctrl_c().await?;
     }
     Ok(())
+}
+
+/// 周期性收敛遗留的「进行中」记录：SIGKILL / panic 下的任务没有任何收尾机会，
+/// 平时也得有人把它们收成失败，不能等几个月后的重启。`reconcile_interrupted` 锁感知——
+/// 任一任务在跑就整批跳过，不会误伤此刻正在执行的任务。
+async fn reconcile_loop(store: Arc<Store>) {
+    loop {
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+        match store.reconcile_interrupted() {
+            Ok(0) => {}
+            Ok(count) => log(
+                "WARN",
+                &format!("收敛了 {count} 条遗留的进行中记录（它们的任务没能自己收尾）"),
+            ),
+            Err(err) => log("WARN", &format!("遗留记录收敛失败: {err}")),
+        }
+    }
 }
 
 /// 把一条循环放进「panic 只重启它自己」的监护里跑。

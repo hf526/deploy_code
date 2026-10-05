@@ -56,6 +56,9 @@ SUDO=""
 # 而下面那行 `--version` 打的是刚落盘的新二进制 —— 界面与握手都会以为「升级成功」。
 # 停在半路的那个任务不假装成功：agent 启动时用 reconcile_interrupted 把它收成失败。
 $SUDO systemctl stop {service} 2>/dev/null || true
+# 崩溃循环过的服务被 StartLimit 钉在 failed：stop 不清启动频率计数，不 reset-failed 的
+# 话下面的 start 会被「Start request repeated too quickly」直接拒绝 —— 重装修复这条路就断了。
+$SUDO systemctl reset-failed {service} 2>/dev/null || true
 $SUDO install -m 755 {tmp} {bin}
 $SUDO mkdir -p {dir}
 $SUDO chmod 700 {dir}
@@ -193,6 +196,12 @@ mod tests {
             .find("install -m 755")
             .expect("安装脚本要落二进制");
         assert!(stop < install, "stop 必须发生在覆盖二进制之前：{script}");
+        // 崩溃循环后服务钉在 failed，stop 不清启动频率计数：不 reset-failed，
+        // enable --now 的 start 会被拒绝，「重装修复」这条路就断了。
+        let reset = script
+            .find("systemctl reset-failed")
+            .expect("安装脚本要 reset-failed");
+        assert!(stop < reset && reset < install, "reset-failed 要在 stop 与落二进制之间：{script}");
     }
 
     #[test]

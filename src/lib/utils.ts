@@ -152,6 +152,36 @@ export function maskUrlPassword(url: string): string {
   return `${prefix}${authority}${maskQueryPassword(rest.slice(authorityEnd))}`;
 }
 
+/**
+ * 遮蔽 git 远端 URL 里内嵌的凭据（与 Rust 侧 `git/mod.rs::mask_remote_url` 同一口径）。
+ *
+ * 与 `maskUrlPassword` 的差别：无冒号的 http(s) userinfo 也要整段遮——那是「token 当用户名」
+ * 配 GitHub 的常见形态；`ssh://git@host` / `git@host:path` 没有口令段，保持可读。
+ * 只用于展示：编辑远端的弹窗必须拿原文回填，存假 URL 会把仓库远端改坏。
+ */
+export function maskRemoteUrl(url: string): string {
+  const schemeEnd = url.indexOf("://");
+  if (schemeEnd < 0) return url;
+  const rest = url.slice(schemeEnd + 3);
+  const slash = rest.indexOf("/");
+  const headEnd = slash < 0 ? url.length : schemeEnd + 3 + slash;
+  const head = url.slice(0, headEnd);
+  const tail = url.slice(headEnd);
+  const at = head.lastIndexOf("@");
+  if (at < 0) return url;
+  const prefix = url.slice(0, schemeEnd + 3);
+  const userinfo = head.slice(schemeEnd + 3, at);
+  const host = head.slice(at + 1);
+  const colon = userinfo.indexOf(":");
+  const masked =
+    colon >= 0
+      ? `${userinfo.slice(0, colon)}:***`
+      : prefix.startsWith("http://") || prefix.startsWith("https://")
+        ? "***"
+        : null;
+  return masked === null ? url : `${prefix}${masked}@${host}${tail}`;
+}
+
 /** 从远端地址推导 GitHub 仓库与预计的 Pages 访问地址（仅用于界面预览）。 */
 export function githubTarget(remote: string | null): { owner: string; repo: string; url: string } | null {
   if (!remote) return null;
