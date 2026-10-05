@@ -40,6 +40,7 @@ import type {
 import { cn, deployStatusLabel, humanSize, statusBadgeKind } from "../lib/utils";
 import { ContainerConfigList } from "./containers/ContainerConfigList";
 import { ContainerConfigModal } from "./containers/ContainerConfigModal";
+import { ContainerParamsCard } from "./containers/ContainerParamsCard";
 import { ContainerScheduleCard } from "./containers/ContainerScheduleCard";
 import { RestoreBundleModal } from "./containers/RestoreBundleModal";
 import { StackDetail } from "./containers/StackDetail";
@@ -577,6 +578,8 @@ export default function ContainersPage() {
           </section>
 
           <ContainerScheduleCard />
+
+          <ContainerParamsCard />
         </div>
 
         <div className="flex min-w-0 flex-col gap-6">

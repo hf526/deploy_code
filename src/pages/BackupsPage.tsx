@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   CalendarClock,
   Copy,
@@ -30,11 +30,13 @@ import {
 import { api } from "../lib/api";
 import { stalenessHints } from "../lib/agent";
 import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
+import { enqueueSettingsSave } from "../lib/settingsDraft";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
 import { useAgentStaleness } from "../lib/useAgentStaleness";
 import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
 import { BackupConfigModal } from "./backup/BackupConfigModal";
+import { BackupTargetsCard } from "./backup/BackupTargetsCard";
 
 function statusBadge(record: BackupRecord) {
   return <Badge kind={statusBadgeKind(record.status)}>{deployStatusLabel(record.status)}</Badge>;
@@ -83,8 +85,6 @@ export default function BackupsPage() {
   const [deleting, setDeleting] = useState(false);
   const [runningConfigId, setRunningConfigId] = useState("");
   const [scheduleTime, setScheduleTime] = useState(settings.scheduledBackupTime);
-  // 设置保存串行化：连续修改时按顺序提交，避免在途请求用旧快照互相覆盖。
-  const scheduleQueue = useRef<Promise<void>>(Promise.resolve());
 
   // 配置 / 目标 / 设置可能被 CLI 改动，进入页面时拉取一次最新数据，避免展示与后端不一致。
   useEffect(() => {
@@ -121,15 +121,12 @@ export default function BackupsPage() {
 
   /** 定时备份设置即时保存（开关 / 时间 / 配置选择）。 */
   async function handleSaveSchedule(patch: Partial<Settings>) {
-    const run = scheduleQueue.current.then(async () => {
-      const current = useApp.getState().settings;
-      const saved = await api.saveSettings({ ...current, ...patch });
+    try {
+      const saved = await enqueueSettingsSave(async () =>
+        api.saveSettings({ ...useApp.getState().settings, ...patch }),
+      );
       setSettings(saved);
       toast("success", t("backup.schedule.saved"));
-    });
-    scheduleQueue.current = run.catch(() => undefined);
-    try {
-      await run;
     } catch (error) {
       toast("error", String(error));
     }
@@ -412,6 +409,8 @@ export default function BackupsPage() {
               )}
             </Card>
           </section>
+
+          <BackupTargetsCard />
         </div>
 
         <div className="flex min-w-0 flex-col gap-6">

@@ -5,7 +5,12 @@
     "windowTitle": "DeployCode - 分支部署工具"
   },
   "nav": {
-    "section": "导航",
+    "group": {
+      "release": "发布",
+      "servers": "服务器",
+      "scheduled": "备份与定时",
+      "local": "本机"
+    },
     "openRepo": "打开文件夹",
     "openRepoDialogTitle": "打开文件夹",
     "repos": "仓库",
@@ -543,8 +548,7 @@
       "legacy": "检测到旧版单连接串配置，将作为最低优先级兜底。",
       "legacyName": "旧版连接串",
       "convertLegacy": "转为备份目标",
-      "fullOverwrite": "全量覆盖：执行时清空目标 schema 后重新导入，并恢复默认角色授权",
-      "saveParams": "保存备份参数"
+      "fullOverwrite": "全量覆盖：执行时清空目标 schema 后重新导入，并恢复默认角色授权"
     },
     "cloudflare": {
       "title": "Cloudflare Pages",
@@ -573,7 +577,8 @@
       "title": "外观",
       "description": "界面主题与语言",
       "theme": "界面主题",
-      "language": "界面语言"
+      "language": "界面语言",
+      "save": "保存设置"
     },
     "automation": {
       "title": "启动与自动化",
@@ -605,9 +610,9 @@
       "failed": "关机请求下发失败：{{error}}",
       "missed": "计划 {{time}} 的关机已错过：电脑在倒计时期间睡眠或时钟跳动，为避免唤醒后突然关机，本次已放弃"
     },
-    "dataDir": {
-      "title": "数据目录",
-      "description": "配置、部署记录与临时文件存放位置",
+    "storage": {
+      "title": "数据目录与备份包",
+      "description": "配置、部署记录与临时文件的存放位置，以及没有被任何记录认领的备份包",
       "openDir": "打开目录"
     },
     "configBackup": {
@@ -657,7 +662,8 @@
     "orphanMore": "另有 {{count}} 个未列出",
     "orphanTotal": "共 {{count}} 个 · {{size}}",
     "orphanClean": "清理这些包",
-    "orphanCleaned": "已删除 {{count}} 个备份包，释放 {{size}}"
+    "orphanCleaned": "已删除 {{count}} 个备份包，释放 {{size}}",
+    "saveParams": "保存参数"
   },
   "deploy": {
     "toast": {

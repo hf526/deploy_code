@@ -5,7 +5,12 @@
     "windowTitle": "DeployCode - Branch Deploy Tool"
   },
   "nav": {
-    "section": "Navigation",
+    "group": {
+      "release": "Release",
+      "servers": "Servers",
+      "scheduled": "Backups & Scheduling",
+      "local": "Local"
+    },
     "openRepo": "Open Folder",
     "openRepoDialogTitle": "Open folder",
     "repos": "Repositories",
@@ -543,8 +548,7 @@
       "legacy": "Legacy single connection string detected; it will be used as the lowest-priority fallback.",
       "legacyName": "Legacy connection string",
       "convertLegacy": "Convert to Target",
-      "fullOverwrite": "Full overwrite: the target schema is cleared and re-imported, then default role grants are restored",
-      "saveParams": "Save Backup Settings"
+      "fullOverwrite": "Full overwrite: the target schema is cleared and re-imported, then default role grants are restored"
     },
     "cloudflare": {
       "title": "Cloudflare Pages",
@@ -573,7 +577,8 @@
       "title": "Appearance",
       "description": "Interface theme and language",
       "theme": "Interface theme",
-      "language": "Interface language"
+      "language": "Interface language",
+      "save": "Save Settings"
     },
     "automation": {
       "title": "Startup & Automation",
@@ -605,9 +610,9 @@
       "failed": "Failed to send the shutdown request: {{error}}",
       "missed": "Shutdown due at {{time}} was missed: the computer slept during the countdown. Skipped to avoid shutting down right after wake-up."
     },
-    "dataDir": {
-      "title": "Data Directory",
-      "description": "Where settings, deploy history and temporary files are stored",
+    "storage": {
+      "title": "Data Directory & Bundles",
+      "description": "Where settings, deploy history and temporary files live, plus backup bundles no record claims",
       "openDir": "Open Directory"
     },
     "configBackup": {
@@ -657,7 +662,8 @@
     "orphanMore": "{{count}} more not listed",
     "orphanTotal": "{{count}} bundles · {{size}}",
     "orphanClean": "Clean these bundles",
-    "orphanCleaned": "Deleted {{count}} bundles, freed {{size}}"
+    "orphanCleaned": "Deleted {{count}} bundles, freed {{size}}",
+    "saveParams": "Save Parameters"
   },
   "deploy": {
     "toast": {

@@ -23,6 +23,7 @@ import {
 } from "../components/ui";
 import { api } from "../lib/api";
 import { diskLevel, splitByLocation, stalenessHints, syncNeeded } from "../lib/agent";
+import { enqueueSettingsSave } from "../lib/settingsDraft";
 import { useApp } from "../lib/store";
 import { useAgentStaleness } from "../lib/useAgentStaleness";
 import type { AgentBinaryInfo, AgentStatus, AgentSyncReport } from "../lib/types";
@@ -220,7 +221,10 @@ export default function AgentPage() {
 
   async function handlePickServer(value: string) {
     try {
-      const saved = await api.saveSettings({ ...settings, agentServerId: value });
+      // 整表回写 + 全局一条车道：拿渲染作用域里的 settings 会把别的板块刚存的字段顶回去。
+      const saved = await enqueueSettingsSave(async () =>
+        api.saveSettings({ ...useApp.getState().settings, agentServerId: value }),
+      );
       setSettings(saved);
       setStatus(null);
       setReport(null);

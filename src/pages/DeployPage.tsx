@@ -50,6 +50,7 @@ import {
   statusBadgeKind,
 } from "../lib/utils";
 import { DeployConfigModal, type DeployPrefill } from "./deploy/DeployConfigModal";
+import { DeployDefaultsCard } from "./deploy/DeployDefaultsCard";
 import { PagesConfigModal } from "./deploy/PagesConfigModal";
 
 type EditingState =
@@ -640,6 +641,8 @@ export default function DeployPage() {
               </Card>
             )}
           </section>
+
+          <DeployDefaultsCard />
         </div>
 
         <div className="flex min-h-0 flex-col gap-5">

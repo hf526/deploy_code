@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { CalendarClock } from "lucide-react";
 
 import { Card, Checkbox, Field, Input, SectionTitle } from "../../components/ui";
 import { api } from "../../lib/api";
 import { stalenessHints } from "../../lib/agent";
+import { enqueueSettingsSave } from "../../lib/settingsDraft";
 import { useApp } from "../../lib/store";
 import type { Settings } from "../../lib/types";
 import { useAgentStaleness } from "../../lib/useAgentStaleness";
@@ -25,8 +26,6 @@ export function ContainerScheduleCard() {
 
   const [time, setTime] = useState(settings.scheduledContainerTime);
   useEffect(() => setTime(settings.scheduledContainerTime), [settings.scheduledContainerTime]);
-  // 设置保存串行化：连续修改时按顺序提交，避免在途请求用旧快照互相覆盖。
-  const saveQueue = useRef<Promise<void>>(Promise.resolve());
 
   /**
    * patch 用函数给出，取值时机是「轮到自己被提交」而不是「被点击」：
@@ -34,15 +33,13 @@ export function ContainerScheduleCard() {
    * 直接读渲染作用域会把前一个勾选吃掉。
    */
   async function save(build: (current: Settings) => Partial<Settings>) {
-    const run = saveQueue.current.then(async () => {
-      const current = useApp.getState().settings;
-      const saved = await api.saveSettings({ ...current, ...build(current) });
+    try {
+      const saved = await enqueueSettingsSave(async () => {
+        const current = useApp.getState().settings;
+        return api.saveSettings({ ...current, ...build(current) });
+      });
       setSettings(saved);
       toast("success", t("containers.schedule.saved"));
-    });
-    saveQueue.current = run.catch(() => undefined);
-    try {
-      await run;
     } catch (error) {
       toast("error", String(error));
     }
