@@ -942,6 +942,33 @@ pub fn is_sensitive_path(path: &str) -> bool {
         || name.ends_with(".secret")
 }
 
+/// 对一段人读文本里的**每一处** `scheme://…` 做凭据遮蔽。
+///
+/// git 失败的 stderr 与命令行参数都可能带着内嵌口令的远端 URL（`fatal: unable to access
+/// 'https://user:token@…'`），这条消息会进任务日志、记录与 CLI stderr；同一行里 URL 还可能
+/// 出现多次，不能只遮第一处。URL 的边界取空白与常见引用符，遮不到的尾巴维持原文。
+fn mask_remote_urls_in_text(text: &str) -> String {
+    const BOUNDARIES: &[char] = &[
+        ' ', '\t', '\n', '\r', '\'', '"', '(', ')', '[', ']', '<', '>', ',', ';',
+    ];
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(offset) = rest.find("://") {
+        // scheme 起点在 `://` 之前、上一个边界符之后；URL 终于其后的第一个边界符。
+        let head = &rest[..offset];
+        let scheme_start = head.rfind(BOUNDARIES).map_or(0, |i| i + 1);
+        let tail = &rest[offset + 3..];
+        let url_end = tail.find(BOUNDARIES).map_or(tail.len(), |i| i);
+        let segment_end = offset + 3 + url_end;
+        out.push_str(&rest[..scheme_start]);
+        out.push_str(&mask_remote_url(&rest[scheme_start..segment_end]));
+        // 非法形态遮不动也会前进（segment_end ≥ offset + 3），不会死循环。
+        rest = &rest[segment_end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 fn git_error(args: &[&str], out: &CommandOutput) -> String {
     let detail = out.combined();
     let detail = if detail.is_empty() { "无输出" } else { &detail };
@@ -951,7 +978,13 @@ fn git_error(args: &[&str], out: &CommandOutput) -> String {
     if detail.contains("not a git repository") {
         return "当前文件夹尚未绑定 Git 仓库，请先绑定远端仓库地址".to_string();
     }
-    format!("git {} 失败: {detail}", args.join(" "))
+    // 失败回显会进任务日志 / 记录 / CLI stderr：stderr 与参数都可能带着内嵌口令的 URL。
+    let args = args
+        .iter()
+        .map(|arg| mask_remote_url(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("git {args} 失败: {}", mask_remote_urls_in_text(detail))
 }
 
 #[cfg(test)]
@@ -991,6 +1024,25 @@ mod tests {
         );
         // 本地路径没有 scheme，不处理。
         assert_eq!(mask_remote_url("/srv/git/app.git"), "/srv/git/app.git");
+    }
+
+    #[test]
+    fn git_error_masks_credentials_in_args_and_every_stderr_url() {
+        // 真实形态：push 失败时 stderr 往往把带口令的 URL 原样报出来，还可能一行多个。
+        let out = CommandOutput {
+            code: 128,
+            stdout: String::new(),
+            stderr: "fatal: unable to access 'https://user:ghp_secret@github.com/acme/app/': The requested URL returned error: 403\r\nfatal: unable to reach 'https://user:ghp_secret@mirror.example/acme.git/': connect timeout".to_string(),
+        };
+        let msg = git_error(
+            &["push", "https://user:ghp_secret@github.com/acme/app.git", "main"],
+            &out,
+        );
+        // 参数与 stderr 里的每一处 URL 都要遮，token 一个字都不许剩。
+        assert!(msg.contains("git push https://user:***@github.com/acme/app.git main"), "{msg}");
+        assert!(msg.contains("https://user:***@github.com/acme/app/"), "{msg}");
+        assert!(msg.contains("https://user:***@mirror.example/acme.git/"), "{msg}");
+        assert!(!msg.contains("ghp_secret"), "{msg}");
     }
 
     fn empty_status() -> RepoStatus {
