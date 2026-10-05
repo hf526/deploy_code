@@ -70,11 +70,17 @@ impl AgentControl {
     ///
     /// 走 `exec_stream` 而不是 `exec_capture`：后者会把 stderr 行冠上 `[stderr]` 再拼进同一段
     /// 文本，那样就没法直接喂给 serde_json。
+    ///
+    /// `busy_on_3` 只对**执行 agent 二进制**的调用开（status / records / prune）：agent 把
+    /// `CoreError::Busy` 映射成退出码 3，必须还原成 busy，调用方才能按项目红线用 `matches!`
+    /// 分辨「稍后重试」与真失败。install 跑的是一段 shell 脚本，它以 `systemctl is-active
+    /// --quiet` 收尾——服务没起来时**脚本**也退出 3，但那不是 busy，绝不能混。
     async fn exec_json<T, F>(
         client: &SshClient,
         command: &str,
         timeout: u64,
         action: &str,
+        busy_on_3: bool,
         parse: F,
     ) -> Result<T>
     where
@@ -110,10 +116,7 @@ impl AgentControl {
                     detail.to_string()
                 }
             );
-            // 退出码 3 是 agent 说的「名额被占」（deploy-agent main.rs 把 Busy 映射成 3）。
-            // 必须还原成 CoreError::busy，调用方才能按项目红线用 matches! 分辨「稍后重试」与
-            // 真失败；压成 ssh 错就等于把这条红线改成了「读文案」。
-            return Err(if code == 3 {
+            return Err(if busy_on_3 && code == 3 {
                 CoreError::busy(message)
             } else {
                 CoreError::ssh(message)
@@ -186,6 +189,7 @@ impl AgentControl {
                 &command,
                 300,
                 "安装 agent",
+                false,
                 |text| parse_version(text).ok_or_else(|| "控制机没有打印版本行".to_string()),
             )
             .await?;
@@ -422,7 +426,7 @@ impl AgentControl {
     async fn status_via(&self, client: &SshClient) -> Result<AgentStatus> {
         let command = format!("{BIN_PATH} status --data-dir {DATA_DIR}");
         let mut status: AgentStatus =
-            Self::exec_json(client, &command, 90, "读取控制机状态", |text| {
+            Self::exec_json(client, &command, 90, "读取控制机状态", true, |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await?;
@@ -471,7 +475,7 @@ impl AgentControl {
                 "{BIN_PATH} records --data-dir {DATA_DIR} --kind backup --limit {limit}",
                 limit = limit.clamp(1, 1000)
             );
-            Self::exec_json(&client, &command, 90, "读取控制机备份记录", |text| {
+            Self::exec_json(&client, &command, 90, "读取控制机备份记录", true, |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await
@@ -493,7 +497,7 @@ impl AgentControl {
                 "{BIN_PATH} records --data-dir {DATA_DIR} --kind container --limit {limit}",
                 limit = limit.clamp(1, 1000)
             );
-            Self::exec_json(&client, &command, 90, "读取控制机容器备份记录", |text| {
+            Self::exec_json(&client, &command, 90, "读取控制机容器备份记录", true, |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await
@@ -510,7 +514,7 @@ impl AgentControl {
         let client = self.connect(server_id).await?;
         let result = async {
             let command = format!("{BIN_PATH} prune --list --data-dir {DATA_DIR}");
-            Self::exec_json(&client, &command, 90, "读取控制机未认领备份包", |text| {
+            Self::exec_json(&client, &command, 90, "读取控制机未认领备份包", true, |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await
@@ -529,7 +533,7 @@ impl AgentControl {
         let client = self.connect(server_id).await?;
         let result = async {
             let command = format!("{BIN_PATH} prune --data-dir {DATA_DIR}");
-            Self::exec_json(&client, &command, 120, "清理控制机未认领备份包", |text| {
+            Self::exec_json(&client, &command, 120, "清理控制机未认领备份包", true, |text| {
                 serde_json::from_str(text).map_err(|err| err.to_string())
             })
             .await
