@@ -1556,6 +1556,11 @@ DEPLOYCODE_LIST"));
         assert!(script.contains("EXPECTED=2"));
         // 恢复脚本的卷清单是三列：名字 / 短名 / 镜像（短名写回 compose 标签）。
         assert!(script.contains("blog_data\tdata\tpostgres:16"));
+        // 三份下发脚本同一条口径：信号的 handler 必须自带 exit，否则 cleanup 把 $RUN（含备份包）
+        // 删掉之后脚本接着往下跑，而 stage 5/6 根本不依赖 $RUN —— 空卷上把栈拉起来，本机却已经把
+        // 这次记成失败。这一份过去是三者里唯一还留着旧写法的（另两份由各自脚本的测试钉着）。
+        assert!(script.contains("trap 'cleanup; exit 1' INT TERM HUP"));
+        assert!(!script.contains("trap cleanup EXIT INT TERM"));
     }
 
     /// 来源服务器上的文件名属于外部输入：整行等于 here-doc 终止符的条目必须丢掉。

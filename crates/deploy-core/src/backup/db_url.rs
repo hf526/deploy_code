@@ -38,8 +38,20 @@ fn locate_authority(rest: &str, assume_late_at_is_userinfo: bool) -> (usize, Opt
     }
 
     let query_limit = rest.find(['?', '#']).unwrap_or(rest.len());
+    // 脱敏这一路搜 `@` 的右界不能直接用第一个 `?`/`#`：口令里就带这两个字符时（生成器给的强口令
+    // 很常见，而这里没有任何东西要求用户先编码），第一个 `?` 是口令的一部分，真正的 `@` 和口令尾部
+    // 会被关在搜索区之外，于是整串一条不遮地原样返回 —— 而这份串落进 BackupRecord.target 与 CLI 的
+    // JSON 输出。按 RFC 3986，`?`/`#` 只有在路径开始（第一个 `/`）之后才当查询/片段分界；一条 `/`
+    // 都没有时（`host:5432?x=1` 这种）它确实是分界，照旧用 query_limit。
+    let mask_limit = match rest.find('/') {
+        Some(slash) => rest[slash..]
+            .find(['?', '#'])
+            .map(|offset| slash + offset)
+            .unwrap_or(rest.len()),
+        None => query_limit,
+    };
     let late = if assume_late_at_is_userinfo {
-        rest[..query_limit].rfind('@')
+        rest[..mask_limit].rfind('@')
     } else {
         rest[first_sep..query_limit]
             .find('@')
@@ -285,6 +297,26 @@ mod tests {
             "postgresql://host/db?user=a@b&password=***"
         );
         assert_eq!(mask_database_url("not-a-url"), "not-a-url");
+    }
+
+    /// 口令里带未编码的 `?` / `#` 是最容易被漏掉的一类：这两个字符正是查询与片段的分界，
+    /// 拿「第一个 `?`/`#`」当分界去搜 `@`，真正的 `@` 就落在搜索区之外，于是整串一条不遮地
+    /// 原样返回 —— 而这份串会进 `BackupRecord.target`（落 backups.json）与 CLI 的 JSON 输出。
+    #[test]
+    fn mask_covers_passwords_holding_query_or_fragment_delimiters() {
+        assert_eq!(
+            mask_database_url("postgresql://user:p?ss@host:5432/db"),
+            "postgresql://user:***@host:5432/db"
+        );
+        assert_eq!(
+            mask_database_url("postgresql://user:p#ss@host:5432/db"),
+            "postgresql://user:***@host:5432/db"
+        );
+        // 没有路径那一段时，`?` 确实是查询分界：查询里的 `@` 不许当成 userinfo（口径同上）。
+        assert_eq!(
+            mask_database_url("postgresql://host:5432?password=sec@ret"),
+            "postgresql://host:5432?password=***"
+        );
     }
 
     #[test]

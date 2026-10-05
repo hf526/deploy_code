@@ -127,8 +127,13 @@ export function maskUrlPassword(url: string): string {
   const prefix = url.slice(0, schemeEnd + 3);
   const rest = url.slice(schemeEnd + 3);
   // 只在查询 / 片段之前找最后一个 '@'，查询参数里的 '@' 不能当作 host 分界。
-  const queryLimit = firstIndexOf(rest, ["?", "#"]);
-  const limit = queryLimit < 0 ? rest.length : queryLimit;
+  // 但这个分界必须是「路径开始之后」的第一个 '?'/'#'：口令里就带这两个字符时（生成器给的强口令
+  // 很常见，没有任何东西要求用户先编码），第一个 '?' 是口令的一部分，按它截断会把真正的 '@' 连同
+  // 口令尾部一起关在搜索区之外，整串一条不遮地原样返回。一条 '/' 都没有时它确实是分界，照旧用。
+  // 与 Rust 侧 backup/db_url.rs::locate_authority 同一口径。
+  const slash = rest.indexOf("/");
+  const delimiter = firstIndexOf(slash < 0 ? rest : rest.slice(slash), ["?", "#"]);
+  const limit = delimiter < 0 ? rest.length : delimiter + (slash < 0 ? 0 : slash);
   const at = rest.slice(0, limit).lastIndexOf("@");
   let authorityEnd: number;
   let authority: string;

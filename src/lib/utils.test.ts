@@ -79,6 +79,19 @@ describe("maskUrlPassword", () => {
     );
   });
 
+  it("口令含未编码的 ? 或 # 时仍然遮蔽（与 Rust 侧同一组用例）", () => {
+    expect(maskUrlPassword("postgresql://user:p?ss@host:5432/db")).toBe(
+      "postgresql://user:***@host:5432/db",
+    );
+    expect(maskUrlPassword("postgresql://user:p#ss@host:5432/db")).toBe(
+      "postgresql://user:***@host:5432/db",
+    );
+    // 没有路径那一段时 '?' 确实是查询分界：查询里的 '@' 不许当成 userinfo。
+    expect(maskUrlPassword("postgresql://host:5432?password=sec@ret")).toBe(
+      "postgresql://host:5432?password=***",
+    );
+  });
+
   it("无 scheme 时原样返回", () => {
     expect(maskUrlPassword("not-a-url")).toBe("not-a-url");
   });

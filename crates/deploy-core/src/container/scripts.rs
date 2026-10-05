@@ -220,7 +220,14 @@ cleanup() {
   rm -rf "$RUN"
   rm -f "$PID_FILE" "$SCRIPT"
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+# 信号那一路必须带着 exit，口径与上面的快照脚本、backup/scripts.rs 的备份脚本一致：handler 不含
+# exit 时 bash 跑完 cleanup 会接着往下执行（见 backup/scripts.rs 里那段本机实测记录），而到这一步
+# $RUN 连备份包都已删掉，后面的 docker volume create / cp -a / compose up -d 照跑。其中 stage 5、6
+# 根本不依赖 $RUN，所以这一句挡的是「数据源已被自己删掉，却仍把项目拉起来」——起出来的是拿着空卷
+# 的栈，而本机早就把这次记成失败或已取消，没人会去查那台机器上实际起了什么。
+# HUP 也要接：任务被 abort 时本地会话先没，远端脚本收到的是 SIGHUP 而不是 TERM。
+trap 'cleanup; exit 1' INT TERM HUP
 
 compose() {
   if [ "$COMPOSE_V2" = "1" ]; then docker compose "$@"; else docker-compose "$@"; fi
