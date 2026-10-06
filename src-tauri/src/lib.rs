@@ -22,15 +22,6 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             let store = Store::default_store()?;
-            // 安装包内置的 agent 二进制：资源目录跟着安装位置走，只有壳问得到，
-            // 所以在这里登记给 core（`deploy-core` 不许依赖 tauri）。没内置就是旧安装包，
-            // core 会退回 `<数据目录>/agent/`，两处都没有时点安装会明确报错。
-            if let Ok(dir) = app.path().resource_dir() {
-                let bundled = dir.join("agent").join("deploy-agent");
-                if bundled.is_file() {
-                    store.set_bundled_agent_binary(bundled);
-                }
-            }
             // 上次异常退出遗留的 Running 记录在此收敛为失败（有其他进程正在跑任务时跳过）。
             let _ = store.reconcile_interrupted();
             // 旧版「服务器单份 db_backup」升级为备份配置列表。
@@ -78,21 +69,6 @@ pub fn run() {
             commands::app::reveal_path,
             commands::app::get_autostart,
             commands::app::set_autostart,
-            commands::agent::agent_binary_info,
-            commands::agent::install_agent,
-            commands::agent::uninstall_agent,
-            commands::agent::agent_status,
-            commands::agent::agent_sync,
-            commands::agent::agent_orphans,
-            commands::agent::agent_staleness,
-            commands::agent::agent_logs,
-            commands::agent::agent_backup_records,
-            commands::agent::agent_container_records,
-            commands::agent::agent_prune_list,
-            commands::agent::agent_prune,
-            commands::agent::start_agent_backup,
-            commands::agent::start_agent_container,
-            commands::agent::restore_agent_container,
             commands::shutdown::get_shutdown_status,
             commands::shutdown::schedule_shutdown,
             commands::shutdown::cancel_shutdown,

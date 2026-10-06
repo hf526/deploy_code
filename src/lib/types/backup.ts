@@ -1,4 +1,4 @@
-import type { DeployStatus, LiveTask, LogLevel, RunLocation } from "./common";
+import type { DeployStatus, LiveTask, LogLevel } from "./common";
 
 export interface DbBackupSource {
   mode: "docker" | "system";
@@ -22,8 +22,6 @@ export interface BackupConfig {
   source: DbBackupSource;
   targetId: string | null;
   supabaseUrl: string | null;
-  /** 执行位：本机定时，或交给控制机上的 agent（对应 Rust 的 RunLocation）。 */
-  runLocation: RunLocation;
 }
 
 export interface BackupRecord {

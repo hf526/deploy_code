@@ -76,7 +76,6 @@ export const defaultSettings: Settings = {
   scheduledContainerTime: "03:30",
   scheduledContainerConfigIds: [],
   scheduledContainerLastRun: "",
-  agentServerId: "",
 };
 
 let toastSeq = 0;
@@ -181,8 +180,8 @@ async function launchContainer(start: () => Promise<string>): Promise<string> {
     useApp.setState((state) => {
       const live = state.liveContainer;
       // 一条事件都没到过 = 压根没跑起来，收回占位让界面恢复可点。
-      // 已经跑过再断不能抹面板：控制机那条路是整条流跑完才 resolve，中途断线会把用户
-      // 正在看的日志一起清掉，而本机失败是走事件收尾的、不抹 —— 两边口径要一致。
+      // 已经跑过再断不能抹面板：中途断线会把用户正在看的日志一起清掉，
+      // 而本机失败是走事件收尾的、不抹 —— 两边口径要一致。
       return live && live.lines.length > 0
         ? {
             liveContainer: {
@@ -497,7 +496,13 @@ export const useApp = create<AppStore>((set, get) => ({
       // 一台一条记录，recordId 交给各自的 started 事件补齐，这里不回写。
       return await api.deployConfigTargets(configId, serverIds);
     } catch (error) {
-      set({ live: null });
+      // 事件可能先于命令错误到达（首台 prepare 失败会先发一行错误日志）：跑过就别抹面板，
+      // 只把状态收成失败；一条日志都没有才清空，避免留下空的 running 状态把部署功能锁死。
+      set((state) =>
+        state.live && state.live.lines.length > 0
+          ? { live: { ...state.live, status: "failed", progress: 100 } }
+          : { live: null },
+      );
       get().toast("error", String(error));
       throw error;
     }
@@ -515,7 +520,12 @@ export const useApp = create<AppStore>((set, get) => ({
       set((state) => (state.live ? { live: { ...state.live, recordId: newId } } : {}));
       return newId;
     } catch (error) {
-      set({ live: null });
+      // 与批量部署同一口径：中途才失败时日志留着，只在一条都没跑起来时清空。
+      set((state) =>
+        state.live && state.live.lines.length > 0
+          ? { live: { ...state.live, status: "failed", progress: 100 } }
+          : { live: null },
+      );
       get().toast("error", String(error));
       throw error;
     }
@@ -585,15 +595,7 @@ export const useApp = create<AppStore>((set, get) => ({
       liveBackup: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
     });
     try {
-      // 执行位在控制机的配置交给控制机执行：本机跑会把包和记录落在本机，
-      // 而后端 start_backup 也已拒掉这种走法 —— 两条路不能分叉。
-      const saved = request.backupConfigId
-        ? get().backupConfigs.find((item) => item.id === request.backupConfigId)
-        : undefined;
-      const recordId =
-        saved?.runLocation === "remote"
-          ? await api.startAgentBackup(saved.id)
-          : await api.startBackup(request);
+      const recordId = await api.startBackup(request);
       set((state) =>
         state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
       );
@@ -688,13 +690,8 @@ export const useApp = create<AppStore>((set, get) => ({
 
   restoreContainerBundle: (request) => launchContainer(() => api.restoreContainerBundle(request)),
 
-  startContainerConfigBackup: (configId) => {
-    // 同 startBackup：执行位在控制机的配置由控制机出面跑，事件仍走 container://event。
-    const saved = get().containerConfigs.find((item) => item.id === configId);
-    return saved?.runLocation === "remote"
-      ? launchContainer(() => api.startAgentContainer(saved.id))
-      : launchContainer(() => api.startContainerConfigBackup(configId));
-  },
+  startContainerConfigBackup: (configId) =>
+    launchContainer(() => api.startContainerConfigBackup(configId)),
 
   cancelContainer: async () => {
     const { liveContainer, containerRecords } = get();

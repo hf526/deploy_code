@@ -9,8 +9,6 @@ vi.mock("./api", () => ({
     restoreContainerBundle: vi.fn(async () => "c2"),
     startContainerConfigBackup: vi.fn(async () => "c3"),
     startBackup: vi.fn(async () => "db-1"),
-    startAgentBackup: vi.fn(async () => "ag-1"),
-    startAgentContainer: vi.fn(async () => "ag-2"),
     listHistory: vi.fn(async () => []),
     listBackups: vi.fn(async () => []),
     listPagesRecords: vi.fn(async () => []),
@@ -19,14 +17,7 @@ vi.mock("./api", () => ({
 vi.mock("./i18n", () => ({ default: { t: (key: string) => key } }));
 
 import { api } from "./api";
-import type {
-  BackupConfig,
-  ContainerConfig,
-  ContainerRequest,
-  DbBackupSource,
-  PagesDeployRecord,
-  RunLocation,
-} from "./types";
+import type { ContainerRequest, PagesDeployRecord } from "./types";
 import { useApp } from "./store";
 
 // toast 内部用 window.setTimeout 自动消失；node 环境用桩即可。
@@ -218,83 +209,15 @@ describe("store 长任务接线", () => {
   });
 });
 
-const dbSource: DbBackupSource = {
-  mode: "docker",
-  container: "pg",
-  database: "app",
-  username: "u",
-  password: "p",
-  schema: "public",
-};
-
-function backupConfig(id: string, runLocation: RunLocation): BackupConfig {
-  return {
-    id,
-    name: id,
-    serverId: "s1",
-    source: dbSource,
-    targetId: null,
-    supabaseUrl: null,
-    runLocation,
-  };
-}
-
-function containerConfig(id: string, runLocation: RunLocation): ContainerConfig {
-  return {
-    id,
-    name: id,
-    serverId: "s1",
-    project: "lf-blog",
-    pauseSource: false,
-    includeVolumes: true,
-    includeImages: false,
-    target: null,
-    createdAt: "",
-    runLocation,
-  };
-}
-
-// 「立即备份」不能看在哪台机器上跑：执行位在控制机的配置一旦在本机跑，包和记录就落在本机，
-// 而后端 start_backup 也已经拒掉这种走法 —— 前端必须把它交给控制机。
-describe("store 按执行位分流手动发起", () => {
-  it("执行位在控制机的备份配置交给控制机执行", async () => {
-    useApp.setState({ backupConfigs: [backupConfig("b1", "remote")] });
-    const id = await useApp.getState().startBackup({ serverId: "s1", backupConfigId: "b1" });
-    expect(api.startAgentBackup).toHaveBeenCalledWith("b1");
-    expect(api.startBackup).not.toHaveBeenCalled();
-    expect(id).toBe("ag-1");
-  });
-
-  it("执行位是本机的备份配置仍走本机命令", async () => {
-    useApp.setState({ backupConfigs: [backupConfig("b2", "local")] });
-    await useApp.getState().startBackup({ serverId: "s1", backupConfigId: "b2" });
-    expect(api.startBackup).toHaveBeenCalled();
-    expect(api.startAgentBackup).not.toHaveBeenCalled();
-  });
-
-  it("控制机的容器配置交给 startAgentContainer", async () => {
-    useApp.setState({ containerConfigs: [containerConfig("cc1", "remote")] });
-    await useApp.getState().startContainerConfigBackup("cc1");
-    expect(api.startAgentContainer).toHaveBeenCalledWith("cc1");
-    expect(api.startContainerConfigBackup).not.toHaveBeenCalled();
-  });
-
-  it("找不到对应配置时不猜执行位，按本机命令交给后端判", async () => {
-    useApp.setState({ containerConfigs: [] });
-    await useApp.getState().startContainerConfigBackup("unknown");
-    expect(api.startContainerConfigBackup).toHaveBeenCalledWith("unknown");
-    expect(api.startAgentContainer).not.toHaveBeenCalled();
-  });
-
-  // 控制机那条路是整条流跑完才 resolve：中途断线如果照旧收回占位，用户正在看的日志就没了。
-  it("远端备份中途断线时保留已看到的日志，只把状态收成失败", async () => {
-    useApp.setState({ backupConfigs: [backupConfig("b1", "remote")] });
-    vi.mocked(api.startAgentBackup).mockImplementationOnce(async () => {
+// 发起后中途断线不能抹掉已经出现的日志面板：本机失败是走事件收尾的、不抹，两边口径要一致。
+describe("store 长任务发起失败时的面板收敛", () => {
+  it("备份中途断线时保留已看到的日志，只把状态收成失败", async () => {
+    vi.mocked(api.startBackup).mockImplementationOnce(async () => {
       useApp.getState().handleBackupEvent({ type: "log", level: "info", message: "正在下载导出包" });
       throw new Error("SSH 通道已关闭");
     });
     await expect(
-      useApp.getState().startBackup({ serverId: "s1", backupConfigId: "b1" }),
+      useApp.getState().startBackup({ serverId: "s1" }),
     ).rejects.toThrow();
     const live = useApp.getState().liveBackup;
     expect(live?.status).toBe("failed");
@@ -304,16 +227,16 @@ describe("store 按执行位分流手动发起", () => {
     ]);
   });
 
-  it("远端容器任务断线后界面恢复可点：状态不是 running", async () => {
-    useApp.setState({ containerConfigs: [containerConfig("cc1", "remote")] });
-    vi.mocked(api.startAgentContainer).mockImplementationOnce(async () => {
+  it("容器任务断线后界面恢复可点：保留日志但状态不是 running", async () => {
+    vi.mocked(api.startContainerConfigBackup).mockImplementationOnce(async () => {
       useApp
         .getState()
         .handleContainerEvent({ type: "log", level: "info", message: "正在打包卷" });
-      throw new Error("远端任务异常结束");
+      throw new Error("任务异常结束");
     });
     await expect(useApp.getState().startContainerConfigBackup("cc1")).rejects.toThrow();
     expect(useApp.getState().liveContainer?.status).toBe("failed");
+
     // 没跑起来的那次仍然要把占位收回去，否则界面永远点不动。
     vi.mocked(api.startContainerConfigBackup).mockRejectedValueOnce(new Error("已有容器任务"));
     await expect(useApp.getState().startContainerConfigBackup("other")).rejects.toThrow();

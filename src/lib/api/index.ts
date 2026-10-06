@@ -9,7 +9,6 @@ import { backupCommands } from "./backup";
 import { pagesCommands } from "./pages";
 import { cronjobCommands } from "./cronjob";
 import { containerCommands } from "./container";
-import { agentCommands } from "./agent";
 
 /** 后端 Tauri 命令的类型化封装。 */
 export const api = {
@@ -24,5 +23,4 @@ export const api = {
   ...pagesCommands,
   ...cronjobCommands,
   ...containerCommands,
-  ...agentCommands,
 };

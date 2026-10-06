@@ -41,6 +41,4 @@ export interface Settings {
   scheduledContainerTime: string;
   scheduledContainerConfigIds: string[];
   scheduledContainerLastRun: string;
-  /** 控制机（跑备份 agent 的那台服务器）的 id；空表示未启用。 */
-  agentServerId: string;
 }

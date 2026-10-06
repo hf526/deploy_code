@@ -58,9 +58,6 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
 
 #[tauri::command(async)]
 pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
-    // 删的正是控制机：先按「卸载 agent」那一套把执行位收回本机。漏了这一步，留下的就是
-    // 「配置写着控制机、控制机已经不在了」——定时循环照旧让位，本机又撒手，那一晚两头都不跑。
-    state.store.forget_agent_server(&server_id)?;
     let servers = state.store.mutate_config(|config| {
         config.servers.retain(|server| server.id != server_id);
         // 服务器已删除，其备份配置不再可用（备份记录保留作历史）。

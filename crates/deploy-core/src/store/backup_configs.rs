@@ -3,7 +3,7 @@
 use super::Store;
 use crate::error::{CoreError, Result};
 use crate::models::{
-    new_id, AppConfig, BackupConfig, BackupTarget, RepoConfig, RunLocation, ServerConfig,
+    new_id, AppConfig, BackupConfig, BackupTarget, RepoConfig, ServerConfig,
 };
 
 impl Store {
@@ -261,13 +261,6 @@ impl Store {
                     source,
                     target_id,
                     supabase_url,
-                    // 已经指定了控制机：旧行为本来就是「定时在本机跑、包落本机」，但用户装
-                    // agent 的目的就是把这件事搬走，所以迁移过来的配置默认交给控制机。
-                    run_location: if config.settings.agent_server_id.trim().is_empty() {
-                        RunLocation::Local
-                    } else {
-                        RunLocation::Remote
-                    },
                 });
             }
             let created = additions.len();

@@ -158,9 +158,6 @@ pub fn start_container_config_backup(
     let request = {
         let config = state.store.load_config()?;
         let saved = Store::find_container_config(&config, &config_id)?;
-        // 与定时循环同一个口径：执行位在控制机的配置本机不代跑，
-        // 界面的「立即备份」会把它交给 start_agent_container。
-        saved.run_location.assert_runs_here(&saved.name)?;
         saved.request()
     };
     start_container_transfer(app, state, request)
@@ -245,6 +242,9 @@ pub async fn cancel_container(
             record.finished_at = Some(deploy_core::models::now_string());
             record.duration_ms = deploy_core::models::elapsed_ms_since(&record.started_at);
             record.log = format!("{}[已取消] 用户停止了本次任务\n", record.log);
+            // 取消是整条 future 被 drop，引擎收尾那句清理轮不到跑：计划路径没有落地文件就抹空，
+            // 否则列表会留下点了才报错的「恢复」入口，轮转也会误占一个保留席位。
+            deploy_core::container::clear_missing_bundle_path(&mut record);
             let limit = state
                 .store
                 .load_config()
@@ -255,8 +255,8 @@ pub async fn cancel_container(
         let _ = app.emit("container://event", ContainerEvent::Finished { record });
         return Ok("已取消".to_string());
     }
-    // 本机没有这条记录 = 这是在控制机上跑的那类任务：记录与收尾都归它，
-    // 但界面的 live 状态必须收敛，否则进度条永远停在「进行中」。
+    // 记录已经不在盘上了（任务恰好在 take 与写入之间收尾）：界面的 live 状态必须收敛，
+    // 否则进度条永远停在「进行中」。
     let _ = app.emit("container://event", ContainerEvent::Finished {
         record: ContainerRecord::stopped(&record_id),
     });

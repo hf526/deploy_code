@@ -9,37 +9,6 @@ pub enum DeployStatus {
     Failed,
 }
 
-/// 备份任务在哪里被调度与执行。
-///
-/// `Local` 是改动前的行为：定时循环跑在装客户端的这台机器上，备份包也落本机。
-/// `Remote` 表示这条配置交给控制机上的 agent：由它到点执行、把包留在控制机，
-/// 本机只在需要时发起一次执行并回读记录。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum RunLocation {
-    #[default]
-    Local,
-    Remote,
-}
-
-impl RunLocation {
-    pub fn is_remote(self) -> bool {
-        self == Self::Remote
-    }
-
-    /// 挡住「在本机跑一条交给控制机的配置」：包和记录都会落在本机，而用户以为在控制机上，
-    /// 恢复与迁移就找不到东西。定时循环早就是这个口径（scheduler 的 `BackupOwner::Unsynced`），
-    /// 手动入口与 CLI 不能绕过它 —— 要执行请让控制机出面。
-    pub fn assert_runs_here(self, name: &str) -> crate::error::Result<()> {
-        if self.is_remote() {
-            return Err(crate::error::CoreError::config(format!(
-                "「{name}」的执行位是控制机，本机不代跑。请到控制机页面执行这条配置，或把执行位改回本机"
-            )));
-        }
-        Ok(())
-    }
-}
-
 /// SSH 认证方式。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
@@ -133,9 +102,6 @@ pub struct BackupConfig {
     /// 该配置直接指定的目标连接串（优先级高于 target_id）。
     #[serde(default)]
     pub supabase_url: Option<String>,
-    /// 执行位：本机定时，或交给控制机上的 agent。
-    #[serde(default)]
-    pub run_location: RunLocation,
 }
 
 impl BackupConfig {
@@ -147,7 +113,6 @@ impl BackupConfig {
             source,
             target_id: None,
             supabase_url: None,
-            run_location: RunLocation::default(),
         }
     }
 }
@@ -922,9 +887,6 @@ pub struct ContainerConfig {
     pub target: Option<ContainerTarget>,
     #[serde(default)]
     pub created_at: String,
-    /// 执行位：本机定时，或交给控制机上的 agent（备份包留在控制机）。
-    #[serde(default)]
-    pub run_location: RunLocation,
 }
 
 impl ContainerConfig {
@@ -993,11 +955,7 @@ pub enum ContainerEvent {
 }
 
 impl ContainerRecord {
-    /// 控制机上被停止的任务：本机没有这条记录，但界面的收尾必须有记录可给。
-    ///
-    /// 远端发起的容器任务由控制机执行，用户点「停止」时本机只是关掉那条 SSH 通道，
-    /// 收尾（删远端工作目录与包）由 agent 自己做完 —— 本机盘上从来没有过这条记录，
-    /// 所以这里按已知事实拼一条最小的：id、状态、取消原因。
+    /// 收尾时必须能拿出记录：本机盘上从来没有过这条记录时，按已知事实拼一条最小的（id、状态、取消原因）。
     pub fn stopped(record_id: &str) -> Self {
         Self {
             id: record_id.to_string(),
@@ -1017,7 +975,7 @@ impl ContainerRecord {
             include_images: true,
             status: DeployStatus::Failed,
             error: Some("任务已取消".to_string()),
-            log: "[已取消] 用户停止了本次任务（控制机侧收尾由其自行完成）".to_string(),
+            log: "[已取消] 用户停止了本次任务".to_string(),
             started_at: now_string(),
             finished_at: Some(now_string()),
             duration_ms: 0,
@@ -1082,8 +1040,7 @@ pub struct Settings {
     #[serde(default = "default_container_bundle_keep")]
     pub container_bundle_keep: usize,
     /// 同一个（服务器 + 库 + schema）在本机保留几个数据库导出包，0 表示不留
-    /// （= 改动前的行为：远端导出跑完就删，本机不落盘，也就完全不占本机磁盘）。
-    /// 控制机上的 agent 不吃这个 0：那边不留包就没有可恢复的产物，见 `agent::AGENT_DB_BUNDLE_KEEP`。
+    /// （= 旧行为：远端导出跑完就删，本机不落盘，也就完全不占本机磁盘）。
     #[serde(default = "default_db_bundle_keep")]
     pub db_bundle_keep: usize,
     /// 界面语言偏好（空字符串表示跟随系统）。
@@ -1106,8 +1063,7 @@ pub struct Settings {
     pub scheduled_backup_config_id: Option<String>,
     /// 定时备份已发起的调度日期（YYYY-MM-DD，空表示从未）。记录的是「成功启动了一次任务」，
     /// 不是「备份已完成」——与循环里的旧局部变量同义。
-    /// 之所以要落盘：进程重启后若忘了它，同一个时间点会再触发一次（控制机上的 agent 由
-    /// systemd 拉起重启，重复触发会留下两个同日的包）。
+    /// 之所以要落盘：进程重启后若忘了它，同一个时间点会再触发一次。
     #[serde(default)]
     pub scheduled_backup_last_run: String,
     /// 定时关机开关：应用运行期间（含托盘后台）每天到点让本机关机。
@@ -1135,9 +1091,6 @@ pub struct Settings {
     /// 容器是「排下队列就记」，即使当晚一个都没跑成也不在同一天重复排队。
     #[serde(default)]
     pub scheduled_container_last_run: String,
-    /// 控制机（跑了备份 agent 的那台服务器）的服务器 id；空表示未启用。
-    #[serde(default)]
-    pub agent_server_id: String,
 }
 
 fn default_scheduled_container_time() -> String {
@@ -1184,7 +1137,7 @@ fn default_container_bundle_keep() -> usize {
 
 /// 数据库导出包默认**不**留在本机：这是新增能力，默认开着等于给全体老用户改变行为
 /// （每次备份都往 `%APPDATA%` 拖一个 GB 级的包，而设置页没有这一项的开关）。
-/// 想要留包的人显式设成正数；下发给控制机时由 `agent::AGENT_DB_BUNDLE_KEEP` 兜住份数。
+/// 想要留包的人显式设成正数。
 fn default_db_bundle_keep() -> usize {
     0
 }
@@ -1226,7 +1179,6 @@ impl Default for Settings {
             scheduled_container_time: default_scheduled_container_time(),
             scheduled_container_config_ids: Vec::new(),
             scheduled_container_last_run: String::new(),
-            agent_server_id: String::new(),
         }
     }
 }
@@ -1374,17 +1326,9 @@ impl ExportData {
         for backup in &mut backup_configs {
             backup.source.password = String::new();
             backup.supabase_url = None;
-            // 执行位是「这台机器把这活儿交给了那台机器」的本机接线，跟着导出过去就是死局：
-            // 新机没有 agent-sync.json，定时循环天天报「未下发」而本机又撒手，一次都不备份。
-            // 同一台机器重新导入自己时，导入侧会把本机的执行位换回来（`store::keep_remote_location`），
-            // 这里抹的只给新机看。
-            backup.run_location = RunLocation::Local;
         }
 
-        let mut container_configs = config.container_configs.clone();
-        for item in &mut container_configs {
-            item.run_location = RunLocation::Local;
-        }
+        let container_configs = config.container_configs.clone();
 
         let mut settings = config.settings.clone();
         settings.cloudflare_api_token = String::new();
@@ -1397,8 +1341,6 @@ impl ExportData {
         settings.supabase_url = String::new();
         // 主密码哈希等价于主密码的可离线破解替身，导出的配置用不上它。
         settings.master_password_hash = None;
-        // 控制机指向同属本机接线：换台机器就得重新指定，留着只会指向一台不存在 agent 的服务器。
-        settings.agent_server_id = String::new();
 
         Self {
             version: "1.0".to_string(),
@@ -1418,17 +1360,6 @@ impl ExportData {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// 「本机不代跑控制机的配置」是定时循环与手动入口共用的口径：谁绕过去，包就落错机器。
-    #[test]
-    fn remote_run_location_refuses_local_execution() {
-        assert!(RunLocation::Local.assert_runs_here("夜间库").is_ok());
-
-        let err = RunLocation::Remote.assert_runs_here("夜间库").unwrap_err();
-        // 报错要点名是哪条配置，列表里几十条时才知道该改哪一条。
-        assert!(matches!(err, crate::error::CoreError::Config(_)), "实际: {err:?}");
-        assert!(err.to_string().contains("夜间库"));
-    }
 
     /// 旧 config.json 里部署配置只有一台服务器，读入后要变成单元素列表而不是报错。
     #[test]
@@ -1630,42 +1561,6 @@ mod tests {
 
         // 命中旧根靠大小写折叠，改写后的文件段落保留原来的大小写。
         assert_eq!(repo.env_files[0].local_path, r"E:\Code\New\Docker\.env");
-    }
-
-    /// 控制机指向与执行位是「这台机器把活儿交给了那台机器」的本机接线，不能跟着配置走。
-    #[test]
-    fn export_leaves_the_agent_wiring_behind() {
-        let mut config = AppConfig::default();
-        config.settings.agent_server_id = "s-agent".to_string();
-
-        let mut backup = BackupConfig::new(
-            "每晚".to_string(),
-            "s1".to_string(),
-            DbBackupSource::default(),
-        );
-        backup.run_location = RunLocation::Remote;
-        config.backup_configs.push(backup);
-
-        config.container_configs.push(ContainerConfig {
-            id: "c1".to_string(),
-            name: "站点".to_string(),
-            server_id: "s1".to_string(),
-            project: "blog".to_string(),
-            pause_source: false,
-            include_volumes: true,
-            include_images: true,
-            target: None,
-            created_at: String::new(),
-            run_location: RunLocation::Remote,
-        });
-
-        let export = ExportData::new(&config);
-        assert_eq!(export.settings.agent_server_id, "");
-        assert_eq!(export.backup_configs[0].run_location, RunLocation::Local);
-        assert_eq!(
-            export.container_configs[0].run_location,
-            RunLocation::Local
-        );
     }
 
     #[test]

@@ -426,13 +426,13 @@ if command -v fail2ban-client >/dev/null 2>&1; then
   $SUDO fail2ban-client banned 2>/dev/null | grep -qwF "$IP" && still=1
 fi
 if command -v ufw >/dev/null 2>&1; then
-  $SUDO ufw status 2>/dev/null | grep -qwF "$IP" && still=1
+  $SUDO ufw status 2>/dev/null | grep -Ei 'DENY|REJECT' | grep -qwF "$IP" && still=1
 fi
 if command -v firewall-cmd >/dev/null 2>&1; then
   $SUDO firewall-cmd --list-rich-rules 2>/dev/null | grep -i drop | grep -qwF "$IP" && still=1
 fi
 if command -v "$BIN" >/dev/null 2>&1; then
-  $SUDO $BIN -S INPUT 2>/dev/null | grep -qwF "$IP" && still=1
+  $SUDO $BIN -S INPUT 2>/dev/null | grep -Ei 'DROP|REJECT' | grep -qwF "$IP" && still=1
 fi
 if [ "$still" != "0" ]; then
   echo "解除失败：IP 仍在拦截列表中（权限不足或规则来源未知）" >&2
@@ -1098,6 +1098,16 @@ mod tests {
         // 复核同样只认 drop 富规则：accept 里出现同一个地址不等于还在被封。
         assert!(
             script.contains("--list-rich-rules 2>/dev/null | grep -i drop | grep -qwF"),
+            "{script}"
+        );
+        // ufw 的 ALLOW / iptables 的 ACCEPT 里出现同一个地址也不等于还封着：
+        // 少了这层过滤，被放行过的 IP 会永远停在「解除失败」。
+        assert!(
+            script.contains("grep -Ei 'DENY|REJECT' | grep -qwF \"$IP\""),
+            "{script}"
+        );
+        assert!(
+            script.contains("grep -Ei 'DROP|REJECT' | grep -qwF \"$IP\""),
             "{script}"
         );
     }

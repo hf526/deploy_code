@@ -70,15 +70,21 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
       return;
     }
     if (event.type === "log") {
+      const recordId = findRunningId();
+      // 没有正在跑的任务可挂靠（命令已经失败、这次批次连记录都没写）：忽略。
+      // 硬要补建，就会造出一个 recordId 为空、再也不会收到事件的 running 状态，界面永久卡在「进行中」。
+      if (!recordId) return;
       setLive({
-        ...runningTask(findRunningId()),
+        ...runningTask(recordId),
         lines: [{ level: event.level, message: event.message }],
       });
       return;
     }
     if (event.type === "progress") {
+      const recordId = findRunningId();
+      if (!recordId) return;
       setLive({
-        ...runningTask(findRunningId()),
+        ...runningTask(recordId),
         progress: event.percent,
         progressMessage: event.message,
       });
@@ -90,10 +96,11 @@ export function applyTaskEvent<TRecord extends TaskRecord>(
 
   switch (event.type) {
     case "started": {
-      // 新一轮任务开始：清掉上一轮的进度与结果状态。
-      // 批量部署每台各发一条 started，而上一台结束时已经把记录带进来了 —— 那种情况保留已有日志，
-      // 否则「[批次 2/3] 开始部署到 X」这类批次行会在自己出现的那一刻被清掉（N 台丢 N 行）。
-      const carried = live.record ? live.lines : [];
+      // 新一轮任务开始：清掉上一轮的进度与结果状态，但**保留已有日志行**。
+      // 单次任务由 store 在发起时把整块 live 重置，到这里本来就没有旧日志；
+      // 批量部署每台各发一条 started，而引擎先把「[批次 i/N] 开始部署到 X」写进日志再发 started ——
+      // 首台那行来不及带记录，按「有记录才保留」的判断会把它连同后续批次行一起清掉（N 台丢 N 行）。
+      const carried = live.lines;
       setLive({ ...runningTask(event.recordId), lines: carried });
       break;
     }

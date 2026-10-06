@@ -6,7 +6,7 @@ import { ServerSelect } from "../../components/ServerSelect";
 import { Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
-import type { BackupConfig, BackupRequest, DbBackupSource, RunLocation } from "../../lib/types";
+import type { BackupConfig, BackupRequest, DbBackupSource } from "../../lib/types";
 import { maskUrlPassword } from "../../lib/utils";
 
 function defaultSource(): DbBackupSource {
@@ -49,20 +49,16 @@ export function BackupConfigModal({
   const { t } = useTranslation();
   const servers = useApp((state) => state.servers);
   const backupTargets = useApp((state) => state.backupTargets);
-  const settings = useApp((state) => state.settings);
   const toast = useApp((state) => state.toast);
 
   const [name, setName] = useState(config?.name ?? "");
   const [serverId, setServerId] = useState(config?.serverId ?? servers[0]?.id ?? "");
-  // 编辑时必须带着原值：保存是整体替换一条配置，这里漏传就等于每次编辑都把执行位退回本机。
-  const [runLocation, setRunLocation] = useState<RunLocation>(config?.runLocation ?? "local");
   const [draft, setDraft] = useState<DbBackupSource>(() => config?.source ?? defaultSource());
   const [targetId, setTargetId] = useState(config?.targetId ?? "");
   const [overrideUrl, setOverrideUrl] = useState(config?.supabaseUrl ?? "");
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
 
-  const agentConfigured = settings.agentServerId.trim() !== "";
   // 服务器列表晚于弹窗加载完成时补选第一台，避免表单一直无法提交。
   useEffect(() => {
     if (!serverId && servers.length > 0) setServerId(servers[0].id);
@@ -114,7 +110,6 @@ export function BackupConfigModal({
         source: normalized(draft),
         targetId: keepOriginalTarget ? originalTargetId : validTargetId || null,
         supabaseUrl: overrideUrl.trim() || null,
-        runLocation,
       });
     } catch (error) {
       toast("error", String(error));
@@ -203,21 +198,6 @@ export function BackupConfigModal({
             emptyText={t("backup.noServers")}
           />
         </Field>
-
-        {/* 执行位决定这条配置的定时由谁跑，所以只在指定过控制机后才摆出来：
-            没装 agent 时给一个「交给控制机」的选项，等于送出一条两头都不跑的静默失败。 */}
-        {agentConfigured && (
-          <Field label={t("backup.runLocation")} hint={t("backup.runLocationHint")}>
-            <Select
-              value={runLocation}
-              onChange={(event) => setRunLocation(event.target.value as RunLocation)}
-              disabled={saving}
-            >
-              <option value="local">{t("backup.runLocal")}</option>
-              <option value="remote">{t("backup.runRemote")}</option>
-            </Select>
-          </Field>
-        )}
 
         <div className="grid grid-cols-2 gap-4">
           <Field label={t("backup.mode")}>

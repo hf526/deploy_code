@@ -108,6 +108,16 @@ describe("applyTaskEvent", () => {
     expect(state.live?.lines).toEqual([{ level: "command", message: "hello" }]);
   });
 
+  it("无 live 且没有运行中记录：忽略迟到的 log / progress，不补建卡死的 running", () => {
+    // 命令失败后事件才到（批次首台连记录都没写）：硬补建会造出一个 recordId 为空、
+    // 再也不会收到事件的 running 状态，界面永久停在「进行中」。
+    const { state, sink } = makeSink(null);
+    applyTaskEvent(log("准备部署失败"), sink);
+    expect(state.live).toBeNull();
+    applyTaskEvent({ type: "progress", percent: 10, message: "x" }, sink);
+    expect(state.live).toBeNull();
+  });
+
   it("无 live 时 progress 补建并带上百分比与文案", () => {
     const { state, sink } = makeSink(null, "r9");
     applyTaskEvent({ type: "progress", percent: 42, message: "上传压缩包" }, sink);
@@ -130,22 +140,21 @@ describe("applyTaskEvent", () => {
     expect(state.announced).toEqual([record]);
   });
 
-  it("started 清空上一轮日志与结果（store 发起新任务时不带记录）", () => {
-    // 界面上点「部署 / 重新部署」时 store 会把 live 重置成没有记录的形状，所以这一轮必须清空；
-    // 带着记录的那条路径是批量部署的下一台，见上面「保留批次行」的用例。
+  it("批量部署首台的 started 保留先到的批次行（那行到达时还没有记录）", () => {
+    // 引擎先把「[批次 1/N] 开始部署到 X」写进日志再发 started，此时 store 刚重置过、record 为空；
+    // 保留已有日志行，首台那行才不会被清掉。单次任务由 store 发起时整块重置，不受影响。
     const { state, sink } = makeSink(
-      makeLive({ recordId: "old", lines: [{ level: "info", message: "old" }], record: null }),
+      makeLive({
+        recordId: "",
+        lines: [{ level: "info", message: "[批次 1/3] 开始部署到 A" }],
+        record: null,
+      }),
     );
-    applyTaskEvent({ type: "started", recordId: "new" }, sink);
-    expect(state.live).toEqual({
-      recordId: "new",
-      lines: [],
-      progress: 0,
-      progressMessage: "",
-      status: "running",
-      record: null,
-      aborted: null,
-    });
+    applyTaskEvent({ type: "started", recordId: "r1" }, sink);
+    expect(state.live?.lines.map((line) => line.message)).toEqual(["[批次 1/3] 开始部署到 A"]);
+    expect(state.live?.recordId).toBe("r1");
+    expect(state.live?.status).toBe("running");
+    expect(state.live?.record).toBeNull();
   });
 
   it("log 追加日志行", () => {

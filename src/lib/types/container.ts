@@ -1,4 +1,4 @@
-import type { DeployStatus, LiveTask, LogLevel, RunLocation } from "./common";
+import type { DeployStatus, LiveTask, LogLevel } from "./common";
 
 // ---------------------------------------------------------------------------
 // 容器备份与迁移（镜像 deploy-core src/container.rs）
@@ -100,8 +100,6 @@ export interface ContainerConfig {
   /** 迁移目标；null 表示只备份到本机。 */
   target: ContainerTarget | null;
   createdAt: string;
-  /** 执行位：本机定时，或交给控制机上的 agent。 */
-  runLocation: RunLocation;
 }
 
 export type ContainerRecordKind = "backup" | "migrate" | "restore";

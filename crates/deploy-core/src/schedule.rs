@@ -1,17 +1,12 @@
 //! 定时任务的到点判定。
 //!
-//! GUI 的调度循环（`src-tauri/src/scheduler.rs`）与控制机上的常驻 agent 共用这一份判断，
-//! 免得两边对「错过要不要补跑」「重试窗口多长」的理解分叉 —— 这两条都是用户能直接感知的行为。
-//! 队列推进、忙则等待这类状态机仍留在各自的循环里：它们依赖进程内的任务名额，抽出来只会更难懂。
+//! GUI 的调度循环（`src-tauri/src/scheduler.rs`）用这一份判断，队列推进、忙则等待这类
+//! 状态机仍留在循环里：它们依赖进程内的任务名额，抽出来只会更难懂。
 
-use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone, Timelike};
-use serde::{Deserialize, Serialize};
+use chrono::{DateTime, Duration, Local, NaiveDate, NaiveTime, TimeZone};
 
 /// 到点后若因已有任务占用而无法启动，最多重试的时长。
 pub const RETRY_WINDOW_MINUTES: i64 = 10;
-
-/// 一天的分钟数：平移墙上时钟时用来取模。
-const MINUTES_PER_DAY: i64 = 24 * 60;
 
 /// 解析 "HH:MM"（也接受 "H:MM"）。
 pub fn parse_hhmm(value: &str) -> Option<NaiveTime> {
@@ -32,39 +27,6 @@ pub fn today_at(value: &str, now: &DateTime<Local>) -> Option<DateTime<Local>> {
     Local
         .from_local_datetime(&now.date_naive().and_time(time))
         .earliest()
-}
-
-/// 本机的时区偏移（分钟，东为正）在 `value` 这个墙上时刻「下一次发生」时是多少。
-///
-/// 取下一次而不是取现在：带夏令时的本机在切换日前后，同一个 `HH:MM` 对应的偏移可能不同，
-/// 要按真正会跑的那一次算。写法不对时返回 None（调用方按「不折算」处理）。
-pub fn local_offset_at_next(value: &str, now: &DateTime<Local>) -> Option<i32> {
-    let time = parse_hhmm(value)?;
-    let today = now.date_naive().and_time(time);
-    let candidate = Local.from_local_datetime(&today).earliest()?;
-    let next = if candidate > *now {
-        candidate
-    } else {
-        // 今天这个点已经过去，那下一次发生就是明天（跨夏令时的偏移差要在明天那次取）。
-        Local
-            .from_local_datetime(&(today + Duration::days(1)))
-            .earliest()?
-    };
-    Some(next.offset().local_minus_utc() / 60)
-}
-
-/// 把「墙上时钟的 HH:MM」平移 `delta_minutes` 分钟，仍然返回 HH:MM（跨日取模）。
-///
-/// 用于下发配置给控制机：设置里的 `HH:MM` 是用户在**本机时区**认定的时刻，而 agent 用
-/// 它自己的本地时区解释这个字符串（见 [`today_at`]）；机器在 UTC 时"03:00"是本地下午。
-/// 所以下发前把两个时区的差平移掉，让控制机到点那一刻正好等于本机的定点。
-///
-/// 只平移固定分钟数、不查目标时区的夏令时规则：agent 上报的是一个固定偏移（`date +%z`），
-/// 目标机若在带夏令时的时区，切换那一两天的执行时刻会差一小时（中国境内与 UTC 无此问题）。
-pub fn shift_hhmm(value: &str, delta_minutes: i64) -> Option<String> {
-    let time = parse_hhmm(value)?;
-    let total = (time.hour() as i64 * 60 + time.minute() as i64 + delta_minutes).rem_euclid(MINUTES_PER_DAY);
-    Some(format!("{:02}:{:02}", total / 60, total % 60))
 }
 
 /// 相邻两轮轮询之间允许的最大空档（秒）。
@@ -110,48 +72,6 @@ pub fn format_date(date: NaiveDate) -> String {
 /// 读回落盘的调度日期；空串或写坏时按「从未触发」处理，而不是让调度器起不来。
 pub fn parse_date(value: &str) -> Option<NaiveDate> {
     NaiveDate::parse_from_str(value.trim(), "%Y-%m-%d").ok()
-}
-
-/// 哪一条调度循环记的日期。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScheduleKind {
-    Backup,
-    Container,
-}
-
-/// 调度器已经触发过的日期。
-///
-/// 单独一份文件（而不是塞进 `settings`）是为了给控制机上的 agent 用：客户端每次下发配置
-/// 都会整体覆盖 agent 的 `config.json`，日期若存在 settings 里就会被顶成客户端那份，
-/// systemd 一重启就把当天已经跑过的备份再跑一次。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ScheduleState {
-    #[serde(default)]
-    pub backup_last_run: String,
-    #[serde(default)]
-    pub container_last_run: String,
-}
-
-impl ScheduleState {
-    fn slot(&mut self, kind: ScheduleKind) -> &mut String {
-        match kind {
-            ScheduleKind::Backup => &mut self.backup_last_run,
-            ScheduleKind::Container => &mut self.container_last_run,
-        }
-    }
-
-    pub fn last_run(&self, kind: ScheduleKind) -> Option<NaiveDate> {
-        let value = match kind {
-            ScheduleKind::Backup => self.backup_last_run.as_str(),
-            ScheduleKind::Container => self.container_last_run.as_str(),
-        };
-        parse_date(value)
-    }
-
-    pub fn remember(&mut self, kind: ScheduleKind, date: NaiveDate) {
-        *self.slot(kind) = format_date(date);
-    }
 }
 
 #[cfg(test)]
@@ -265,55 +185,5 @@ mod tests {
         // 从未触发（空串）与写坏了都按「没有记录」处理，不能让调度器起不来。
         assert_eq!(parse_date(""), None);
         assert_eq!(parse_date("昨天"), None);
-    }
-
-    #[test]
-    fn schedule_state_keeps_the_two_loops_apart() {
-        let mut state = ScheduleState::default();
-        assert_eq!(state.last_run(ScheduleKind::Backup), None);
-        state.remember(ScheduleKind::Backup, at(2026, 3, 9, 3, 0).date_naive());
-        // 容器那条循环不该看见数据库那条的记录，否则两条循环互相把对方的日期当成「今天已跑」。
-        assert_eq!(state.last_run(ScheduleKind::Container), None);
-        assert_eq!(state.last_run(ScheduleKind::Backup).unwrap().to_string(), "2026-03-09");
-        state.remember(ScheduleKind::Container, at(2026, 3, 10, 3, 30).date_naive());
-        assert_eq!(state.backup_last_run, "2026-03-09");
-        assert_eq!(state.container_last_run, "2026-03-10");
-    }
-
-    #[test]
-    fn shift_hhmm_moves_the_wall_clock_and_wraps() {
-        // 本机 UTC+8、控制机 UTC：本机 03:00 = 控制机 19:00（前一天），差 -480 分钟。
-        assert_eq!(shift_hhmm("03:00", -480).as_deref(), Some("19:00"));
-        // 本机 UTC+8、控制机 UTC+0：本机 20:00 = 控制机 12:00。
-        assert_eq!(shift_hhmm("20:00", -480).as_deref(), Some("12:00"));
-        // 同区：原样。
-        assert_eq!(shift_hhmm("03:00", 0).as_deref(), Some("03:00"));
-        // 半小时时区（差 -330 分钟）也要能落在合法的时刻上：03:00 往前 5 小时 30 分。
-        assert_eq!(shift_hhmm("03:00", -330).as_deref(), Some("21:30"));
-        // 正负都取模到 00:00-23:59，不会写出 24:00 或 -1:00。
-        assert_eq!(shift_hhmm("23:59", 1).as_deref(), Some("00:00"));
-        assert_eq!(shift_hhmm("00:00", -1).as_deref(), Some("23:59"));
-        assert_eq!(shift_hhmm("03:00", 24 * 60).as_deref(), Some("03:00"));
-        assert_eq!(shift_hhmm("坏的", 60), None);
-    }
-
-    #[test]
-    fn local_offset_is_a_plausible_utc_offset() {
-        // 只验形状：本机时区由环境决定，断言具体值会让测试跟着机器跑。
-        let offset = local_offset_at_next("03:00", &Local::now()).unwrap();
-        assert!((-12 * 60..=14 * 60).contains(&offset), "{offset}");
-        assert!(local_offset_at_next("", &Local::now()).is_none());
-    }
-
-    #[test]
-    fn schedule_state_json_is_camel_case_and_tolerates_missing_fields() {
-        let state: ScheduleState = serde_json::from_str("{}").unwrap();
-        assert_eq!(state, ScheduleState::default());
-        let text = serde_json::to_string(&ScheduleState {
-            backup_last_run: "2026-03-09".to_string(),
-            container_last_run: String::new(),
-        })
-        .unwrap();
-        assert!(text.contains("backupLastRun"), "{text}");
     }
 }

@@ -3,7 +3,7 @@ import type { Settings } from "./types";
 
 /** 保存到后端的规范化：数值字段限幅、空值用默认值兜底。 */
 export function normalizeSettings(source: Settings): Settings {
-  // 0 是「不自动清理」的有效值，不能用 `|| 3` 兜底；只有填不进数字的才回落默认。
+  // 0 是「不自动清理」的有效值，不能用 `|| 2` 兜底；只有填不进数字的才回落默认。
   const bundleKeep = Number(source.containerBundleKeep);
   return {
     ...source,
@@ -23,7 +23,7 @@ export function normalizeSettings(source: Settings): Settings {
     containerHistoryLimit: Math.max(10, Number(source.containerHistoryLimit) || 200),
     containerTimeoutSecs: Math.max(300, Number(source.containerTimeoutSecs) || 7200),
     containerBundleKeep:
-      Number.isFinite(bundleKeep) && bundleKeep >= 0 ? Math.min(999, Math.trunc(bundleKeep)) : 3,
+      Number.isFinite(bundleKeep) && bundleKeep >= 0 ? Math.min(999, Math.trunc(bundleKeep)) : 2,
     language: normalizeLanguagePreference(source.language),
     releaseKeep: Math.min(50, Math.max(1, Number(source.releaseKeep) || 5)),
     scheduledBackupTime: /^\d{1,2}:\d{2}$/.test(source.scheduledBackupTime.trim())

@@ -252,14 +252,14 @@ pub async fn cancel_deploy(
         .take_deploy(&record_id)
         .ok_or_else(|| CoreError::deploy("没有正在进行的部署（可能已完成）"))?;
 
+    // 登记必须在 abort 之前：abort 后任务守卫会摘除 active_deploys，中间若用户退出应用，
+    // 退出清理会以为没有任务而漏掉远端脚本。与容器那条取消路径同一时序。
+    state.add_pending_cleanup(&record_id, active.clone());
+
     // 中止本地任务：未来在下一处 await 退出，本地临时文件由 TempArchiveGuard 清理。
     active.abort.abort();
     // 留一点时间给任务退出，避免它与下面的记录写入互相覆盖。
     tokio::time::sleep(Duration::from_millis(300)).await;
-
-    // 中止后任务守卫会摘除 active_deploys；单独登记到 pending_cleanups，
-    // 保证取消清理期间退出应用时仍会终止远端脚本。
-    state.add_pending_cleanup(&record_id, active.clone());
 
     // 重连服务器终止远端脚本进程组并清理残留压缩包；清理失败不影响取消结果。
     if let Ok(config) = state.store.load_config() {

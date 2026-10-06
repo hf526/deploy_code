@@ -2,12 +2,12 @@ use std::collections::VecDeque;
 use std::time::Duration;
 
 use chrono::{Local, TimeZone};
-use deploy_core::models::{AppConfig, BackupRequest, Settings};
+use deploy_core::models::{BackupRequest, Settings};
 use deploy_core::schedule::{
     clock_jumped, format_date, has_crossed, parse_date, today_at, window_expired,
 };
 use deploy_core::shutdown::{request_shutdown, CANCEL_WINDOW_SECS, OS_GRACE_SECS};
-use deploy_core::{CoreError, Store};
+use deploy_core::CoreError;
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 
@@ -107,58 +107,6 @@ pub fn spawn(app: AppHandle) {
                 continue;
             };
 
-            // 执行位是「控制机」的配置由 agent 到点执行：本机再跑一遍就是两次导出、两份包，
-            // 而且控制机上那份的节奏会和本机这份混在一起。
-            // 但只有「上次成功下发确实把这条带过去了」才算交给它 —— 光看执行位就撒手，
-            // 用户改了名字没重新下发（或压根没装 agent）的那一晚就两头都不跑。
-            match backup_owner(&app.state::<AppState>().store, &config, &config_id) {
-                BackupOwner::Agent(name) => {
-                    pending = None;
-                    // 让位本身是正常收尾，但控制机上那份定时可能是上次下发的旧值：
-                    // 今晚跑的不是用户以为的那一份，这一句必须讲出来（缺陷就藏在「看起来交给它了」）。
-                    if deploy_core::agent::staleness(&app.state::<AppState>().store)
-                        .backup_schedule_stale
-                    {
-                        emit_notice(
-                            &app,
-                            "agentStale",
-                            Some(format!("「{name}」这一晚控制机仍按上次下发的定时执行")),
-                        );
-                    } else {
-                        emit_notice(&app, "remoteSkipped", Some(name));
-                    }
-                    continue;
-                }
-                BackupOwner::Unsynced(name) => {
-                    // 本机不代跑：包会落在本机，而用户以为在控制机上，恢复和迁移都找不到东西。
-                    // 报失败，让他去点「下发配置」。
-                    pending = None;
-                    emit_notice(
-                        &app,
-                        "failed",
-                        Some(format!(
-                            "「{name}」的执行位是控制机，但控制机上没有这条配置（未安装或未下发），请到控制机页面点「下发配置」"
-                        )),
-                    );
-                    continue;
-                }
-                BackupOwner::Local => {
-                    // 执行位写着本机、控制机那份里却还留着同一条（改回来之后没有重新下发）：
-                    // 今晚两台各出一份包，落在两台机器上。本机照跑（那是用户要的），但要把另一头讲出来。
-                    let store = &app.state::<AppState>().store;
-                    let agent = config.settings.agent_server_id.trim().to_string();
-                    if store.load_agent_sync().holds_backup(&agent, &config_id) {
-                        let name = config
-                            .backup_configs
-                            .iter()
-                            .find(|item| item.id == config_id)
-                            .map(|item| item.name.clone())
-                            .unwrap_or_else(|| config_id.clone());
-                        emit_notice(&app, "agentStranded", Some(format!("「{name}」")));
-                    }
-                }
-            }
-
             let request = BackupRequest {
                 server_id: String::new(),
                 backup_config_id: Some(config_id),
@@ -235,66 +183,14 @@ pub fn spawn_container(app: AppHandle) {
                         last_run = Some(scheduled.date_naive());
                         remember_schedule_run(&app, scheduled.date_naive(), ScheduleKind::Container);
                         triggered_at = Some(now);
-                        // 只保留仍然存在、且今晚确实由本机负责的配置；真正交给控制机的才静默剔除。
-                        let (local, handed, unsynced) = split_container_queue(
-                            &app.state::<AppState>().store,
-                            &config,
-                            &settings.scheduled_container_config_ids,
-                        );
-                        queue = local;
-                        if handed > 0 {
-                            // 带单位：这条 message 会被拼进「已交给控制机执行：…」，
-                            // 只发一个数字过去，界面读起来像坏掉的输出。
-                            emit_notice(
-                                &app,
-                                "remoteSkipped",
-                                Some(format!("{handed} 条容器备份")),
-                            );
-                        }
-                        if !unsynced.is_empty() {
-                            emit_notice(
-                                &app,
-                                "containerFailed",
-                                Some(format!(
-                                    "{} 条容器备份的执行位是控制机，但控制机上没有它们（未安装或未下发），本次不执行",
-                                    unsynced.len()
-                                )),
-                            );
-                        }
-                        // 与数据库备份同一口径的两句话：控制机上那份定时是旧的（今晚跑的不是
-                        // 用户勾选的那批），以及某条已经改回本机而控制机还留着它（两边各出一份包）。
-                        let store = app.state::<AppState>().store.clone();
-                        if deploy_core::agent::staleness(&store).container_schedule_stale {
-                            emit_notice(
-                                &app,
-                                "agentStale",
-                                Some("容器定时（开关、时间或勾选）改动后没有重新下发".to_string()),
-                            );
-                        }
-                        let agent = config.settings.agent_server_id.trim().to_string();
-                        let sync = store.load_agent_sync();
-                        let stranded: Vec<String> = settings
+                        // 只保留仍然存在的配置：被删掉的条目静默剔除，其余按勾选顺序排队。
+                        queue = settings
                             .scheduled_container_config_ids
                             .iter()
-                            .filter_map(|id| {
-                                let item = config
-                                    .container_configs
-                                    .iter()
-                                    .find(|entry| &entry.id == id)?;
-                                (!item.run_location.is_remote() && sync.holds_container(&agent, id))
-                                    .then(|| item.name.clone())
-                            })
+                            .filter(|id| config.container_configs.iter().any(|item| &item.id == *id))
+                            .cloned()
                             .collect();
-                        if !stranded.is_empty() {
-                            emit_notice(
-                                &app,
-                                "agentStranded",
-                                Some(stranded.join("、")),
-                            );
-                        }
-                        if queue.is_empty() && handed == 0 && unsynced.is_empty() {
-                            // 只在真的没人可跑时说「未选择配置」。上面两条分支已经解释过原因时
-                            // 再补一句「没配置」是错的，用户会去翻勾选框而不去点下发。
+                        if queue.is_empty() {
                             emit_notice(&app, "containerNoConfig", None);
                         }
                     }
@@ -435,58 +331,6 @@ fn arm_scheduled_shutdown(
     emit_status(app);
 }
 
-/// 一条定时备份配置今晚归谁跑。
-enum BackupOwner {
-    /// 本机负责（执行位本来就是本机，或配置已经不在了）。
-    Local,
-    /// 控制机负责，附带配置名（提示里要说清楚是哪条）。
-    Agent(String),
-    /// 执行位写着控制机，但那台机器上并没有这一份：没装、没下发、或下发之后才改名/新建。
-    Unsynced(String),
-}
-
-/// 判定一条定时备份配置的归属。只在执行位是远端时才去读同步指纹，本机路径不多一次文件读。
-fn backup_owner(store: &Store, config: &AppConfig, config_id: &str) -> BackupOwner {
-    let Some(item) = config.backup_configs.iter().find(|entry| entry.id == config_id) else {
-        return BackupOwner::Local;
-    };
-    if !item.run_location.is_remote() {
-        return BackupOwner::Local;
-    }
-    let agent = config.settings.agent_server_id.trim();
-    if store.load_agent_sync().holds_backup(agent, &item.id) {
-        BackupOwner::Agent(item.name.clone())
-    } else {
-        BackupOwner::Unsynced(item.name.clone())
-    }
-}
-
-/// 容器定时队列按执行位分成三份：本机要跑的、已交给控制机的条数、写着控制机但它没持有的名字。
-///
-/// 最后一类**不进本机队列**：本机代跑会把包落在本机，而用户以为在控制机上，恢复和迁移
-/// 都找不到那个包 —— 宁可这一条不执行并报错，让他去补一次下发。
-fn split_container_queue(
-    store: &Store,
-    config: &AppConfig,
-    ids: &[String],
-) -> (VecDeque<String>, usize, Vec<String>) {
-    let mut local = VecDeque::new();
-    let mut handed = 0usize;
-    let mut unsynced = Vec::new();
-    let agent = config.settings.agent_server_id.trim();
-    let sync = store.load_agent_sync();
-    for id in ids {
-        match config.container_configs.iter().find(|item| &item.id == id) {
-            Some(item) if !item.run_location.is_remote() => local.push_back(item.id.clone()),
-            Some(item) if sync.holds_container(agent, &item.id) => handed += 1,
-            Some(item) => unsynced.push(item.name.clone()),
-            // 配置已经不在了：静默剔除，与改动前的行为一致。
-            None => {}
-        }
-    }
-    (local, handed, unsynced)
-}
-
 fn emit_notice(app: &AppHandle, kind: &'static str, message: Option<String>) {
     let _ = app.emit("scheduler://notice", SchedulerNotice { kind, message });
 }
@@ -513,114 +357,4 @@ fn remember_schedule_run(app: &AppHandle, date: chrono::NaiveDate, kind: Schedul
         *slot = value;
         Ok(())
     });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use deploy_core::agent::AgentSyncState;
-    use deploy_core::models::{BackupConfig, ContainerConfig, DbBackupSource, RunLocation};
-
-    fn store_with(sync: Option<AgentSyncState>) -> Store {
-        let dir = std::env::temp_dir().join(format!(
-            "deploycode-scheduler-{}",
-            deploy_core::models::new_id()
-        ));
-        let store = Store::new(&dir);
-        if let Some(state) = sync {
-            store.save_agent_sync(&state).unwrap();
-        }
-        store
-    }
-
-    fn backup(id: &str, remote: bool) -> BackupConfig {
-        let mut config =
-            BackupConfig::new(id.to_string(), "s1".to_string(), DbBackupSource::default());
-        config.id = id.to_string();
-        config.run_location = if remote { RunLocation::Remote } else { RunLocation::Local };
-        config
-    }
-
-    fn container(id: &str, remote: bool) -> ContainerConfig {
-        ContainerConfig {
-            id: id.to_string(),
-            name: id.to_string(),
-            server_id: "s1".to_string(),
-            project: "app".to_string(),
-            pause_source: false,
-            include_volumes: true,
-            include_images: false,
-            target: None,
-            created_at: String::new(),
-            run_location: if remote { RunLocation::Remote } else { RunLocation::Local },
-        }
-    }
-
-    fn config_with(agent: &str, backups: Vec<BackupConfig>) -> AppConfig {
-        let mut config = AppConfig::default();
-        config.settings.agent_server_id = agent.to_string();
-        config.backup_configs = backups;
-        config
-    }
-
-    #[test]
-    fn remote_config_only_yields_after_a_real_sync() {
-        let held = AgentSyncState {
-            server_id: "s1".to_string(),
-            backup_config_ids: vec!["b1".to_string()],
-            ..Default::default()
-        };
-
-        // 执行位是远端、且控制机确实持有这条 → 让位。
-        let store = store_with(Some(held.clone()));
-        let config = config_with("s1", vec![backup("b1", true)]);
-        assert!(matches!(
-            backup_owner(&store, &config, "b1"),
-            BackupOwner::Agent(name) if name == "b1"
-        ));
-
-        // 执行位是远端但从没下发过 → 判为未就绪：循环据此报失败，本机不代跑。
-        let empty = store_with(None);
-        assert!(matches!(
-            backup_owner(&empty, &config, "b1"),
-            BackupOwner::Unsynced(name) if name == "b1"
-        ));
-
-        // 换了一台控制机：旧指纹不算数，得重新下发。
-        assert!(matches!(
-            backup_owner(&store, &config_with("s2", vec![backup("b1", true)]), "b1"),
-            BackupOwner::Unsynced(_)
-        ));
-
-        // 本机执行位 / 配置已删除：与改动前一样走本机。
-        let local = config_with("s1", vec![backup("b2", false)]);
-        assert!(matches!(backup_owner(&store, &local, "b2"), BackupOwner::Local));
-        assert!(matches!(backup_owner(&store, &local, "gone"), BackupOwner::Local));
-    }
-
-    #[test]
-    fn container_queue_does_not_cover_for_unsynced_remote_configs() {
-        let store = store_with(Some(AgentSyncState {
-            server_id: "s1".to_string(),
-            container_config_ids: vec!["c1".to_string()],
-            ..Default::default()
-        }));
-        let mut config = AppConfig::default();
-        config.settings.agent_server_id = "s1".to_string();
-        config.container_configs = vec![
-            container("c1", true),
-            container("c2", true),
-            container("c3", false),
-        ];
-        let ids: Vec<String> = ["c1", "c2", "c3", "gone"]
-            .iter()
-            .map(|value| value.to_string())
-            .collect();
-        let (local, handed, unsynced) = split_container_queue(&store, &config, &ids);
-        // c1 真的在控制机上（本机剔除）；c2 写着远端但没下发过 —— 本机也不代跑，
-        // 只把它报成失败让人去补下发；c3 本来就是本机的。
-        assert_eq!(handed, 1);
-        assert_eq!(unsynced, vec!["c2".to_string()]);
-        assert_eq!(local, VecDeque::from(["c3".to_string()]));
-    }
 }

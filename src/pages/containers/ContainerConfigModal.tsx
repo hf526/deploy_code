@@ -6,7 +6,7 @@ import { ServerSelect } from "../../components/ServerSelect";
 import { Button, Checkbox, Field, Input, Modal, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";
-import type { ComposeStack, ContainerConfig, RunLocation } from "../../lib/types";
+import type { ComposeStack, ContainerConfig } from "../../lib/types";
 
 /**
  * 容器备份配置的新增 / 编辑弹窗。
@@ -28,11 +28,9 @@ export function ContainerConfigModal({
 }) {
   const { t } = useTranslation();
   const servers = useApp((state) => state.servers);
-  const settings = useApp((state) => state.settings);
   const toast = useApp((state) => state.toast);
 
   const seed = config ?? preset ?? null;
-  const agentConfigured = settings.agentServerId.trim() !== "";
   const [name, setName] = useState(config?.name ?? "");
   const [serverId, setServerId] = useState(seed?.serverId ?? servers[0]?.id ?? "");
   const [project, setProject] = useState(seed?.project ?? "");
@@ -42,8 +40,6 @@ export function ContainerConfigModal({
   const [targetServerId, setTargetServerId] = useState(seed?.target?.serverId ?? "");
   const [targetDir, setTargetDir] = useState(seed?.target?.targetDir ?? "");
   const [startServices, setStartServices] = useState(seed?.target?.startServices ?? true);
-  // 保存是整条替换：漏传执行位会让「编辑一次名字就把任务退回本机跑」这种事静默发生。
-  const [runLocation, setRunLocation] = useState<RunLocation>(seed?.runLocation ?? "local");
 
   const [stacks, setStacks] = useState<ComposeStack[]>([]);
   const [loadingStacks, setLoadingStacks] = useState(false);
@@ -136,7 +132,6 @@ export function ContainerConfigModal({
           ? { serverId: targetServerId, targetDir: dir, startServices }
           : null,
         createdAt: config?.createdAt ?? "",
-        runLocation,
       });
       onSaved(saved);
     } catch (error) {
@@ -193,19 +188,6 @@ export function ContainerConfigModal({
               emptyText={t("containers.noServers")}
             />
           </Field>
-          {/* 与备份配置同理：只在指定过控制机后才摆出来，否则「交给控制机」是一条跑不通的配置。 */}
-          {agentConfigured && (
-            <Field label={t("containers.config.runLocation")} hint={t("containers.config.runLocationHint")}>
-              <Select
-                value={runLocation}
-                onChange={(event) => setRunLocation(event.target.value as RunLocation)}
-                disabled={saving}
-              >
-                <option value="local">{t("containers.config.runLocal")}</option>
-                <option value="remote">{t("containers.config.runRemote")}</option>
-              </Select>
-            </Field>
-          )}
           <Field label={t("containers.config.project")} required>
             <Select
               value={project}

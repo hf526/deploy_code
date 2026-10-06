@@ -714,7 +714,31 @@ fn normalize_rel(rel: &str) -> Result<String> {
     if rel.starts_with('/') || rel.contains(":") || rel.split('/').any(|seg| seg == "..") {
         return Err(CoreError::git(format!("非法路径: {rel}")));
     }
+    // `.git` 只允许 git 自己碰：文件编辑器能写 core.fsmonitor / filter.*.clean
+    // 这类键，下一次 `git add` 就是本机任意命令执行；读取也能翻出远端 URL 里的凭据。
+    // 按段比较（`.gitignore` / `.github` 不受影响），大小写不敏感是为了 Windows。
+    if rel
+        .split('/')
+        .any(|segment| segment.eq_ignore_ascii_case(".git"))
+    {
+        return Err(CoreError::git(format!("不允许访问 .git 目录: {rel}")));
+    }
     Ok(rel.trim_matches('/').to_string())
+}
+
+/// 解析后的真实路径是否落在仓库的 `.git` 目录里（含任意层级）。
+///
+/// `normalize_rel` 的字符串检查挡的是字面上的 `.git/...`；仓库里指向 `.git` 的符号链接
+/// （提交就能带进来）只有解析成 canonical 路径后才现形，所以读 / 写 / 列目录都得再过这一道。
+/// 比较的是解析后的真实段名，Windows 上「段尾点 / 空格与本体等价」的写法在这里也已经归一。
+fn is_git_dir_target(canonical: &Path, root: &Path) -> bool {
+    let Ok(rel) = canonical.strip_prefix(root) else {
+        return false;
+    };
+    rel.components().any(|component| match component {
+        std::path::Component::Normal(name) => name.to_string_lossy().eq_ignore_ascii_case(".git"),
+        _ => false,
+    })
 }
 
 /// 校验用户提供的分支 / 版本 / 引用参数，避免以 `-` 开头被 git 当作选项
@@ -1460,6 +1484,50 @@ mod tests {
         ] {
             assert!(!is_sensitive_path(path), "{path} 不应判定为敏感文件");
         }
+    }
+
+    #[test]
+    fn normalize_rel_rejects_git_dir_but_allows_similar_names() {
+        assert!(normalize_rel(".git/config").is_err());
+        assert!(normalize_rel("sub/.git").is_err());
+        assert!(normalize_rel(".GIT/hooks/pre-commit").is_err());
+        assert!(normalize_rel("sub/dir/.git").is_err());
+        // `.gitignore` / `.github` 是正常仓库文件，不能一起拦掉。
+        assert!(normalize_rel(".gitignore").is_ok());
+        assert!(normalize_rel(".github/workflows/ci.yml").is_ok());
+    }
+
+    #[test]
+    fn git_dir_guard_follows_resolved_paths() {
+        let root = Path::new("/repo");
+        assert!(is_git_dir_target(Path::new("/repo/.git/config"), root));
+        assert!(is_git_dir_target(Path::new("/repo/sub/.GIT/x"), root));
+        assert!(!is_git_dir_target(Path::new("/repo/src/main.rs"), root));
+        assert!(!is_git_dir_target(Path::new("/repo/.gitignore"), root));
+        // 仓库以外的路径不归它管（调用方已先用 starts_with 挡越界）。
+        assert!(!is_git_dir_target(Path::new("/elsewhere/.git/config"), root));
+    }
+
+    /// 仓库里一个指向 `.git` 的符号链接能绕过字符串检查，必须靠解析后的真实路径拦住。
+    #[cfg(unix)]
+    #[test]
+    fn symlink_to_git_dir_is_refused_by_editor_operations() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-git-link-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join(".git/config"), "[core]\n").unwrap();
+        let git = Git::open(&dir).unwrap();
+        std::os::unix::fs::symlink(".git", dir.join("link")).unwrap();
+
+        assert!(git.read_file("link/config").is_err());
+        assert!(git.write_file("link/config", "x").is_err());
+        assert!(git.list_dir("link").is_err());
+        // 直接写 `.git` 的那一道也还在。
+        assert!(git.write_file(".git/config", "x").is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

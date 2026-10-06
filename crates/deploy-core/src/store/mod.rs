@@ -1,9 +1,9 @@
 //! 配置与任务记录的本地存储（JSON 文件）。
 //!
 //! 文件分工：本文件是 `Store` 本体（构造、路径、锁原语、config.json 读写、主密码、
-//! agent 同步指纹持久化、调度状态、原子写盘）；`records` 是四类任务记录的 CRUD 与
-//! 孤儿备份包；`import_export` 是导出 / 导入的合并语义；`configs` 是部署 / 容器 / Pages
-//! 配置的校验保存；`backup_configs` 是备份配置 / 目标 / 服务器查找与旧版迁移。
+//! 原子写盘）；`records` 是四类任务记录的 CRUD 与孤儿备份包；`import_export` 是导出 /
+//! 导入的合并语义；`configs` 是部署 / 容器 / Pages 配置的校验保存；`backup_configs`
+//! 是备份配置 / 目标 / 服务器查找与旧版迁移。
 
 mod backup_configs;
 mod configs;
@@ -17,16 +17,13 @@ pub use backup_configs::paths_equal;
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::sync::{Mutex, MutexGuard};
 
 use directories::ProjectDirs;
 
-use crate::agent::AgentSyncState;
 use crate::crypto::{decrypt_string, encrypt_string};
 use crate::error::{CoreError, Result};
-use crate::schedule::ScheduleState;
-use crate::models::{AppConfig, RunLocation, SshAuth};
+use crate::models::{AppConfig, SshAuth};
 
 /// 配置与部署记录的本地存储（JSON 文件）。
 ///
@@ -41,10 +38,6 @@ pub struct Store {
     base_dir: PathBuf,
     /// 串行化写入，避免并发部署/保存设置时互相覆盖或写出损坏文件。
     write_lock: Mutex<()>,
-    /// 进程身份：控制机上的 agent 启动时置真。见 [`Store::set_agent_mode`]。
-    agent_mode: AtomicBool,
-    /// 安装包内置的 agent 可执行文件。见 [`Store::set_bundled_agent_binary`]。
-    bundled_agent_binary: OnceLock<PathBuf>,
 }
 
 /// 跨进程任务锁（GUI 与 CLI 抢占同一个任务时互斥）。
@@ -76,37 +69,7 @@ impl Store {
         Self {
             base_dir: base_dir.into(),
             write_lock: Mutex::new(()),
-            agent_mode: AtomicBool::new(false),
-            bundled_agent_binary: OnceLock::new(),
         }
-    }
-
-    /// 声明「这个进程是控制机上的 agent」：磁盘水位闸只在这种进程上拦任务。
-    ///
-    /// 刻意不是配置字段：它是进程身份，跟着二进制走。写在 `Settings` 里的话，
-    /// 客户端一次「保存设置」的整体回写、或导入别人那份配置，都会把笔电也变成
-    /// 「剩余不足 max(总量 10%, 5GB) 就拒绝备份」——升级后原本能跑的定时备份
-    /// 会直接启动即失败，而这道闸的设计对象只有控制机那块攒了所有备份包的盘。
-    pub fn set_agent_mode(&self, enabled: bool) {
-        self.agent_mode.store(enabled, Ordering::Relaxed);
-    }
-
-    pub fn agent_mode(&self) -> bool {
-        self.agent_mode.load(Ordering::Relaxed)
-    }
-
-    /// 登记安装包内置的 agent 可执行文件（`<资源目录>/agent/deploy-agent`）。
-    ///
-    /// 与 `agent_mode` 同理，这也是进程/安装属性而不是配置字段：资源目录跟着这台机器上的
-    /// 安装位置走，写进 config.json 就会被导出/导入带走，换台机器指到不存在的路径。
-    /// 只有 Tauri 壳问得到资源目录（`deploy-core` 不许依赖 tauri），所以由 `lib.rs` 启动时登记；
-    /// CLI 与单测不登记，`agent::locate_binary` 自然跳过这一档。
-    pub fn set_bundled_agent_binary(&self, path: impl Into<PathBuf>) {
-        let _ = self.bundled_agent_binary.set(path.into());
-    }
-
-    pub fn bundled_agent_binary(&self) -> Option<&Path> {
-        self.bundled_agent_binary.get().map(PathBuf::as_path)
     }
 
     fn lock(&self) -> MutexGuard<'_, ()> {
@@ -186,126 +149,6 @@ impl Store {
 
     pub fn temp_dir(&self) -> PathBuf {
         self.base_dir.join("temp")
-    }
-
-    /// 调度器触发日期所在的文件（控制机上的 agent 用，见 [`crate::schedule::ScheduleState`]）。
-    pub fn schedule_state_path(&self) -> PathBuf {
-        self.base_dir.join("schedule-state.json")
-    }
-
-    /// 读调度状态；文件不存在或写坏了都按「从未触发」处理，不能让调度循环起不来。
-    pub fn load_schedule_state(&self) -> ScheduleState {
-        let path = self.schedule_state_path();
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
-    }
-
-    pub fn save_schedule_state(&self, state: &ScheduleState) -> Result<()> {
-        let _guard = self.write_guard()?;
-        atomic_write(
-            &self.schedule_state_path(),
-            &serde_json::to_string_pretty(state)?,
-        )
-    }
-
-    /// 上次成功下发给控制机的配置指纹所在的文件。
-    pub fn agent_sync_path(&self) -> PathBuf {
-        self.base_dir.join("agent-sync.json")
-    }
-
-    /// 读同步指纹；文件不存在或写坏了都按「从未同步」处理。
-    pub fn load_agent_sync(&self) -> AgentSyncState {
-        let path = self.agent_sync_path();
-        std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
-    }
-
-    /// 记同步指纹。单独一份文件（而不是塞进 `settings`）的理由与 [`Store::schedule_state_path`]
-    /// 同：`save_settings` 是前端整体回写 `Settings` 的，漏带这个字段就会把指纹冲没，
-    /// 而指纹是定时循环判断「这条该不该让给控制机」的唯一依据。
-    pub fn save_agent_sync(&self, state: &AgentSyncState) -> Result<()> {
-        let _guard = self.write_guard()?;
-        atomic_write(
-            &self.agent_sync_path(),
-            &serde_json::to_string_pretty(state)?,
-        )
-    }
-
-    /// 还有哪些台机器「已经不是控制机、但上面可能还装着 agent」需要收回。
-    pub fn orphan_agent_servers(&self) -> Vec<String> {
-        self.load_agent_sync().orphan_server_ids
-    }
-
-    /// 记一台收回失败的旧控制机。它还在自行执行定时，盘上也还留着全部源机的明文口令，
-    /// 这笔待办要一直挂在界面上，直到 [`Store::forget_orphan_agent`] 把它撤掉。
-    pub fn remember_orphan_agent(&self, server_id: &str) -> Result<()> {
-        let mut state = self.load_agent_sync();
-        if state.orphan_server_ids.iter().any(|item| item == server_id) {
-            return Ok(());
-        }
-        state.add_orphan(server_id);
-        self.save_agent_sync(&state)
-    }
-
-    /// 撤掉一笔待收回（那台的 agent 真的卸掉了，或这台服务器被删了）。
-    pub fn forget_orphan_agent(&self, server_id: &str) -> Result<()> {
-        let mut state = self.load_agent_sync();
-        if !state.orphan_server_ids.iter().any(|item| item == server_id) {
-            return Ok(());
-        }
-        state.remove_orphan(server_id);
-        self.save_agent_sync(&state)
-    }
-
-    /// 收回指向某台控制机的本机状态：执行位退回本机、指向清空、同步指纹作废；返回改回本机的条数。
-    ///
-    /// 「卸载 agent」与「删除这台服务器」共用这一条。两条判据都要有：
-    /// ① 动的不是当前控制机时一概不动 —— 顺手清掉另一台上的旧 agent，不该掐死现役那条的定时；
-    /// ② 指针对得上却不收回执行位，留下的就是「配置写着控制机、控制机已经不在了」的死局：
-    ///    定时循环照旧让位、本机又撒手，那一晚两头都不跑。
-    pub fn forget_agent_server(&self, server_id: &str) -> Result<usize> {
-        let mut moved = 0usize;
-        let mut mine = false;
-        self.mutate_config(|config| {
-            mine = config.settings.agent_server_id.trim() == server_id;
-            if !mine {
-                return Ok(());
-            }
-            for item in &mut config.backup_configs {
-                if item.run_location.is_remote() {
-                    item.run_location = RunLocation::Local;
-                    moved += 1;
-                }
-            }
-            for item in &mut config.container_configs {
-                if item.run_location.is_remote() {
-                    item.run_location = RunLocation::Local;
-                    moved += 1;
-                }
-            }
-            config.settings.agent_server_id = String::new();
-            Ok(())
-        })?;
-        if mine {
-            let mut state = self.load_agent_sync();
-            state.clear();
-            state.remove_orphan(server_id);
-            self.save_agent_sync(&state)?;
-        } else if self
-            .load_agent_sync()
-            .orphan_server_ids
-            .iter()
-            .any(|item| item == server_id)
-        {
-            // 待收回那台被卸载成功、或整台服务器被删掉了：这条待办到此为止，
-            // 留着只会指着一个不存在（或已经干净）的目标一直红着。
-            self.forget_orphan_agent(server_id)?;
-        }
-        Ok(moved)
     }
 
     /// 设置主密码（首次使用时调用）

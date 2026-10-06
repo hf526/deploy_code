@@ -44,7 +44,6 @@ function settings(overrides: Partial<Settings> = {}): Settings {
     scheduledContainerTime: "03:30",
     scheduledContainerConfigIds: [],
     scheduledContainerLastRun: "",
-    agentServerId: "",
     ...overrides,
   };
 }
@@ -78,6 +77,9 @@ describe("normalizeSettings", () => {
     );
     expect(fallback.scriptTimeoutSecs).toBe(1800);
     expect(fallback.scheduledBackupTime).toBe("03:00");
+    // 保留数的兜底是后端同一个默认值 2；非法值不能悄悄多留一个包（曾经回落成 3）。
+    expect(normalizeSettings(settings({ containerBundleKeep: Number("x") })).containerBundleKeep).toBe(2);
+    expect(normalizeSettings(settings({ containerBundleKeep: -1 })).containerBundleKeep).toBe(2);
   });
 });
 
@@ -102,7 +104,6 @@ describe("mergedGroup", () => {
   it("本组字段照样过规范化，其余字段原样保留（含未镜像到界面的那些）", () => {
     const saved = settings({
       containerBundleKeep: 0,
-      agentServerId: "srv-agent",
       scheduledContainerConfigIds: ["c1", "c2"],
       masterPasswordHash: "hash",
     });
@@ -112,7 +113,6 @@ describe("mergedGroup", () => {
     expect(body.connectTimeoutSecs).toBe(3);
     expect(body.releaseKeep).toBe(3);
     expect(body.containerBundleKeep).toBe(0);
-    expect(body.agentServerId).toBe("srv-agent");
     expect(body.scheduledContainerConfigIds).toEqual(["c1", "c2"]);
     expect(body.masterPasswordHash).toBe("hash");
   });

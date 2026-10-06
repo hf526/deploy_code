@@ -149,13 +149,6 @@ pub(super) async fn server_command(cli: &Cli, command: &ServerCommand) -> Result
             Ok(())
         }
         ServerCommand::Remove { server } => {
-            // 与 GUI 的 delete_server 同一口径：删的正是控制机时，先把执行位与指向收回本机，
-            // 否则留下的就是「配置写着控制机、控制机已经不在了」，两头都不跑。
-            let target_id = {
-                let config = store.load_config()?;
-                Store::find_server(&config, server)?.id.clone()
-            };
-            store.forget_agent_server(&target_id)?;
             store.mutate_config(|config| {
                 let id = Store::find_server(config, server)?.id.clone();
                 config.servers.retain(|item| item.id != id);

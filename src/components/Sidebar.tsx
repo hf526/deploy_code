@@ -1,4 +1,4 @@
-import { Container, Database, FolderOpen, GitBranch, History, Network, Rocket, Server, ServerCog, Settings, Webhook, type LucideIcon } from "lucide-react";
+import { Container, Database, FolderOpen, GitBranch, History, Network, Rocket, Server, Settings, Webhook, type LucideIcon } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { NavLink, useNavigate } from "react-router-dom";
 
@@ -24,7 +24,6 @@ const NAV_GROUPS: { labelKey: string; items: NavItem[] }[] = [
     items: [
       { to: "/servers", labelKey: "nav.servers", icon: Server },
       { to: "/nginx", labelKey: "nav.nginx", icon: Network },
-      { to: "/agent", labelKey: "nav.agent", icon: ServerCog },
     ],
   },
   {

@@ -454,7 +454,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{RepoConfig, RunLocation, ServerConfig, SshAuth};
+    use crate::models::{RepoConfig, ServerConfig, SshAuth};
     use crate::store::testutil::temp_store;
 
     #[test]
@@ -622,7 +622,6 @@ mod tests {
                     start_services: true,
                 }),
                 created_at: String::new(),
-                run_location: RunLocation::Local,
             },
         )
         .unwrap();
@@ -739,7 +738,6 @@ mod tests {
                     start_services: false,
                 }),
                 created_at: String::new(),
-                run_location: RunLocation::Local,
             },
         )
         .unwrap();

@@ -537,7 +537,7 @@ async fn accept_loop(
         tokio::spawn(async move {
             // 但任务必须跟着这一轮一起收：攥着 `Arc<SshClient>` 不放的那条空连接
             // （浏览器 keepalive 最典型）会让这轮作废的会话永远关不掉，
-            // 换控制机、点「重新连接」之后旧会话还挂在上面。
+            // 点「重新连接」之后旧会话还挂在上面。
             let outcome = tokio::select! {
                 result = client.forward_tcp(stream, &host, remote_port) => result,
                 _ = conn_stop.changed() => return,

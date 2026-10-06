@@ -3,8 +3,8 @@
 use super::Store;
 use crate::error::{CoreError, Result};
 use crate::models::{
-    AppConfig, BackupConfig, ContainerConfig, DbBackupSource, EnvFileConfig, ExportData,
-    ImportCounts, ImportPreview, RunLocation, ServerConfig,
+    AppConfig, BackupConfig, DbBackupSource, EnvFileConfig, ExportData,
+    ImportCounts, ImportPreview, ServerConfig,
     SshAuth,
 };
 
@@ -100,18 +100,6 @@ fn keep_option_when_absent(
     }
 }
 
-/// 执行位是「本机把这活儿交给了控制机」的那根线，跟 `agent_server_id` 一样只属于本机。
-///
-/// 导出侧会把它抹成 `Local`（见 `models.rs` 的 `ExportData::new`），那是给**没有 agent 的机器**
-/// 准备的：照原样带过去就是一条指向不存在 agent 的死配置。同一台机器重新导入自己的配置时，
-/// 这个抹掉的值不能顶掉本机那份 —— 本机撒手回自己跑，而控制机上那份到点照跑，
-/// 同一晚出两份包、落在两台机器上，恢复时只找得到其中一份。
-fn keep_remote_location(incoming: &mut RunLocation, current: &RunLocation) {
-    if !incoming.is_remote() && current.is_remote() {
-        *incoming = *current;
-    }
-}
-
 /// env 文件按数组下标对齐：导出保留了顺序与条数，脱敏后只剩空串，只能按序回填。
 fn merge_env_files(incoming: &mut Vec<EnvFileConfig>, current: &[EnvFileConfig], kept: &mut usize) {
     for (index, file) in incoming.iter_mut().enumerate() {
@@ -204,9 +192,6 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
                 &current.supabase_url,
                 &mut kept,
             );
-            // 执行位跟本机走（见下面 agent_server_id 那段）：导出把它抹成本机是为了不让
-            // 新机继承一个没有 agent 的指向，而不是「这次要改回本机跑」。
-            keep_remote_location(&mut incoming.run_location, &current.run_location);
         },
     );
     preview.pages_configs = merge_by_id(
@@ -220,9 +205,7 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         &mut config.container_configs,
         &data.container_configs,
         |item| item.id.as_str(),
-        |incoming: &mut ContainerConfig, current: &ContainerConfig| {
-            keep_remote_location(&mut incoming.run_location, &current.run_location);
-        },
+        |_, _| {},
     );
 
     // 设置整体跟随导入文件（换机迁移主要靠它），但导出的空凭据一律保留本机值。
@@ -259,13 +242,6 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
     settings.scheduled_backup_last_run = config.settings.scheduled_backup_last_run.clone();
     settings.scheduled_container_last_run = config.settings.scheduled_container_last_run.clone();
     settings.scheduled_shutdown_last_run = config.settings.scheduled_shutdown_last_run.clone();
-    // 控制机的指向同理跟本机走：导出把它抹空是给没装 agent 的机器准备的，
-    // 而本机重新导入自己的配置时被抹空的那份顶掉，等于静默拆掉这条线 ——
-    // 两条配置的执行位（上面按条保留）就成了无主状态，定时与手动都不再走控制机。
-    if settings.agent_server_id.trim().is_empty() && !config.settings.agent_server_id.trim().is_empty()
-    {
-        settings.agent_server_id = config.settings.agent_server_id.clone();
-    }
     config.settings = settings;
 
     preview.kept_local_secrets = kept;
@@ -275,7 +251,6 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Settings;
     use crate::store::testutil::{config_with_secrets, export_with_server, temp_store};
 
     #[test]
@@ -329,56 +304,6 @@ mod tests {
         assert_eq!(after.scheduled_backup_last_run, "");
         assert_eq!(after.scheduled_container_last_run, "");
         assert_eq!(after.scheduled_shutdown_last_run, "");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// 同一台机器重新导入自己的配置：不能把控制机那根线拆了。
-    ///
-    /// 拆掉的后果不是「报错」而是**两份包**：本机撒手回自己跑，而控制机上那份到点照跑，
-    /// 同一个库同一晚被导出两次、包落在两台机器上，恢复时只找得到其中一份。
-    #[test]
-    fn import_keeps_this_machines_agent_wiring() {
-        let (store, dir) = temp_store();
-        let mut config = AppConfig::default();
-        config.settings.agent_server_id = "ctrl".to_string();
-        let mut backup =
-            BackupConfig::new("夜间库".to_string(), "s1".to_string(), DbBackupSource::default());
-        backup.id = "b1".to_string();
-        backup.run_location = RunLocation::Remote;
-        config.backup_configs.push(backup);
-        config.container_configs.push(ContainerConfig {
-            id: "c1".to_string(),
-            name: "博客".to_string(),
-            server_id: "s1".to_string(),
-            project: "app".to_string(),
-            pause_source: false,
-            include_volumes: true,
-            include_images: false,
-            target: None,
-            created_at: String::new(),
-            run_location: RunLocation::Remote,
-        });
-        store.save_config(&config).unwrap();
-        let exported = store.export_config().unwrap();
-        // 导出侧确实抹掉了这两样，否则这条测试什么都没守住。
-        let payload: ExportData = serde_json::from_str(&exported).unwrap();
-        assert_eq!(payload.settings.agent_server_id, "");
-        assert_eq!(payload.backup_configs[0].run_location, RunLocation::Local);
-        assert_eq!(payload.container_configs[0].run_location, RunLocation::Local);
-
-        store.import_config(&exported).unwrap();
-        let after = store.load_config().unwrap();
-        assert_eq!(after.settings.agent_server_id, "ctrl");
-        assert_eq!(after.backup_configs[0].run_location, RunLocation::Remote);
-        assert_eq!(after.container_configs[0].run_location, RunLocation::Remote);
-
-        // 换到没装 agent 的机器才是导出抹掉它们的用途：本机没这根线时不能凭空长出来。
-        store.save_config(&AppConfig::default()).unwrap();
-        store.import_config(&exported).unwrap();
-        let on_fresh_machine = store.load_config().unwrap();
-        assert_eq!(on_fresh_machine.settings.agent_server_id, "");
-        assert_eq!(on_fresh_machine.backup_configs[0].run_location, RunLocation::Local);
-        assert_eq!(on_fresh_machine.container_configs[0].run_location, RunLocation::Local);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

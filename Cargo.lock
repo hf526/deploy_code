@@ -992,20 +992,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "deploy-agent"
-version = "0.1.5"
-dependencies = [
- "chrono",
- "deploy-core",
- "serde",
- "serde_json",
- "tokio",
- "uuid",
-]
-
-[[package]]
 name = "deploy-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "clap",
  "deploy-core",
@@ -1016,7 +1004,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-code"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "chrono",
  "deploy-core",
@@ -1032,7 +1020,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-core"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "aes-gcm 0.10.3",
  "base64 0.21.7",
@@ -1050,7 +1038,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "uuid",
- "windows-sys 0.61.2",
  "zeroize",
 ]
 

@@ -80,18 +80,6 @@ fn sanitize_settings(
 
 #[tauri::command(async)]
 pub fn save_settings(state: State<AppState>, mut settings: Settings) -> Result<Settings> {
-    // 控制机指向换了一台、而旧那台的同步指纹还在 —— 说明活儿真交出去过：旧机器上的 agent 读的是
-    // 它自己那份 config.json，不会自己停，那里面还挂着全部源机的明文口令。界面那个下拉框只做
-    // 「换指向」，所以这里只记一笔待办（不连服务器），真卸载由控制机页面的「收回」按钮下发。
-    let previous = state
-        .store
-        .load_config()?
-        .settings
-        .agent_server_id
-        .trim()
-        .to_string();
-    let next = settings.agent_server_id.trim().to_string();
-    let handed_off = state.store.load_agent_sync().is_for(&previous);
     state.store.mutate_config(|config| {
         sanitize_settings(
             &mut settings,
@@ -102,14 +90,6 @@ pub fn save_settings(state: State<AppState>, mut settings: Settings) -> Result<S
         config.settings = settings.clone();
         Ok(())
     })?;
-    if !previous.is_empty() && previous != next && handed_off {
-        state.store.remember_orphan_agent(&previous)?;
-    }
-    if !next.is_empty() {
-        // 又指回那台：它重新是现役控制机，「待收回」这条就没意义了（留着只会一直红着）。
-        // 反过来不成立 —— 只指过去、从没装过的机器不会被打上待办，因为 `handed_off` 要求指纹真记在它名下。
-        state.store.forget_orphan_agent(&next)?;
-    }
     Ok(settings)
 }
 
@@ -322,7 +302,6 @@ mod tests {
             include_images: true,
             target: None,
             created_at: String::new(),
-            run_location: deploy_core::RunLocation::Local,
         }
     }
 

@@ -5,7 +5,7 @@ use std::path::Path;
 use crate::error::{CoreError, Result};
 use crate::models::{FileContent, FileEntry, ReplaceSummary, SearchHit};
 
-use super::{git_error, normalize_rel, replace_all_occurrences, Git};
+use super::{git_error, is_git_dir_target, normalize_rel, replace_all_occurrences, Git};
 
 impl Git {
     /// 列出仓库内某个目录（相对路径，空串表示根目录）的内容，目录在前、按名称排序。
@@ -14,6 +14,13 @@ impl Git {
         let dir = self.path.join(&rel);
         if !dir.is_dir() {
             return Err(CoreError::not_found(format!("目录不存在: {rel}")));
+        }
+        // 目录可能是仓库里指向 `.git`（或仓库外）的符号链接：列出来等于把 git 内部目录摆进编辑器。
+        let root =
+            std::fs::canonicalize(&self.path).map_err(|e| CoreError::io_path(&self.path, e))?;
+        let canonical = std::fs::canonicalize(&dir).map_err(|e| CoreError::io_path(&dir, e))?;
+        if !canonical.starts_with(&root) || is_git_dir_target(&canonical, &root) {
+            return Err(CoreError::git(format!("不允许访问该目录: {rel}")));
         }
         let read = std::fs::read_dir(&dir).map_err(|e| CoreError::io_path(&dir, e))?;
         let mut entries = Vec::new();
@@ -68,6 +75,9 @@ impl Git {
                 "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
             )));
         }
+        if is_git_dir_target(&canonical, &root) {
+            return Err(CoreError::git(format!("不允许访问 .git 目录: {rel}")));
+        }
         let mut handle = File::open(&file).map_err(|e| CoreError::io_path(&file, e))?;
         // 只读取上限长度，避免超大文件（如 GB 级日志）整个读进内存导致 OOM。
         let size = handle
@@ -114,6 +124,9 @@ impl Git {
                         "文件路径越界（可能是指向仓库外的符号链接）: {rel}"
                     )));
                 }
+                if is_git_dir_target(&canonical, &root) {
+                    return Err(CoreError::git(format!("不允许访问 .git 目录: {rel}")));
+                }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                 let parent = file
@@ -125,6 +138,9 @@ impl Git {
                     return Err(CoreError::git(format!(
                         "文件路径越界（父目录指向仓库外）: {rel}"
                     )));
+                }
+                if is_git_dir_target(&canonical_parent, &root) {
+                    return Err(CoreError::git(format!("不允许访问 .git 目录: {rel}")));
                 }
             }
             Err(err) => return Err(CoreError::io_path(&file, err)),
@@ -313,6 +329,9 @@ impl Git {
                 continue;
             };
             if !canonical.starts_with(&root) {
+                continue;
+            }
+            if is_git_dir_target(&canonical, &root) {
                 continue;
             }
             let bytes = match std::fs::read(&file) {

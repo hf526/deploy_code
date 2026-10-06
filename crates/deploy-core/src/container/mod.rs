@@ -35,7 +35,6 @@ use std::time::Duration;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::engine::kill_script;
-use crate::disk;
 use crate::error::{CoreError, Result};
 use crate::models::{
     now_string, new_id, ContainerEvent, ContainerRecord, ContainerRecordKind, ContainerRequest,
@@ -476,6 +475,7 @@ impl ContainerEngine {
             Err(err) => {
                 record.status = DeployStatus::Failed;
                 record.error = Some(err.to_string());
+                clear_missing_bundle_path(&mut record);
                 logger.error(format!("{}失败: {err}", kind_label(&record.kind)));
             }
         }
@@ -534,12 +534,6 @@ impl ContainerEngine {
         let timeout = settings.container_timeout_secs.max(300);
         match job {
             ContainerJob::Snapshot(plan) => {
-                // 先查盘再连服务器：一次容器快照要几十分钟，跑到最后才发现盘满是最贵的失败。
-                // 只拦控制机（见 `Store::agent_mode`）：笔电的系统盘常常就剩十几 GB，
-                // 拿同一把尺子量会让原本能跑的定时备份升级后启动即失败。
-                if self.store.agent_mode() {
-                    disk::ensure_room(&self.bundle_dir(), 0)?;
-                }
                 logger.info(format!(
                     "来源: {} ({}@{})",
                     plan.source.name, plan.source.username, plan.source.host
@@ -645,10 +639,6 @@ impl ContainerEngine {
             )
             .await?;
 
-            // 打包完成才知道真实大小：按体积再查一次，别把盘写到爆。
-            if self.store.agent_mode() {
-                disk::ensure_room(&self.bundle_dir(), size)?;
-            }
             logger.progress(pull_span.0, "正在下载备份包到本机 ...");
             let mut last = u8::MAX;
             client
@@ -1177,6 +1167,18 @@ pub(crate) fn bundle_part_path(bundle: &Path) -> PathBuf {
     bundle.with_file_name(format!("{name}.part"))
 }
 
+/// 收尾时用：记录里的备份包路径没有对应文件就抹空。
+///
+/// `prepare` 在任务开始前就按计划写好了这个路径，之后的失败 / 取消 / 崩溃都可能让它
+/// 指向一个从未落地的文件。界面「恢复到目标服务器」与轮转的保留窗口判的都是它：
+/// 留着悬空路径，用户点了才报错，轮转还会把它当成一个真实包占掉保留席位，
+/// 于是本该留下的旧包被删掉。所以路径的语义就是「文件在这里」。
+pub fn clear_missing_bundle_path(record: &mut ContainerRecord) {
+    if !record.bundle_path.is_empty() && !Path::new(&record.bundle_path).is_file() {
+        record.bundle_path.clear();
+    }
+}
+
 /// `.part` 的收尾守卫：半途而废的下载文件必须跟着任务一起消失。
 ///
 /// 只在 `Err` 分支里手动删不够 —— 取消是直接把整条 future drop 掉，那一段代码根本轮不到执行，
@@ -1684,6 +1686,55 @@ DEPLOYCODE_LIST"));
         guard.disarm();
         drop(guard);
         assert!(part.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 失败 / 取消收尾要把「计划路径但没落文件」的悬空路径抹空：
+    /// 界面按它显示恢复入口，轮转也会把它当成真实包占掉一个保留席位。
+    #[test]
+    fn missing_bundle_file_is_cleared_from_the_record() {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-container-bundle-path-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = dir.join("done.tar");
+        std::fs::write(&existing, b"tar").unwrap();
+
+        let mut record = ContainerRecord {
+            kind: ContainerRecordKind::Backup,
+            id: "r1".to_string(),
+            project: "blog".to_string(),
+            server_id: "s1".to_string(),
+            server_name: "prod".to_string(),
+            target_server_id: String::new(),
+            target_server_name: String::new(),
+            target_dir: String::new(),
+            bundle_path: dir.join("never-written.tar").to_string_lossy().into_owned(),
+            bundle_size: 0,
+            services: Vec::new(),
+            volumes: Vec::new(),
+            images: Vec::new(),
+            include_volumes: true,
+            include_images: true,
+            status: DeployStatus::Running,
+            error: None,
+            log: String::new(),
+            started_at: String::new(),
+            finished_at: None,
+            duration_ms: 0,
+        };
+        clear_missing_bundle_path(&mut record);
+        assert_eq!(record.bundle_path, "", "没落地的计划路径要抹空");
+
+        record.bundle_path = existing.to_string_lossy().into_owned();
+        clear_missing_bundle_path(&mut record);
+        assert_eq!(
+            record.bundle_path,
+            existing.to_string_lossy(),
+            "文件真在的路径不许动"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -57,17 +57,6 @@ fn spawn_backup(
 
 #[tauri::command(async)]
 pub fn start_backup(app: AppHandle, state: State<AppState>, request: BackupRequest) -> Result<String> {
-    // 执行位在控制机的配置不在本机代跑：包会落在本机，而用户以为在控制机上。
-    // 界面的「立即备份」会把它交给 start_agent_backup，能走到这里就是绕过了那条路。
-    if let Some(key) = request
-        .backup_config_id
-        .as_deref()
-        .filter(|key| !key.trim().is_empty())
-    {
-        let config = state.store.load_config()?;
-        let saved = Store::find_backup_config(&config, key)?;
-        saved.run_location.assert_runs_here(&saved.name)?;
-    }
     // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
     let claim = match ClaimGuard::acquire(&app, ClaimKind::Backup)? {
         Some(claim) => claim,

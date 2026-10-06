@@ -6,9 +6,6 @@ export type SshAuth =
   | { type: "password"; password: string }
   | { type: "privateKey"; keyPath: string; passphrase: string | null };
 
-/** 备份任务的执行位（Rust: deploy_core::models::RunLocation）。 */
-export type RunLocation = "local" | "remote";
-
 /** 关机计划的来源：每天定时排的那一次，或用户手动按下的倒计时。 */
 export type ShutdownSource = "scheduled" | "manual";
 
@@ -56,12 +53,6 @@ export interface SchedulerNotice {
     | "containerStarted"
     | "containerNoConfig"
     | "containerFailed"
-    | /** 到点了，但这条配置今晚由控制机执行：本机让位（正常收尾，不是失败）。 */
-      "remoteSkipped"
-    | /** 让位给控制机，可它拿的是上次下发的那份定时：今晚跑的不是用户以为的设置。 */
-      "agentStale"
-    | /** 执行位已改回本机的配置，控制机那份里还留着：今晚两边各跑一次。 */
-      "agentStranded"
     | "shutdownFired"
     | /** 倒计时期间电脑睡眠（或时钟前跳），唤醒后计划已过期：刻意放弃这次关机，不是失败。 */
       "shutdownMissed"

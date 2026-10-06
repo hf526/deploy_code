@@ -13,8 +13,6 @@ use crate::models::{
 };
 
 /// 一个「盘上有文件、记录里已经没有指向它」的本地备份包。见 [`Store::orphan_bundles`]。
-///
-/// agent 侧 `prune --list` 也用它回传清单（客户端按同一形状反序列化），所以要双向可序列化。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OrphanBundle {
@@ -194,8 +192,9 @@ impl Store {
             .ok_or_else(|| CoreError::busy("容器备份 / 迁移正在进行，请等它结束后再清理备份包"))?;
         let dirs = [self.db_bundle_dir(), self.container_bundle_dir()];
         let referenced = self.referenced_bundle_keys()?;
-        let mut deleted = 0usize;
-        let mut freed = 0u64;
+        // 先把每一条都验完再动手：混进一条越界或仍被引用的路径时整批拒绝，
+        // 不能让前面的合法项已经删掉、界面却收到一个失败（重试时状态对不上）。
+        let mut targets: Vec<(PathBuf, u64)> = Vec::with_capacity(paths.len());
         for raw in paths {
             let path = PathBuf::from(raw.trim());
             let parent = match path.parent() {
@@ -224,6 +223,12 @@ impl Store {
                 )));
             }
             let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+            targets.push((path, size));
+        }
+
+        let mut deleted = 0usize;
+        let mut freed = 0u64;
+        for (path, size) in targets {
             match std::fs::remove_file(&path) {
                 Ok(_) => {
                     deleted += 1;
@@ -290,6 +295,9 @@ impl Store {
             CONTAINER_LABEL,
             message,
         )?;
+        // 崩溃 / 强杀留下的容器记录：计划路径可能从未落地，收尾时一并抹空，
+        // 否则历史里会留下点了才报错的「恢复」入口，轮转还会把它当成真实包占保留席位。
+        self.clear_dangling_container_bundles()?;
         Ok(converted)
     }
 
@@ -309,8 +317,8 @@ impl Store {
     }
 
     /// 被硬杀（SIGKILL / OOM / 断电）的任务没有任何 Drop 机会：它下到一半的 `*.part`
-    /// 半截包既进不了记录（轮转看不见），又被孤儿视图刻意排除，从此无人认领，控制机的
-    /// 数据目录会被几 GB 级的半成品慢慢吃满。借收敛这次机会顺手清掉：走到这里四把任务
+    /// 半截包既进不了记录（轮转看不见），又被孤儿视图刻意排除，从此无人认领，数据目录
+    /// 会被几 GB 级的半成品慢慢吃满。借收敛这次机会顺手清掉：走到这里四把任务
     /// 锁都在手上，盘上的 `.part` 必然没有活着的写手。删失败就留给下一轮。
     fn sweep_orphan_part_files(&self) -> Result<usize> {
         let mut swept = 0usize;
@@ -333,7 +341,7 @@ impl Store {
         Ok(swept)
     }
 
-    /// 半路放弃一条数据库备份时，把本机（控制机）那条 Running 收成失败。
+    /// 半路放弃一条数据库备份时，把本机那条 Running 收成失败。
     ///
     /// 不能留给 [`reconcile_interrupted`]：它要求四把任务锁都没人持有，而放弃发生的这一刻
     /// 我们正持有自己那一把 —— 等下去就是记录永远挂着「进行中」。
@@ -350,7 +358,29 @@ impl Store {
             CONTAINER_LABEL,
             record_id,
             reason,
-        )
+        )?;
+        self.clear_dangling_container_bundles()?;
+        Ok(())
+    }
+
+    /// 已持有写守卫时调用：把指向不存在文件的容器包路径抹空。
+    ///
+    /// 计划路径由 `ContainerEngine::prepare` 提前写下，正常失败由引擎收尾清理；
+    /// 但取消 / 强杀是整条 future 被 drop，只能在这些收敛路径上补一刀。
+    fn clear_dangling_container_bundles(&self) -> Result<usize> {
+        let mut records =
+            load_records::<ContainerRecord>(&self.containers_path(), CONTAINER_LABEL)?;
+        let mut cleared = 0usize;
+        for record in records.iter_mut() {
+            if !record.bundle_path.is_empty() && !Path::new(&record.bundle_path).is_file() {
+                record.bundle_path.clear();
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            write_records(&self.containers_path(), &records)?;
+        }
+        Ok(cleared)
     }
 }
 
@@ -851,6 +881,68 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 崩溃收敛时，指向不存在文件的容器包路径要抹空（计划路径从未落地）；
+    /// 文件真在的那条不动，恢复入口仍要可用。
+    #[test]
+    fn mark_interrupted_clears_dangling_container_bundle_paths() {
+        let dir = std::env::temp_dir()
+            .join(format!("deploycode-store-dangling-{}", uuid::Uuid::new_v4()));
+        let store = Store::new(&dir);
+        let bundle_dir = store.container_bundle_dir();
+        std::fs::create_dir_all(&bundle_dir).unwrap();
+        let landed = bundle_dir.join("blog-20260101-000000-aaaa.tar");
+        std::fs::write(&landed, b"tar").unwrap();
+
+        let make = |id: &str, path: String| ContainerRecord {
+            id: id.to_string(),
+            kind: crate::models::ContainerRecordKind::Backup,
+            project: "blog".to_string(),
+            server_id: "s1".to_string(),
+            server_name: "prod".to_string(),
+            target_server_id: String::new(),
+            target_server_name: String::new(),
+            target_dir: String::new(),
+            bundle_path: path,
+            bundle_size: 0,
+            services: Vec::new(),
+            volumes: Vec::new(),
+            images: Vec::new(),
+            include_volumes: true,
+            include_images: true,
+            status: DeployStatus::Running,
+            error: None,
+            log: String::new(),
+            started_at: "2026-01-01 00:00:00".to_string(),
+            finished_at: None,
+            duration_ms: 0,
+        };
+        store
+            .upsert_container(
+                &make(
+                    "ghost",
+                    bundle_dir.join("never.tar").to_string_lossy().into_owned(),
+                ),
+                0,
+            )
+            .unwrap();
+        store
+            .upsert_container(&make("landed", landed.to_string_lossy().into_owned()), 0)
+            .unwrap();
+
+        assert_eq!(store.mark_interrupted().unwrap(), 2);
+        assert_eq!(
+            store.find_container_record("ghost").unwrap().bundle_path,
+            "",
+            "没落地的计划路径要抹空"
+        );
+        assert_eq!(
+            store.find_container_record("landed").unwrap().bundle_path,
+            landed.to_string_lossy(),
+            "文件真在的路径不许动"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 记录被裁剪或手动删掉之后留在盘上的包要能看见、能清，同时越界路径与有记录的包一律不许删。
     #[test]
     fn orphan_bundles_lists_files_without_records_and_protects_the_rest() {
@@ -902,6 +994,12 @@ mod tests {
             .expect_err("越界路径必须拒绝");
         assert!(err.to_string().contains("只能删除备份包目录"), "{err}");
         assert!(orphan.is_file());
+        // 合法项与越界项混在一批：整批拒绝，合法的那条也不许先被删掉。
+        let err = store
+            .delete_orphan_bundles(&[orphan.display().to_string(), outside.display().to_string()])
+            .expect_err("混入越界路径必须整批拒绝");
+        assert!(err.to_string().contains("只能删除备份包目录"), "{err}");
+        assert!(orphan.is_file(), "整批拒绝时前面的合法项也不能删");
         // 还挂在记录上的不许删。
         assert!(store
             .delete_orphan_bundles(&[kept.display().to_string()])

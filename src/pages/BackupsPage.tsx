@@ -28,12 +28,10 @@ import {
   SelectBox,
 } from "../components/ui";
 import { api } from "../lib/api";
-import { stalenessHints } from "../lib/agent";
 import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
 import { enqueueSettingsSave } from "../lib/settingsDraft";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
-import { useAgentStaleness } from "../lib/useAgentStaleness";
 import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
 import { BackupConfigModal } from "./backup/BackupConfigModal";
 import { BackupTargetsCard } from "./backup/BackupTargetsCard";
@@ -61,8 +59,6 @@ export default function BackupsPage() {
   const backupTargets = useApp((state) => state.backupTargets);
   const backupConfigs = useApp((state) => state.backupConfigs);
   const settings = useApp((state) => state.settings);
-  // 控制机上那份定时是不是旧的：这一栏的意义就是跟着刚改完的设置走。
-  const staleness = useAgentStaleness(settings);
   const liveBackup = useApp((state) => state.liveBackup);
   const startBackup = useApp((state) => state.startBackup);
   const refreshBackups = useApp((state) => state.refreshBackups);
@@ -399,14 +395,6 @@ export default function BackupsPage() {
                   ? t("backup.schedule.summary", { time: settings.scheduledBackupTime })
                   : t("backup.schedule.disabled")}
               </p>
-              {stalenessHints(staleness).backupSchedule && (
-                <p className="text-[11px] leading-relaxed text-neg">{t("agent.staleScheduleBackup")}</p>
-              )}
-              {stalenessHints(staleness).stragglers && (
-                <p className="text-[11px] leading-relaxed text-neg">
-                  {t("agent.stragglerList", { names: stalenessHints(staleness).stragglers })}
-                </p>
-              )}
             </Card>
           </section>
 

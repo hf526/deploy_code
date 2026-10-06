@@ -12,7 +12,6 @@ use tokio::sync::mpsc;
 use crate::cli::*;
 use crate::output;
 
-mod agent;
 mod backup;
 mod branch;
 mod container;
@@ -32,7 +31,6 @@ pub async fn dispatch(cli: &Cli) -> Result<()> {
         Command::Backup(command) => backup::backup_command(cli, command).await,
         Command::Container(command) => container::container_command(cli, command).await,
         Command::Pages(command) => pages::pages_command(cli, command).await,
-        Command::Agent(command) => agent::agent_command(cli, command).await,
         Command::Where => {
             let store = open_store(cli)?;
             output::info(store.base_dir().display().to_string());

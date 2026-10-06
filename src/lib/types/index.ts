@@ -10,5 +10,4 @@ export * from "./security";
 export * from "./backup";
 export * from "./pages";
 export * from "./container";
-export * from "./agent";
 export * from "./cronjob";

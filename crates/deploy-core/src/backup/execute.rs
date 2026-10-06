@@ -6,7 +6,6 @@ use super::db_url::split_database_url;
 use super::scripts::{build_backup_script, remote_dump_path};
 use super::{BackupEngine, BackupOutcome};
 use crate::container::{safe_component, short_id};
-use crate::disk;
 use crate::error::{CoreError, Result};
 use crate::models::{BackupEvent, BackupRecord, DbBackupSource, ServerConfig};
 use crate::process::shell_quote;
@@ -37,11 +36,6 @@ impl BackupEngine {
         let server = Store::find_server(&config, &record.server_id)?.clone();
         // 留存开关：0 时脚本跑完照旧把远端导出删掉、本机什么都不留（改动前的行为）。
         let keep = settings.db_bundle_keep > 0;
-        // 水位闸只拦控制机（见 `Store::agent_mode`）：笔电上少一道保险，总好过定时备份
-        // 突然因为系统盘只剩十几个 GB 而启动即失败。
-        if keep && self.store.agent_mode() {
-            disk::ensure_room(&self.store.db_bundle_dir(), 0)?;
-        }
 
         let source_label = if source.is_docker() {
             format!("docker 容器 {}", source.container)
@@ -84,7 +78,7 @@ impl BackupEngine {
                 Ok(size) => size,
                 // KEEP=1 时脚本刻意放过导出文件（等本机来下载），所以失败路径必须由调用方来删它。
                 // 最常见的失败是 STAGE:3/4 导入阶段非零退出 —— 那时全库 gzip 已经躺在源机 /tmp 上，
-                // 而控制机那边 `db_bundle_keep` 兜底成 2，等于每晚失败一次就留一份、没人收。
+                // 漏删一次就是每晚失败一次就留一份、没人收。
                 Err(err) => {
                     if keep {
                         let _ = client
@@ -153,10 +147,6 @@ impl BackupEngine {
     ) -> Result<PathBuf> {
         if let Some(parent) = bundle.parent() {
             std::fs::create_dir_all(parent).map_err(|e| CoreError::io_path(parent, e))?;
-            // 导出完成才知道真实大小：按体积再查一次，别把盘写到爆（同样只拦控制机）。
-            if self.store.agent_mode() {
-                disk::ensure_room(parent, expected)?;
-            }
         }
         logger.command("正在下载导出包到本机 ...");
         let part = crate::container::bundle_part_path(bundle);
