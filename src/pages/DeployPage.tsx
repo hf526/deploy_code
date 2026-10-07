@@ -626,6 +626,7 @@ export default function DeployPage() {
                     }
                     onCopy={() => void copyUrl(record.url ?? "")}
                     onDelete={() => void handleDeletePagesRecord(record.id)}
+                    deleteDisabled={record.status === "running"}
                     selected={selectedPages.has(record.id)}
                     selectionDisabled={record.status === "running"}
                     selectionLabel={
@@ -989,6 +990,7 @@ function PagesRecordRow({
   onToggle,
   onCopy,
   onDelete,
+  deleteDisabled,
   selected,
   onSelect,
   selectionLabel,
@@ -999,6 +1001,7 @@ function PagesRecordRow({
   onToggle: () => void;
   onCopy: () => void;
   onDelete: () => void;
+  deleteDisabled: boolean;
   selected: boolean;
   onSelect: (on: boolean) => void;
   selectionLabel: string;
@@ -1021,6 +1024,7 @@ function PagesRecordRow({
       }
       deleteTitle={t("backup.deleteRecord")}
       onDelete={onDelete}
+      deleteDisabled={deleteDisabled}
       selected={selected}
       onSelect={onSelect}
       selectionLabel={selectionLabel}

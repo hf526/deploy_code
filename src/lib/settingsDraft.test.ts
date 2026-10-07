@@ -1,12 +1,39 @@
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Settings } from "./types";
+
+/** 捕获即时保存真正提交出去的那份 body（`saveSettingsGroup` 的测试要用）。 */
+const sent: { body: Settings | null } = { body: null };
 
 vi.mock("./i18n", () => ({
   normalizeLanguagePreference: (value: string) => (value === "en-US" ? "en-US" : "zh-CN"),
 }));
 
-const { enqueueSettingsSave, mergedGroup, normalizeSettings } = await import("./settingsDraft");
+vi.mock("./api", () => ({
+  api: {
+    saveSettings: (body: Settings) => {
+      sent.body = body;
+      return Promise.resolve(body);
+    },
+  },
+}));
+
+/** 只替掉 store 的读/写两个口，`saveSettingsGroup` 依赖 `useApp.getState().settings`。 */
+let committed: Settings;
+vi.mock("./store", () => ({
+  useApp: {
+    getState: () => ({ settings: committed }),
+    setState: () => undefined,
+  },
+}));
+
+const {
+  SETTINGS_FIELD_GROUPS,
+  enqueueSettingsSave,
+  mergedGroup,
+  normalizeSettings,
+  saveSettingsGroup,
+} = await import("./settingsDraft");
 
 function settings(overrides: Partial<Settings> = {}): Settings {
   return {
@@ -160,5 +187,87 @@ describe("enqueueSettingsSave：整表回写只许一条车道", () => {
     await expect(failing).rejects.toThrow("存不上");
     await expect(ok).resolves.toMatchObject({ releaseKeep: 9 });
     expect(store.current().releaseKeep).toBe(9);
+  });
+});
+
+describe("saveSettingsGroup：模块页的即时保存也只提交本组", () => {
+  // 定时备份三个字段就是 BackupsPage 那一组的全部内容。
+  const SCHEDULE_KEYS = [
+    "scheduledBackupEnabled",
+    "scheduledBackupTime",
+    "scheduledBackupConfigId",
+  ] as const satisfies readonly (keyof Settings)[];
+
+  beforeEach(() => {
+    sent.body = null;
+    committed = settings();
+  });
+
+  it("只提交本组字段，别组已落盘的值原样带上", async () => {
+    committed = settings({ connectTimeoutSecs: 42, githubToken: "已落盘的 token" });
+
+    await saveSettingsGroup(SCHEDULE_KEYS, { scheduledBackupEnabled: true });
+
+    expect(sent.body?.scheduledBackupEnabled).toBe(true);
+    expect(sent.body?.connectTimeoutSecs).toBe(42);
+    expect(sent.body?.githubToken).toBe("已落盘的 token");
+    // 没碰过的调度字段保持落盘值，不会被抹成默认。
+    expect(sent.body?.scheduledBackupTime).toBe("03:00");
+  });
+
+  it("本组字段照样过规范化：越界的数值被夹回边界", async () => {
+    await saveSettingsGroup(SCHEDULE_KEYS, { scheduledBackupTime: "99:99" });
+
+    // 非法时间回落默认值（这是「时间和正则」那三条重复控件共同的兜底）。
+    expect(sent.body?.scheduledBackupTime).toBe("03:00");
+  });
+
+  it("提交的是排队时刻的快照，不是调用时刻的旧快照", async () => {
+    committed = settings({ githubToken: "旧" });
+
+    // 第一次提交还没跑完就把 store 里的值换成新的（模拟别处刚落盘的一份）。
+    const first = saveSettingsGroup(SCHEDULE_KEYS, { scheduledBackupEnabled: true });
+    committed = settings({ githubToken: "新" });
+    await first;
+
+    await saveSettingsGroup(SCHEDULE_KEYS, { scheduledBackupTime: "05:00" });
+
+    // 第二次不能拿着「旧」把刚落盘的「新」顶回去。
+    expect(sent.body?.githubToken).toBe("新");
+    expect(sent.body?.scheduledBackupTime).toBe("05:00");
+  });
+});
+
+describe("SETTINGS_FIELD_GROUPS：每个 Settings 字段都要有归属", () => {
+  it("字段名与 fixture 逐个对齐（漏登记或多登记都会红）", () => {
+    // fixture 的字段集就是 Settings 的全部字段；TS 侧另外还有一层编译期保险
+    // （`Record<keyof Settings, SettingsGroupName>`），这条负责挡住拼错名字那种情况。
+    expect(Object.keys(SETTINGS_FIELD_GROUPS).sort()).toEqual(Object.keys(settings()).sort());
+  });
+
+  it("没有字段被漏掉 normalizeSettings 之外的兜底（数值字段都有限幅）", () => {
+    // 哨兵：把每个数值字段塞成越界值，normalizeSettings 后不该留下原值。
+    const wild = normalizeSettings(
+      settings({
+        connectTimeoutSecs: 0,
+        scriptTimeoutSecs: 0,
+        historyLimit: 0,
+        pagesHistoryLimit: 0,
+        backupHistoryLimit: 0,
+        backupTimeoutSecs: 0,
+        containerHistoryLimit: 0,
+        containerTimeoutSecs: 0,
+        releaseKeep: 0,
+      }),
+    );
+    expect(wild.connectTimeoutSecs).toBeGreaterThanOrEqual(3);
+    expect(wild.scriptTimeoutSecs).toBeGreaterThanOrEqual(10);
+    expect(wild.historyLimit).toBeGreaterThanOrEqual(20);
+    expect(wild.pagesHistoryLimit).toBeGreaterThanOrEqual(10);
+    expect(wild.backupHistoryLimit).toBeGreaterThanOrEqual(10);
+    expect(wild.backupTimeoutSecs).toBeGreaterThanOrEqual(60);
+    expect(wild.containerHistoryLimit).toBeGreaterThanOrEqual(10);
+    expect(wild.containerTimeoutSecs).toBeGreaterThanOrEqual(300);
+    expect(wild.releaseKeep).toBeGreaterThanOrEqual(1);
   });
 });

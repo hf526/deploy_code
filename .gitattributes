@@ -1,0 +1,10 @@
+# 界面文案的行尾：AGENTS.md 要求这两份文件是 2 空格缩进 + CRLF + 末尾一个 CRLF，
+# 而「改完 re-dump 一遍、与原文件逐字节一致」是那套改法的校验口径。
+# 不声明的话，Linux / macOS 检出会把它们折成 LF，逐字节校验在别人机器上就永远对不上
+# （src/lib/locales.test.ts 因此只能测「不混用」，不敢钉死 CRLF）。
+# 只钉这两个文件，不要写成 `*.json` —— 那会把 package.json / tauri.conf.json 一起改行尾。
+/src/locales/*.json text eol=crlf
+
+# 图标等二进制不做行尾转换。
+*.png binary
+*.ico binary

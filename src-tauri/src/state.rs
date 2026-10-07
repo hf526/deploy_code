@@ -679,3 +679,137 @@ impl AppState {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    static SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// 每个用例一个独立数据目录：`try_claim` 会真的建跨进程锁文件，
+    /// 共用目录会让并行跑的用例互相抢锁、出现莫名其妙的「已有任务在进行」。
+    fn state() -> AppState {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-state-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::SeqCst)
+        ));
+        AppState::new(Arc::new(Store::new(dir)))
+    }
+
+    #[test]
+    fn same_kind_claim_is_exclusive_until_released() {
+        let state = state();
+        assert!(state.try_claim_deploy().unwrap());
+        // 第二个同类任务必须被挡下：放进去就是两个部署同时写同一份历史、同一台服务器。
+        assert!(!state.try_claim_deploy().unwrap());
+        state.release_deploy_claim();
+        assert!(state.try_claim_deploy().unwrap());
+    }
+
+    #[test]
+    fn different_kinds_claim_independently() {
+        let state = state();
+        // 五类任务各有独立名额：一条容器迁移跑几十分钟，不能把部署一起锁死。
+        assert!(state.try_claim_deploy().unwrap());
+        assert!(state.try_claim_backup().unwrap());
+        assert!(state.try_claim_pages().unwrap());
+        assert!(state.try_claim_nginx().unwrap());
+        assert!(state.try_claim_container().unwrap());
+    }
+
+    #[test]
+    fn container_cleanup_occupies_the_container_slot() {
+        let state = state();
+        assert!(state.try_begin_container_cleanup());
+        // 清理期间旧任务还会按 compose 标签把容器 `docker start` 回来，
+        // 此时放进新任务就是对同一批项目一边 stop 一边 start。
+        assert!(state.has_active_container());
+        assert!(!state.try_claim_container().unwrap());
+        // 第二场清理不重复占位（由第一场负责放开）。
+        assert!(!state.try_begin_container_cleanup());
+
+        state.end_container_cleanup();
+        assert!(!state.has_active_container());
+        assert!(state.try_claim_container().unwrap());
+    }
+
+    #[test]
+    fn container_claim_alone_counts_as_active() {
+        let state = state();
+        assert!(state.try_claim_container().unwrap());
+        // 退出清理据此推迟退出：名额被占就必须等远端收尾。
+        assert!(state.has_active_container());
+    }
+
+    #[test]
+    fn cancel_scheduled_shutdown_leaves_manual_countdown_alone() {
+        let state = state();
+        state.arm_shutdown(PendingShutdown {
+            at_ms: 1_000,
+            source: ShutdownSource::Manual,
+        });
+        // 关掉「每天定时关机」开关，不该把用户刚按下的倒计时一起取消。
+        assert!(state.cancel_scheduled_shutdown().is_none());
+        assert!(matches!(
+            state.pending_shutdown(),
+            Some(plan) if plan.source == ShutdownSource::Manual
+        ));
+
+        state.arm_shutdown(PendingShutdown {
+            at_ms: 2_000,
+            source: ShutdownSource::Scheduled,
+        });
+        assert!(state.cancel_scheduled_shutdown().is_some());
+        assert!(state.pending_shutdown().is_none());
+    }
+
+    #[test]
+    fn due_shutdown_is_taken_exactly_once() {
+        let state = state();
+        state.arm_shutdown(PendingShutdown {
+            at_ms: 5_000,
+            source: ShutdownSource::Manual,
+        });
+        // 没到点不许摘走：摘早了用户就再也取消不掉这次关机。
+        assert!(state.take_due_shutdown(4_999).is_none());
+        assert!(state.pending_shutdown().is_some());
+        // 到点摘走，且第二次必须为空 —— 否则同一计划会被下发两次。
+        assert!(state.take_due_shutdown(5_000).is_some());
+        assert!(state.take_due_shutdown(5_000).is_none());
+    }
+
+    #[test]
+    fn cancel_shutdown_returns_and_clears_the_plan() {
+        let state = state();
+        state.arm_shutdown(PendingShutdown {
+            at_ms: 7_000,
+            source: ShutdownSource::Manual,
+        });
+        assert_eq!(state.cancel_shutdown().map(|plan| plan.at_ms), Some(7_000));
+        assert!(state.cancel_shutdown().is_none());
+    }
+
+    #[tokio::test]
+    async fn deploy_tracking_round_trip_and_pending_cleanup_dedup() {
+        let state = state();
+        let abort = tokio::spawn(async {}).abort_handle();
+        let active = ActiveDeploy {
+            server_id: "s1".to_string(),
+            target_dir: "/opt/app".to_string(),
+            abort,
+        };
+
+        state.track_deploy("r1", active.clone());
+        assert!(state.take_deploy("r1").is_some());
+        // 取走之后退出清理不该再看到它（取消流程自己负责那段远端收尾）。
+        assert!(state.take_deploy("r1").is_none());
+
+        // 重复登记同一记录只保留先登记的那一项：取消与退出清理会各登记一次。
+        state.add_pending_cleanup("r1", active.clone());
+        state.add_pending_cleanup("r1", active);
+        assert_eq!(state.take_pending_cleanups().len(), 1);
+        assert!(state.take_pending_cleanups().is_empty());
+    }
+}

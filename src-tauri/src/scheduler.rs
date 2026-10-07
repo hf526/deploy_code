@@ -62,7 +62,11 @@ pub fn spawn(app: AppHandle) {
             fire_due_shutdown(&app, now);
 
             let Ok(config) = app.state::<AppState>().store.load_config() else {
-                last_tick = now;
+                // 读不出来（config.json 正被另一次写占着、盘一时读不动）时**不要推进
+                // `last_tick`**：到点判定看的是 `(last_tick, now]` 这个区间，推进了就等于
+                // 把这一跳跨过的时间点宣告成「已经过去」，而这一跳根本没做判定 ——
+                // 正好落在到点那一跳时会当天永久跳过这次备份（下面的关机 arm 同样跳过），
+                // 用户那边零提示。保持 last_tick 不变，下一 tick 读得动时会照常判成「刚跨过」。
                 continue;
             };
             let settings = config.settings.clone();
@@ -171,7 +175,8 @@ pub fn spawn_container(app: AppHandle) {
             tokio::time::sleep(CHECK_INTERVAL).await;
             let now = Local::now();
             let Ok(config) = app.state::<AppState>().store.load_config() else {
-                last_tick = now;
+                // 同 spawn：这一跳没做判定就不能推进 last_tick，否则到点那一跳读失败
+                // 等于把今晚的容器备份静默作废。
                 continue;
             };
             let settings = &config.settings;

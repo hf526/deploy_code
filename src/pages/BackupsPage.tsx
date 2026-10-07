@@ -29,7 +29,7 @@ import {
 } from "../components/ui";
 import { api } from "../lib/api";
 import { pruneSelection, selectionState, toggleAll, toggleId } from "../lib/selection";
-import { enqueueSettingsSave } from "../lib/settingsDraft";
+import { saveSettingsGroup } from "../lib/settingsDraft";
 import { useApp } from "../lib/store";
 import type { BackupConfig, BackupRecord, Settings } from "../lib/types";
 import { cn, deployStatusLabel, statusBadgeKind } from "../lib/utils";
@@ -51,6 +51,13 @@ function humanSize(bytes: number): string {
   }
   return `${value.toFixed(index === 0 ? 0 : 1)} ${units[index]}`;
 }
+
+/** 定时备份这一组能提交的字段：即时保存只许动这三项（其余字段沿用盘上那份）。 */
+const SCHEDULED_BACKUP_KEYS = [
+  "scheduledBackupEnabled",
+  "scheduledBackupTime",
+  "scheduledBackupConfigId",
+] as const satisfies readonly (keyof Settings)[];
 
 export default function BackupsPage() {
   const { t } = useTranslation();
@@ -118,9 +125,9 @@ export default function BackupsPage() {
   /** 定时备份设置即时保存（开关 / 时间 / 配置选择）。 */
   async function handleSaveSchedule(patch: Partial<Settings>) {
     try {
-      const saved = await enqueueSettingsSave(async () =>
-        api.saveSettings({ ...useApp.getState().settings, ...patch }),
-      );
+      // 走本组车道（saveSettingsGroup）：整表 `{ ...settings, ...patch }` 会把别的卡片
+      // 尚未过 normalizeSettings 的值一起落盘，等于把限幅绕掉。
+      const saved = await saveSettingsGroup<Settings>(SCHEDULED_BACKUP_KEYS, patch);
       setSettings(saved);
       toast("success", t("backup.schedule.saved"));
     } catch (error) {
@@ -472,6 +479,7 @@ export default function BackupsPage() {
                     badge={statusBadge(record)}
                     deleteTitle={t("backup.deleteRecord")}
                     onDelete={() => void handleDelete(record.id)}
+                    deleteDisabled={record.status === "running"}
                     selected={selectedRecords.has(record.id)}
                     selectionDisabled={record.status === "running"}
                     selectionLabel={

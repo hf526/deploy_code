@@ -1,5 +1,82 @@
+import { api } from "./api";
 import { normalizeLanguagePreference } from "./i18n";
+import { useApp } from "./store";
 import type { Settings } from "./types";
+
+/**
+ * 每一个 Settings 字段属于哪一块界面 —— **由编译器强制维护**。
+ *
+ * 这张表本身没有运行时用途，它存在的唯一理由是那个 `Record<keyof Settings, GroupName>`
+ * 标注：`Settings` 里新增一个字段而这里没登记时，`npm run build` 的 `tsc` 步骤直接报错。
+ * 在此之前，「新字段有没有落进某个板块的 groupKeys」只能靠人记，已经漏过一次 ——
+ * `dbBundleKeep`（数据库导出包保留数）至今没有任何卡片能写它，GUI 用户够不着这个功能。
+ *
+ * 新增字段时的三步：① 这里登记归属；② 该板块的 `*_KEYS` 里加上它（要能提交）；
+ * ③ 需要限幅 / 兜底的写进 `normalizeSettings`。
+ */
+export type SettingsGroupName =
+  | "appearance"
+  | "deployDefaults"
+  | "backupTargets"
+  | "containerParams"
+  | "scheduledBackup"
+  | "scheduledContainer"
+  | "shutdownMachine"
+  | "credentials"
+  | "storage"
+  | "internal";
+
+export const SETTINGS_FIELD_GROUPS: Record<keyof Settings, SettingsGroupName> = {
+  language: "appearance",
+  scriptDir: "deployDefaults",
+  runScripts: "deployDefaults",
+  connectTimeoutSecs: "deployDefaults",
+  scriptTimeoutSecs: "deployDefaults",
+  keepRemoteArchive: "deployDefaults",
+  historyLimit: "deployDefaults",
+  atomicRelease: "deployDefaults",
+  releaseKeep: "deployDefaults",
+  pagesHistoryLimit: "deployDefaults",
+  backupHistoryLimit: "backupTargets",
+  backupTimeoutSecs: "backupTargets",
+  defaultBackupTargetId: "backupTargets",
+  supabaseUrl: "backupTargets",
+  containerHistoryLimit: "containerParams",
+  containerTimeoutSecs: "containerParams",
+  containerBundleKeep: "containerParams",
+  // 还没有任何界面写它：后端默认 0（不落本机导出包）。登记成 storage 是待办标记，
+  // 要么补进 StorageSection，要么明确「只给 CLI 用」。
+  dbBundleKeep: "storage",
+  scheduledBackupEnabled: "scheduledBackup",
+  scheduledBackupTime: "scheduledBackup",
+  scheduledBackupConfigId: "scheduledBackup",
+  scheduledContainerEnabled: "scheduledContainer",
+  scheduledContainerTime: "scheduledContainer",
+  scheduledContainerConfigIds: "scheduledContainer",
+  scheduledShutdownEnabled: "shutdownMachine",
+  scheduledShutdownTime: "shutdownMachine",
+  cloudflareApiToken: "credentials",
+  cloudflareAccountId: "credentials",
+  githubToken: "credentials",
+  cronjobApiKey: "credentials",
+  // 三条调度循环各自「已触发」的调度日期：由后端写入，界面只读不写。
+  scheduledBackupLastRun: "internal",
+  scheduledShutdownLastRun: "internal",
+  scheduledContainerLastRun: "internal",
+  // 主密码哈希：没有界面入口，但参与导出抹除与导入保留两条不变量。
+  masterPasswordHash: "internal",
+};
+
+/**
+ * 三条定时时间的共同兜底：`<Input type="time">` 正常送不出非法值，但旧数据 / 手改持久化
+ * 文件可以，`99:99` 这种「格式对、数值越界」的串必须拦在落盘前，回落各自板块的默认点。
+ */
+function normalizeScheduledTime(value: string, fallback: string): string {
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  const hours = match ? Number(match[1]) : -1;
+  const minutes = match ? Number(match[2]) : -1;
+  return hours >= 0 && hours <= 23 && minutes >= 0 && minutes <= 59 ? value.trim() : fallback;
+}
 
 /** 保存到后端的规范化：数值字段限幅、空值用默认值兜底。 */
 export function normalizeSettings(source: Settings): Settings {
@@ -26,13 +103,10 @@ export function normalizeSettings(source: Settings): Settings {
       Number.isFinite(bundleKeep) && bundleKeep >= 0 ? Math.min(999, Math.trunc(bundleKeep)) : 2,
     language: normalizeLanguagePreference(source.language),
     releaseKeep: Math.min(50, Math.max(1, Number(source.releaseKeep) || 5)),
-    scheduledBackupTime: /^\d{1,2}:\d{2}$/.test(source.scheduledBackupTime.trim())
-      ? source.scheduledBackupTime.trim()
-      : "03:00",
+    scheduledBackupTime: normalizeScheduledTime(source.scheduledBackupTime, "03:00"),
     scheduledBackupConfigId: source.scheduledBackupConfigId || null,
-    scheduledShutdownTime: /^\d{1,2}:\d{2}$/.test(source.scheduledShutdownTime.trim())
-      ? source.scheduledShutdownTime.trim()
-      : "04:00",
+    scheduledShutdownTime: normalizeScheduledTime(source.scheduledShutdownTime, "04:00"),
+    scheduledContainerTime: normalizeScheduledTime(source.scheduledContainerTime, "03:30"),
   };
 }
 
@@ -71,4 +145,27 @@ export function enqueueSettingsSave<T>(task: () => Promise<T>): Promise<T> {
     () => undefined,
   );
   return run;
+}
+
+/**
+ * 模块页上「即时保存」的控件（定时备份开关 / 时间 / 配置选择、容器定时）保存自己那一组。
+ *
+ * ⚠️ 不要在调用点写 `api.saveSettings({ ...useApp.getState().settings, ...patch })`：
+ * 那个写法虽然也过了车道（不会被并发顶掉），但它提交的是**整张表**——
+ * ① 别处卡片里已经存进 store、但没走过 `normalizeSettings` 的值会原样落盘（限幅被绕掉）；
+ * ② 少 `mergedGroup` 这道闸，将来谁往这条路上多带一个字段都不会有人拦。
+ *
+ * `patch` 传函数时在**排到队之后**才求值（与 `useSettingsForm.save` 同口径），
+ * 取值时机不能是「被点击」：连着点两个开关时，第二次点下的界面状态还没被第一次的结果
+ * 刷新，直接读渲染作用域会把前一个改动吃掉。
+ */
+export function saveSettingsGroup<T>(
+  groupKeys: readonly (keyof Settings)[],
+  patch: Partial<Settings> | ((current: Settings) => Partial<Settings>),
+): Promise<T> {
+  return enqueueSettingsSave(() => {
+    const current = useApp.getState().settings;
+    const resolved = typeof patch === "function" ? patch(current) : patch;
+    return api.saveSettings(mergedGroup(current, resolved, groupKeys)) as Promise<T>;
+  });
 }

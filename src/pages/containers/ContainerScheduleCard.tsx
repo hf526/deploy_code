@@ -3,10 +3,16 @@ import { useTranslation } from "react-i18next";
 import { CalendarClock } from "lucide-react";
 
 import { Card, Checkbox, Field, Input, SectionTitle } from "../../components/ui";
-import { api } from "../../lib/api";
-import { enqueueSettingsSave } from "../../lib/settingsDraft";
+import { saveSettingsGroup } from "../../lib/settingsDraft";
 import { useApp } from "../../lib/store";
 import type { Settings } from "../../lib/types";
+
+/** 容器定时这一组能提交的字段：即时保存只许动这三项（其余字段沿用盘上那份）。 */
+const CONTAINER_SCHEDULE_KEYS = [
+  "scheduledContainerEnabled",
+  "scheduledContainerTime",
+  "scheduledContainerConfigIds",
+] as const satisfies readonly (keyof Settings)[];
 
 /**
  * 容器定时备份：一个时间点 + 勾选若干配置，到点按勾选顺序排队，一次只跑一个。
@@ -30,10 +36,9 @@ export function ContainerScheduleCard() {
    */
   async function save(build: (current: Settings) => Partial<Settings>) {
     try {
-      const saved = await enqueueSettingsSave(async () => {
-        const current = useApp.getState().settings;
-        return api.saveSettings({ ...current, ...build(current) });
-      });
+      // 提交范围由 CONTAINER_SCHEDULE_KEYS 界定，patch 在排到队之后才求值：
+      // 连着勾两个配置时，第二次读到的是第一次刚落盘的结果，不会把前一个勾选吃掉。
+      const saved = await saveSettingsGroup<Settings>(CONTAINER_SCHEDULE_KEYS, build);
       setSettings(saved);
       toast("success", t("containers.schedule.saved"));
     } catch (error) {

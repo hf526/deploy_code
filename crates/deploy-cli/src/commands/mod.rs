@@ -241,3 +241,133 @@ fn truncate(value: &str, width: usize) -> String {
 fn short_id(id: &str) -> String {
     id.chars().take(8).collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use deploy_core::models::DbBackupSource;
+
+    // 这几个是「明文凭据不许出 stdout」那条红线的哨兵：断言它们一个字节都不出现在输出里。
+    const SSH_PASSWORD: &str = "ssh-pass-9f2a";
+    const KEY_PASSPHRASE: &str = "key-pass-4c71";
+    const DB_PASSWORD: &str = "db-pass-7b3e";
+    const DSN_PASSWORD: &str = "dsn-pass-1d80";
+
+    fn db_source() -> DbBackupSource {
+        DbBackupSource {
+            database: "app".to_string(),
+            username: "postgres".to_string(),
+            password: DB_PASSWORD.to_string(),
+            ..DbBackupSource::default()
+        }
+    }
+
+    fn server() -> ServerConfig {
+        ServerConfig {
+            id: "s1".to_string(),
+            name: "prod".to_string(),
+            host: "10.0.0.1".to_string(),
+            port: 22,
+            username: "root".to_string(),
+            auth: SshAuth::Password {
+                password: SSH_PASSWORD.to_string(),
+            },
+            default_target_dir: "/opt/app".to_string(),
+            db_backup: Some(db_source()),
+            backup_target_id: Some("t1".to_string()),
+            supabase_url: Some(format!("postgresql://u:{DSN_PASSWORD}@h:5432/db")),
+            tunnels: Vec::new(),
+            created_at: "2026-01-01 00:00:00".to_string(),
+        }
+    }
+
+    fn json<T: serde::Serialize>(value: &T) -> String {
+        serde_json::to_string(value).unwrap()
+    }
+
+    #[test]
+    fn redact_server_hides_every_credential_but_keeps_topology() {
+        let text = json(&redact_server(&server()));
+
+        for secret in [SSH_PASSWORD, DB_PASSWORD, DSN_PASSWORD] {
+            assert!(!text.contains(secret), "凭据泄漏到 JSON 输出：{secret}\n{text}");
+        }
+        // 脱敏只该动凭据：脚本靠这些字段认服务器，一起抹掉这条输出就没用了。
+        for kept in ["prod", "10.0.0.1", "root", "/opt/app", "t1", "app"] {
+            assert!(text.contains(kept), "脱敏把非凭据字段也吃掉了：{kept}\n{text}");
+        }
+        // 连接串遮成密码位为 *** 但仍可读，而不是整条抹掉。
+        assert!(text.contains("postgresql://u:***@h:5432/db"), "{text}");
+    }
+
+    #[test]
+    fn redact_server_masks_private_key_passphrase_and_keeps_key_path() {
+        let mut server = server();
+        server.auth = SshAuth::PrivateKey {
+            key_path: "/home/me/.ssh/id_ed25519".to_string(),
+            passphrase: Some(KEY_PASSPHRASE.to_string()),
+        };
+        let text = json(&redact_server(&server));
+        assert!(!text.contains(KEY_PASSPHRASE), "{text}");
+        // key_path 本身不是凭据，界面与脚本要靠它指认用的是哪把钥匙。
+        assert!(text.contains("/home/me/.ssh/id_ed25519"), "{text}");
+        assert!(
+            text.contains(&format!("\"passphrase\":\"{MASKED_SECRET}\"")),
+            "{text}"
+        );
+
+        // 没设口令的私钥不能凭空多出一个 ***，否则用户会以为自己配了口令。
+        server.auth = SshAuth::PrivateKey {
+            key_path: "/home/me/.ssh/id_ed25519".to_string(),
+            passphrase: None,
+        };
+        let text = json(&redact_server(&server));
+        assert!(text.contains("\"passphrase\":null"), "{text}");
+    }
+
+    #[test]
+    fn redact_target_hides_connection_string_password() {
+        let target = BackupTarget {
+            id: "t1".to_string(),
+            name: "Aiven".to_string(),
+            url: format!("postgresql://avnadmin:{DSN_PASSWORD}@db:5432/defaultdb"),
+        };
+        let text = json(&redact_target(&target));
+
+        assert!(!text.contains(DSN_PASSWORD), "{text}");
+        assert!(text.contains("Aiven"), "{text}");
+        assert!(text.contains("db:5432/defaultdb"), "{text}");
+    }
+
+    #[test]
+    fn redact_backup_config_hides_source_password_and_direct_url() {
+        let config = BackupConfig {
+            id: "c1".to_string(),
+            name: "夜间备份".to_string(),
+            server_id: "s1".to_string(),
+            source: db_source(),
+            target_id: Some("t1".to_string()),
+            supabase_url: Some(format!("postgresql://u:{DSN_PASSWORD}@h:5432/db")),
+        };
+        let text = json(&redact_backup_config(&config));
+
+        for secret in [DB_PASSWORD, DSN_PASSWORD] {
+            assert!(!text.contains(secret), "凭据泄漏到 JSON 输出：{secret}\n{text}");
+        }
+        for kept in ["夜间备份", "postgres", "app", "t1"] {
+            assert!(text.contains(kept), "脱敏把非凭据字段也吃掉了：{kept}\n{text}");
+        }
+    }
+
+    #[test]
+    fn passwordless_connection_string_is_not_mangled() {
+        // 反向保护：没有密码的连接串不能被遮成 ***，否则用户看不出自己配的是哪个库。
+        let target = BackupTarget {
+            id: "t2".to_string(),
+            name: "本地".to_string(),
+            url: "postgresql://postgres@localhost:5432/app".to_string(),
+        };
+        let text = json(&redact_target(&target));
+        assert!(text.contains("postgresql://postgres@localhost:5432/app"), "{text}");
+    }
+}

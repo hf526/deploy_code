@@ -1,0 +1,65 @@
+name: CI
+
+# 这个仓库过去没有任何自动门禁（AGENTS.md 里明写「不要依赖自动门禁」），于是三类
+# 「漏了不报错」的问题只能靠人记得跑：Rust↔TS 手工镜像的类型、i18n 的 key 配对、
+# 以及那些只在 Linux 上编译的 #[cfg(unix)] 用例。这份工作流把那几条口令变成会红的检查。
+#
+# 改动完成的最低校验仍是本地跑这两条（见 AGENTS.md）：
+#   npx tsc -p tsconfig.json --noEmit
+#   cargo test -p deploy-core
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # 纯 Rust 的两个 crate：不碰 tauri，也不需要前端产物，反馈最快。
+  core-and-cli:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # deploy-cli 的用例钉的是「CLI 的 JSON 输出必须脱敏」那条红线
+      # （redact_server / redact_target / redact_backup_config）。
+      - run: cargo test -p deploy-core -p deploy-cli
+
+  # 前端门禁：tsc + vitest。i18n 的两份文案 1:1、格式与缩进也在 npm test 里。
+  frontend:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx tsc -p tsconfig.json --noEmit
+      - run: npm test
+
+  # 桌面壳：必须先 npm run build 产出 dist/，否则 tauri::generate_context! 在编译期
+  # 就找不到 frontendDist（../dist）而直接失败。
+  desktop-shell:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+      - run: npm run build
+      # 覆盖 src-tauri/src/state.rs 的抢占 / 守卫 / 关机计划用例。
+      - run: cargo test -p deploy-code
+
+  # 这台机器上永远跑不到的那几条：deploy-core 里 #[cfg(unix)] 门控的软链遍历与
+  # .git 软链绕过用例（Windows 编译时被整个排除），只有在 Linux 上才会执行。
+  core-unix-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p deploy-core

@@ -38,6 +38,7 @@ export function ExpandableRecordRow({
   actions,
   onDelete,
   deleteTitle,
+  deleteDisabled,
   log,
   selected,
   onSelect,
@@ -52,6 +53,12 @@ export function ExpandableRecordRow({
   actions?: ReactNode;
   onDelete: () => void;
   deleteTitle: string;
+  /**
+   * 正在跑的那条记录不许删：删掉它就等于把「这条任务还在跑」从盘上抹掉，
+   * 对账找不到记录只能保持 running，发起按钮被挡住、停止按钮又解析不出 id。
+   * 后端（`Store::guard_delete`）也会拒，这里只是别让用户点了才报错。
+   */
+  deleteDisabled?: boolean;
   log: ReactNode;
   /** 传入 onSelect 才渲染勾选框，未启用多选的列表保持原样。 */
   selected?: boolean;
@@ -83,7 +90,13 @@ export function ExpandableRecordRow({
           {badge}
         </button>
         {actions}
-        <Button variant="ghost" size="sm" onClick={onDelete} title={deleteTitle}>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={onDelete}
+          disabled={deleteDisabled}
+          title={deleteTitle}
+        >
           <Trash2 className="size-3.5" />
         </Button>
       </div>

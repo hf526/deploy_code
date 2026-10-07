@@ -20,12 +20,10 @@
 //! - [`tasklog`]：三类任务共用的日志器
 //! - [`tunnel`]：SSH 本地端口转发（把远端容器端口接到本机）与保活重连
 //! - [`util`]：展示用格式化工具
-//! - [`crypto`]：敏感数据加密（AES-256-GCM + HKDF）
 
 pub mod backup;
 pub mod container;
 pub mod cronjob;
-pub mod crypto;
 pub mod engine;
 pub mod error;
 pub mod git;

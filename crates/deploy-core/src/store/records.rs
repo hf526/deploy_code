@@ -23,6 +23,22 @@ pub struct OrphanBundle {
     pub size_bytes: u64,
 }
 
+/// 删除记录前的拦截：该类任务正在跑时拒删。
+///
+/// 记录由任务结束时自己写回（`upsert_*`），中途被删掉就等于把「这条任务还在跑」这个事实
+/// 从盘上抹掉：界面对账（`reconcileLiveTask`）找不到记录只能保持原状，发起按钮被 running
+/// 一直挡住、停止按钮又解析不出 recordId —— 用户唯一的出口是重启应用。CLI 的
+/// `history clear` 撞上正在跑的备份是同一个后果，所以拦在 Store 层而不是命令层。
+///
+/// `subject` 是被删的东西（如 "部署记录" 的 "部署"），`task` 是提示里那个任务名，`lock` 是任务锁名。
+fn guard_delete(subject: &str, task: &str, lock: &str, store: &Store) -> Result<()> {
+    match store.try_task_lock(lock)? {
+        // 锁能拿到 = 没有活着的任务：立刻释放（drop），别占着名额。
+        Some(_) => Ok(()),
+        None => Err(CoreError::delete_busy(subject, task)),
+    }
+}
+
 impl Store {
     pub fn load_history(&self) -> Result<Vec<DeployRecord>> {
         load_records(&self.history_path(), HISTORY_LABEL)
@@ -35,16 +51,19 @@ impl Store {
     }
 
     pub fn remove_history(&self, id: &str) -> Result<bool> {
+        guard_delete("部署", "部署", "deploy", self)?;
         let _guard = self.write_guard()?;
         remove_record::<DeployRecord>(&self.history_path(), id, HISTORY_LABEL)
     }
 
     pub fn remove_history_many(&self, ids: &[String]) -> Result<usize> {
+        guard_delete("部署", "部署", "deploy", self)?;
         let _guard = self.write_guard()?;
         remove_records_by_id::<DeployRecord>(&self.history_path(), ids, HISTORY_LABEL)
     }
 
     pub fn clear_history(&self) -> Result<()> {
+        guard_delete("部署", "部署", "deploy", self)?;
         let _guard = self.write_guard()?;
         write_records::<DeployRecord>(&self.history_path(), &[])
     }
@@ -71,16 +90,19 @@ impl Store {
     }
 
     pub fn remove_backup(&self, id: &str) -> Result<bool> {
+        guard_delete("备份", "数据库备份", "backup", self)?;
         let _guard = self.write_guard()?;
         remove_record::<BackupRecord>(&self.backups_path(), id, BACKUP_LABEL)
     }
 
     pub fn remove_backups_many(&self, ids: &[String]) -> Result<usize> {
+        guard_delete("备份", "数据库备份", "backup", self)?;
         let _guard = self.write_guard()?;
         remove_records_by_id::<BackupRecord>(&self.backups_path(), ids, BACKUP_LABEL)
     }
 
     pub fn clear_backups(&self) -> Result<()> {
+        guard_delete("备份", "数据库备份", "backup", self)?;
         let _guard = self.write_guard()?;
         write_records::<BackupRecord>(&self.backups_path(), &[])
     }
@@ -100,16 +122,19 @@ impl Store {
     }
 
     pub fn remove_pages_record(&self, id: &str) -> Result<bool> {
+        guard_delete("Pages 部署", "Pages", "pages", self)?;
         let _guard = self.write_guard()?;
         remove_record::<PagesDeployRecord>(&self.pages_path(), id, PAGES_LABEL)
     }
 
     pub fn remove_pages_records_many(&self, ids: &[String]) -> Result<usize> {
+        guard_delete("Pages 部署", "Pages", "pages", self)?;
         let _guard = self.write_guard()?;
         remove_records_by_id::<PagesDeployRecord>(&self.pages_path(), ids, PAGES_LABEL)
     }
 
     pub fn clear_pages_records(&self) -> Result<()> {
+        guard_delete("Pages 部署", "Pages", "pages", self)?;
         let _guard = self.write_guard()?;
         write_records::<PagesDeployRecord>(&self.pages_path(), &[])
     }
@@ -129,12 +154,14 @@ impl Store {
     }
 
     pub fn remove_container_record(&self, id: &str) -> Result<bool> {
+        guard_delete("容器", "容器备份 / 迁移", "container", self)?;
         let _guard = self.write_guard()?;
         remove_record::<ContainerRecord>(&self.containers_path(), id, CONTAINER_LABEL)
     }
 
     /// 清空记录只删本地的任务历史，备份包文件留在原处（删记录不该带走数据）。
     pub fn clear_container_records(&self) -> Result<()> {
+        guard_delete("容器", "容器备份 / 迁移", "container", self)?;
         let _guard = self.write_guard()?;
         write_records::<ContainerRecord>(&self.containers_path(), &[])
     }
@@ -602,6 +629,39 @@ where
 mod tests {
     use super::*;
     use crate::store::testutil::{backup_record, history_record, pages_record, temp_store};
+
+    /// 任务在跑时那条记录必须留着：删掉它，界面对账（`reconcileLiveTask`）找不到记录
+    /// 只能保持 running，发起按钮被挡住、停止按钮又解析不出 id —— 用户只能重启应用。
+    /// CLI 的 `history clear` 撞上正在跑的备份是同一个后果，所以四类记录都要拦。
+    #[test]
+    fn delete_is_refused_while_that_task_is_running() {
+        let (store, dir) = temp_store();
+        store
+            .upsert_history(&history_record("h1", DeployStatus::Running), 0)
+            .unwrap();
+        store
+            .upsert_container(&ContainerRecord::stopped("c1"), 0)
+            .unwrap();
+
+        let held = store.try_task_lock("deploy").unwrap();
+        assert!(held.is_some(), "测试要先自己占住部署锁");
+        // 部署任务在跑：单条与清空都要拒绝，且错误类型必须是 Busy
+        // （调用方靠它区分「稍后重试」与真实失败，不能退化成字符串匹配）。
+        assert!(matches!(
+            store.remove_history("h1"),
+            Err(CoreError::Busy(_))
+        ));
+        assert!(matches!(store.clear_history(), Err(CoreError::Busy(_))));
+        // 别的记录不受这把锁影响：容器记录这时不归部署锁管。
+        assert!(store.remove_container_record("c1").unwrap());
+        assert_eq!(store.load_history().unwrap().len(), 1);
+        drop(held);
+
+        // 任务结束后照常可删。
+        assert!(store.remove_history("h1").unwrap());
+        assert!(store.load_history().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn remove_history_many_drops_only_selected_ids() {

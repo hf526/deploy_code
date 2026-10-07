@@ -141,6 +141,10 @@ export function reconcileLiveTask<TRecord extends TaskRecord>(
   const record = current.recordId
     ? records.find((item) => item.id === current.recordId)
     : records.find((item) => item.status === "running");
+  // 有 recordId 却查不到记录：多半是这次列表还没刷新到（对账只在 loadAll 里跑、
+  // 不轮询），所以保持原状而不是判定成失败 —— 判错会把正在看的任务状态抹掉。
+  // 「记录被真的删掉」那条路已经由后端堵死（Store 的四组删除方法在对应任务锁被
+  // 持有时直接拒绝），所以这里不存在「永久卡 running」：删不掉，也就对得上账。
   if (!record) return current.recordId ? undefined : null;
   return {
     ...current,

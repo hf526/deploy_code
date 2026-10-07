@@ -639,6 +639,7 @@ export default function ContainersPage() {
                     }
                     deleteTitle={t("containers.deleteRecord")}
                     onDelete={() => void handleDeleteRecord(record.id)}
+                    deleteDisabled={record.status === "running"}
                     actions={
                       record.status !== "running" && record.bundlePath ? (
                         <Button
