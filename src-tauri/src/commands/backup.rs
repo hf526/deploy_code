@@ -2,7 +2,9 @@ use deploy_core::models::{new_id, BackupConfig, BackupEvent, BackupRecord, Backu
 use deploy_core::{BackupEngine, CoreError, OrphanBundle, PreparedBackup, Result, Store};
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use crate::state::{ActiveBackup, AppState, BackupTaskGuard, ClaimGuard, ClaimKind};
+use crate::state::{
+    ActiveBackup, AppState, BackupBatchTracking, BackupTaskGuard, ClaimGuard, ClaimKind,
+};
 
 /// 在后台执行备份，并把日志/进度/结果通过事件推送给前端。
 fn spawn_backup(
@@ -55,6 +57,67 @@ fn spawn_backup(
     record_id
 }
 
+/// 后台执行「多条配置 → 串行备份」的批次（每条各自成败、失败不停，见 `run_configs`）。
+///
+/// 记录在每条真正开始时才 prepare，历史列表不会提前冒出一堆「进行中」；
+/// 整批共用一次抢占和一个任务句柄，退出清理按「当前这一条」去远端收尾。
+///
+/// 返回的接收端在「首条已经登记并开始备份」或「整批一条都没启动」时送达结果，
+/// 命令要等它 —— 见 `start_backup_configs`。
+fn spawn_backup_batch(
+    app: AppHandle,
+    engine: BackupEngine,
+    config_ids: Vec<String>,
+    claim: ClaimGuard,
+) -> tokio::sync::oneshot::Receiver<Result<usize>> {
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<BackupEvent>();
+    let (start_tx, start_rx) = tokio::sync::oneshot::channel::<Result<usize>>();
+
+    let emit_app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        // 抢占标记随事件转发任务释放：事件没转发完就放行下一次备份的话，
+        // 新任务会收到上一批残留的 finished 事件。
+        let _claim = claim;
+        while let Some(event) = receiver.recv().await {
+            let _ = emit_app.emit("backup://event", &event);
+        }
+    });
+
+    let tracking_app = app;
+    let total = config_ids.len();
+    let (abort_tx, abort_rx) = tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
+    let handle = tokio::spawn(async move {
+        // AbortHandle 要等 JoinHandle 生成本身才能拿到，拿不到就没有退出清理的入口，直接放弃这一批。
+        let Ok(abort) = abort_rx.await else {
+            let _ = start_tx.send(Err(CoreError::backup("备份任务启动失败")));
+            return;
+        };
+        let tracked = BackupBatchTracking::new(tracking_app, abort);
+        let mut start_tx = Some(start_tx);
+        let batch = engine
+            .run_configs(
+                &config_ids,
+                Some(sender),
+                |record| {
+                    tracked.begin(record);
+                    // 首条一旦开始，后面就有 started/finished 事件负责收敛界面。
+                    if let Some(tx) = start_tx.take() {
+                        let _ = tx.send(Ok(total));
+                    }
+                },
+                |record| tracked.end(record),
+            )
+            .await;
+        if let Some(err) = batch.blocked {
+            if let Some(tx) = start_tx.take() {
+                let _ = tx.send(Err(err));
+            }
+        }
+    });
+    let _ = abort_tx.send(handle.abort_handle());
+    start_rx
+}
+
 #[tauri::command(async)]
 pub fn start_backup(app: AppHandle, state: State<AppState>, request: BackupRequest) -> Result<String> {
     // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
@@ -65,6 +128,36 @@ pub fn start_backup(app: AppHandle, state: State<AppState>, request: BackupReque
     let engine = BackupEngine::new(state.store.clone());
     let prepared = engine.prepare(&request)?;
     Ok(spawn_backup(app, engine, prepared, claim))
+}
+
+/// 按勾选的多条备份配置发起一批备份：参数全部取自盘上的配置（不在前端拼），
+/// 串行执行、某一条失败不影响后面的继续跑，返回本批的条数。
+#[tauri::command(async)]
+pub async fn start_backup_configs(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    config_ids: Vec<String>,
+) -> Result<usize> {
+    let ids: Vec<String> = config_ids
+        .iter()
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    if ids.is_empty() {
+        return Err(CoreError::config("请至少勾选一条备份配置"));
+    }
+    // 先抢占名额（进程内原子标记 + 跨进程文件锁）再 prepare，避免并发命令同时通过检查。
+    let claim = match ClaimGuard::acquire(&app, ClaimKind::Backup)? {
+        Some(claim) => claim,
+        None => return Err(CoreError::busy("已有备份正在进行，请等待完成后再试")),
+    };
+    let engine = BackupEngine::new(state.store.clone());
+    let started = spawn_backup_batch(app, engine, ids, claim);
+    // 等首条登记完成再返回：一条都没跑起来时整批既没有记录也没有 started/finished 事件，
+    // 提前返回就等于把界面永久留在「备份中」（recordId 还是空的，状态再也收不拢）。
+    started
+        .await
+        .map_err(|_| CoreError::backup("备份任务意外结束"))?
 }
 
 #[tauri::command(async)]

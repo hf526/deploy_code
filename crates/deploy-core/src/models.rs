@@ -743,6 +743,14 @@ pub enum BackupEvent {
     Progress { percent: u8, message: String },
     /// 备份结束（成功或失败）。
     Finished { record: BackupRecord },
+    /// 一批备份的收尾汇总，只有批量备份会发。
+    /// 中间某条在准备阶段就失败时它不会有自己的记录、也就不会有 `Finished`，
+    /// 而上一条成功的记录已把界面定成绿色 —— 整批的性质只能由这条事件来定。
+    BatchFinished {
+        total: usize,
+        succeeded: usize,
+        failed: usize,
+    },
 }
 
 /// 发起一次 Pages 部署所需的参数。

@@ -149,6 +149,7 @@ pub fn run() {
             commands::deploy::list_releases,
             commands::deploy::rollback_release,
             commands::backup::start_backup,
+            commands::backup::start_backup_configs,
             commands::backup::list_backups,
             commands::backup::get_backup,
             commands::backup::delete_backup,

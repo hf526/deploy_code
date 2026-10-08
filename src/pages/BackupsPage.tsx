@@ -68,6 +68,7 @@ export default function BackupsPage() {
   const settings = useApp((state) => state.settings);
   const liveBackup = useApp((state) => state.liveBackup);
   const startBackup = useApp((state) => state.startBackup);
+  const startBackupBatch = useApp((state) => state.startBackupBatch);
   const refreshBackups = useApp((state) => state.refreshBackups);
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const refreshBackupTargets = useApp((state) => state.refreshBackupTargets);
@@ -87,6 +88,7 @@ export default function BackupsPage() {
   const [deleteTarget, setDeleteTarget] = useState<BackupConfig | null>(null);
   const [deleting, setDeleting] = useState(false);
   const [runningConfigId, setRunningConfigId] = useState("");
+  const [selectedConfigs, setSelectedConfigs] = useState<Set<string>>(() => new Set());
   const [scheduleTime, setScheduleTime] = useState(settings.scheduledBackupTime);
 
   // 配置 / 目标 / 设置可能被 CLI 改动，进入页面时拉取一次最新数据，避免展示与后端不一致。
@@ -149,6 +151,33 @@ export default function BackupsPage() {
       return { name: t("backup.customUrl"), url: config.supabaseUrl.trim() };
     }
     return backupTargets.find((target) => target.id === config.targetId) ?? null;
+  }
+
+  // 没有自己目标的配置不参与勾选：后端对已保存的配置只认它自己的目标，勾上也是白勾。
+  const selectableConfigIds = useMemo(
+    () => backupConfigs.filter((config) => resolveTarget(config)).map((config) => config.id),
+    [backupConfigs, backupTargets, t],
+  );
+
+  // 目标被删掉或配置被 CLI 改过之后，丢掉已经不可选的勾选。
+  useEffect(() => {
+    setSelectedConfigs((current) => {
+      const pruned = pruneSelection(current, selectableConfigIds);
+      return pruned.size === current.size ? current : pruned;
+    });
+  }, [selectableConfigIds]);
+
+  /** 批量备份：按列表顺序串行跑勾选的配置（勾选顺序不影响执行顺序）。 */
+  async function handleRunSelected() {
+    const ids = selectableConfigIds.filter((id) => selectedConfigs.has(id));
+    if (running || ids.length === 0) return;
+    try {
+      await startBackupBatch(ids);
+      // 只有真的发起了才清勾选：被「已有备份在跑」挡回来时，他刚勾的那些得还在。
+      setSelectedConfigs(new Set());
+    } catch {
+      // store 已提示错误，liveBackup 由它收敛。
+    }
   }
 
   /** 列表内的一键备份：直接用已保存配置执行，不经过表单。 */
@@ -224,6 +253,7 @@ export default function BackupsPage() {
   }
 
   const selectAllRecords = selectionState(selectedRecords, selectableRecordIds);
+  const selectAllConfigs = selectionState(selectedConfigs, selectableConfigIds);
 
   return (
     <Page
@@ -246,13 +276,34 @@ export default function BackupsPage() {
               title={t("backup.configSection")}
               description={t("backup.configDescription")}
               actions={
-                <Button
-                  size="sm"
-                  icon={<Plus className="size-3.5" />}
-                  onClick={() => setEditing({ config: null })}
-                >
-                  {t("backup.newConfig")}
-                </Button>
+                <div className="flex items-center gap-2">
+                  {selectableConfigIds.length > 0 && (
+                    <SelectBox
+                      label={t("common.selectAll")}
+                      checked={selectAllConfigs === "all"}
+                      indeterminate={selectAllConfigs === "some"}
+                      disabled={running}
+                      onChange={() =>
+                        setSelectedConfigs((current) => toggleAll(current, selectableConfigIds))
+                      }
+                    />
+                  )}
+                  <Button
+                    size="sm"
+                    icon={<Play className="size-3.5" />}
+                    disabled={running || selectedConfigs.size === 0}
+                    onClick={() => void handleRunSelected()}
+                  >
+                    {t("backup.runSelected", { count: selectedConfigs.size })}
+                  </Button>
+                  <Button
+                    size="sm"
+                    icon={<Plus className="size-3.5" />}
+                    onClick={() => setEditing({ config: null })}
+                  >
+                    {t("backup.newConfig")}
+                  </Button>
+                </div>
               }
             />
             {backupConfigs.length === 0 ? (
@@ -276,6 +327,14 @@ export default function BackupsPage() {
                   const target = resolveTarget(config);
                   return (
                     <div key={config.id} className="flex items-center gap-3 px-4 py-3">
+                      <SelectBox
+                        label={t("common.select")}
+                        checked={selectedConfigs.has(config.id)}
+                        disabled={running || !target}
+                        onChange={(on) =>
+                          setSelectedConfigs((current) => toggleId(current, config.id, on))
+                        }
+                      />
                       <span className="grid size-8 shrink-0 place-items-center rounded-md border border-brand-line bg-brand-soft text-brand">
                         <Database className="size-4" />
                       </span>

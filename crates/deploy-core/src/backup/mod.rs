@@ -34,7 +34,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::error::{CoreError, Result};
 use crate::models::{
-    now_string, BackupEvent, BackupRecord, BackupRequest, DbBackupSource, DeployStatus,
+    now_string, BackupEvent, BackupRecord, BackupRequest, DbBackupSource, DeployStatus, LogLevel,
     ServerConfig,
 };
 use crate::process::shell_quote;
@@ -48,6 +48,25 @@ pub struct BackupOutcome {
     pub dump_size: u64,
     /// 导出包在本机的路径；未开启留存时为空串。
     pub bundle_path: String,
+}
+
+/// 一批备份的结果：每条配置一条记录，按执行顺序排列。
+///
+/// `blocked` 只在「一条都没跑起来」时有值：此时没有任何记录写盘、也没有 started/finished
+/// 事件发出，界面等不到收敛信号，必须由调用方把错误带回给请求方（与批量部署同一约定）。
+pub struct BackupBatch {
+    pub records: Vec<BackupRecord>,
+    pub succeeded: usize,
+    /// 准备阶段就被拒绝的配置同样算失败，只是它没有自己的记录。
+    pub failed: usize,
+    pub blocked: Option<CoreError>,
+}
+
+/// 直接向事件通道写一行日志（批次边界上的行不属于任何一条记录，借不了 `TaskLogger`）。
+fn emit_log(events: &Option<BackupEventSender>, level: LogLevel, message: String) {
+    if let Some(sender) = events {
+        let _ = sender.send(BackupEvent::Log { level, message });
+    }
 }
 
 /// 备份事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
@@ -192,6 +211,131 @@ impl BackupEngine {
         record
     }
 
+    /// 串行执行多条已保存的备份配置：每条一份记录，**某一条失败不影响后面的继续跑**。
+    ///
+    /// 与批量部署的「失败即停」相反：这一批里每条配置是互相独立的库（甚至不同服务器），
+    /// 一条用户名写错不该把另外两个库一起掐掉；每条各自的成败由它自己的记录表达，
+    /// 整批的性质由末尾那条 `BatchFinished` 汇总。准备阶段就被拒绝的配置没有记录，
+    /// 也就不会有 `Finished`，只能以日志行 + 汇总计数记下来。
+    ///
+    /// `on_begin` / `on_end` 在每条记录开始与结束时各回调一次：整批只有一个任务句柄，
+    /// 调用方要能随时知道「现在跑的是哪一条」，退出清理才不会去删已经结束的远端脚本。
+    /// 整个批次共用一个发送端并持有到最后一条结束，接收端才不会在中途认为任务已收尾。
+    pub async fn run_configs(
+        &self,
+        config_ids: &[String],
+        events: Option<BackupEventSender>,
+        mut on_begin: impl FnMut(&BackupRecord),
+        mut on_end: impl FnMut(&BackupRecord),
+    ) -> BackupBatch {
+        let total = config_ids.len();
+        // 名称只用于日志归属（报错要点名是哪条配置）；执行参数仍由 prepare 重新读盘解析，
+        // 免得这份快照与 CLI 刚改过的配置不一致时，批次照着旧名字跑。
+        let names: Vec<String> = self
+            .store
+            .load_config()
+            .map(|config| {
+                config_ids
+                    .iter()
+                    .map(|id| {
+                        Store::find_backup_config(&config, id)
+                            .map(|item| item.name.clone())
+                            .unwrap_or_else(|_| id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_else(|_| config_ids.to_vec());
+
+        let mut batch = BackupBatch {
+            records: Vec::with_capacity(total),
+            succeeded: 0,
+            failed: 0,
+            blocked: None,
+        };
+        let mut first_error: Option<CoreError> = None;
+
+        for (index, config_id) in config_ids.iter().enumerate() {
+            let name = names
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| config_id.clone());
+            emit_log(
+                &events,
+                LogLevel::Info,
+                format!("[批量 {}/{}] {}", index + 1, total, name),
+            );
+            let request = BackupRequest {
+                server_id: String::new(),
+                backup_config_id: Some(config_id.clone()),
+                source: None,
+                target_id: None,
+                supabase_url: None,
+                database: None,
+                schema: None,
+            };
+            let prepared = match self.prepare(&request) {
+                Ok(prepared) => prepared,
+                Err(err) => {
+                    batch.failed += 1;
+                    emit_log(
+                        &events,
+                        LogLevel::Error,
+                        format!("配置「{name}」未执行: {err}"),
+                    );
+                    if first_error.is_none() {
+                        first_error = Some(err);
+                    }
+                    continue;
+                }
+            };
+            on_begin(&prepared.record);
+            let record = self
+                .run(
+                    prepared.record,
+                    prepared.source,
+                    prepared.target,
+                    events.clone(),
+                )
+                .await;
+            on_end(&record);
+            if record.status == DeployStatus::Success {
+                batch.succeeded += 1;
+            } else {
+                batch.failed += 1;
+            }
+            batch.records.push(record);
+        }
+
+        if batch.records.is_empty() {
+            // 一条都没跑起来：界面收不到任何事件，由调用方像单条备份那样同步报错。
+            batch.blocked = first_error;
+            return batch;
+        }
+        if total > 1 {
+            let level = if batch.failed == 0 {
+                LogLevel::Success
+            } else {
+                LogLevel::Warn
+            };
+            emit_log(
+                &events,
+                level,
+                format!(
+                    "批量备份结束：{} 成功 / {} 失败（共 {total} 条）",
+                    batch.succeeded, batch.failed
+                ),
+            );
+            if let Some(sender) = &events {
+                let _ = sender.send(BackupEvent::BatchFinished {
+                    total,
+                    succeeded: batch.succeeded,
+                    failed: batch.failed,
+                });
+            }
+        }
+        batch
+    }
+
     /// 检查服务器侧备份环境：pg_dump 可用性与 Supabase 连通性。
     /// 与真实备份使用同一套来源/目标解析优先级。
     pub async fn test(&self, req: &BackupRequest) -> Result<String> {
@@ -250,5 +394,102 @@ impl BackupEngine {
         let result = client.exec_capture(&command, 15).await;
         client.disconnect().await;
         result.map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backup::testutil::source;
+    use crate::models::{BackupConfig, ServerConfig, SshAuth};
+
+    use tokio::sync::mpsc::unbounded_channel;
+
+    fn store_with_configless_source() -> Arc<Store> {
+        let dir = std::env::temp_dir().join(format!(
+            "deploycode-db-batch-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let store = Arc::new(Store::new(&dir));
+        store
+            .mutate_config(|config| {
+                let server = ServerConfig::new(
+                    "prod".to_string(),
+                    "h".to_string(),
+                    "u".to_string(),
+                    SshAuth::Password {
+                        password: "x".to_string(),
+                    },
+                );
+                config.servers.push(server.clone());
+                // 故意不绑目标：解析到「这条配置自己的目标」时就该被拒绝，一步网络都不碰。
+                config
+                    .backup_configs
+                    .push(BackupConfig::new("no-target".to_string(), server.id, source()));
+                Ok(())
+            })
+            .unwrap();
+        store
+    }
+
+    /// 一批里每条都在准备阶段被拒（没有目标 / 配置不存在）：既没有记录也就没有任何
+    /// started/finished 事件，界面等不到收敛信号，必须走 `blocked` 让命令层同步报错。
+    #[tokio::test]
+    async fn run_configs_blocks_and_counts_when_nothing_can_start() {
+        let store = store_with_configless_source();
+        let engine = BackupEngine::new(store.clone());
+        let (sender, mut receiver) = unbounded_channel::<BackupEvent>();
+        let ids = vec!["no-target".to_string(), "missing".to_string()];
+
+        let batch = engine.run_configs(&ids, Some(sender), |_| {}, |_| {}).await;
+
+        assert!(batch.records.is_empty());
+        assert_eq!((batch.succeeded, batch.failed), (0, 2));
+        assert!(batch.blocked.is_some(), "一条都没跑起来时要带回错误");
+        // 没有记录写盘，也就不会在历史列表里留下「进行中」的悬空条目。
+        assert!(store.load_backups().unwrap().is_empty());
+
+        let mut lines = Vec::new();
+        let mut finished = 0;
+        while let Ok(event) = receiver.try_recv() {
+            match event {
+                BackupEvent::Log { message, .. } => lines.push(message),
+                BackupEvent::Finished { .. } => finished += 1,
+                BackupEvent::BatchFinished { .. } => panic!("一条都没跑起来时不该发汇总事件"),
+                _ => {}
+            }
+        }
+        assert_eq!(finished, 0);
+        // 报错要点名是哪条配置，且按列表顺序给批次行。
+        assert!(
+            lines.iter().any(|line| line.contains("[批量 1/2] no-target")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter()
+                .any(|line| line.contains("配置「no-target」未执行")),
+            "{lines:?}"
+        );
+        assert!(
+            lines.iter().any(|line| line.contains("配置「missing」未执行")),
+            "{lines:?}"
+        );
+    }
+
+    /// Rust ↔ TS 是手工镜像（没有代码生成），而 `src/lib/types/backup.ts` 写的是
+    /// `{ type: "batchFinished", total, succeeded, failed }`。字段名或 tag 一改，
+    /// 前端只会「收不到汇总、界面停在最后一条记录的颜色上」，编译器一声不响。
+    #[test]
+    fn batch_finished_serializes_the_shape_the_frontend_reads() {
+        let json = serde_json::to_value(BackupEvent::BatchFinished {
+            total: 3,
+            succeeded: 1,
+            failed: 2,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "type": "batchFinished", "total": 3, "succeeded": 1, "failed": 2 }),
+        );
     }
 }

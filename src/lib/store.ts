@@ -131,6 +131,7 @@ interface AppStore {
   handleDeployEvent: (event: DeployEvent) => void;
 
   startBackup: (request: BackupRequest) => Promise<string>;
+  startBackupBatch: (configIds: string[]) => Promise<void>;
   handleBackupEvent: (event: BackupEvent) => void;
 
   startPagesDeploy: (request: PagesRequest) => Promise<string>;
@@ -191,6 +192,47 @@ async function launchContainer(start: () => Promise<string>): Promise<string> {
             },
           }
         : { liveContainer: null };
+    });
+    useApp.getState().toast("error", message);
+    throw error;
+  }
+}
+
+/**
+ * 备份的两种发起方式（单条表单 / 勾选多条配置批量）共用这一段：
+ * 先占住 liveBackup，拿到记录 id 再回填，失败则按「有没有跑起来过」收回占位或收成失败。
+ * 批量没有单个记录 id —— `start` 返回空串，id 由首条 started 事件补齐（见 applyTaskEvent）。
+ */
+async function launchBackup(start: () => Promise<string>): Promise<string> {
+  const { liveBackup, toast } = useApp.getState();
+  if (liveBackup?.status === "running") {
+    const message = i18n.t("backup.toast.running");
+    toast("error", message);
+    throw new Error(message);
+  }
+  useApp.setState({
+    liveBackup: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+  });
+  try {
+    const recordId = await start();
+    useApp.setState((state) =>
+      state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
+    );
+    return recordId;
+  } catch (error) {
+    const message = String(error);
+    useApp.setState((state) => {
+      const live = state.liveBackup;
+      // 与 launchContainer 同一口径：跑过再断只把状态收成失败，日志留着给人看。
+      return live && live.lines.length > 0
+        ? {
+            liveBackup: {
+              ...live,
+              status: "failed",
+              lines: [...live.lines, { level: "error", message }],
+            },
+          }
+        : { liveBackup: null };
     });
     useApp.getState().toast("error", message);
     throw error;
@@ -585,42 +627,41 @@ export const useApp = create<AppStore>((set, get) => ({
     });
   },
 
-  startBackup: async (request) => {
-    if (get().liveBackup?.status === "running") {
-      const message = i18n.t("backup.toast.running");
-      get().toast("error", message);
-      throw new Error(message);
-    }
-    set({
-      liveBackup: { recordId: "", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+  startBackup: (request) => launchBackup(() => api.startBackup(request)),
+
+  /** 按勾选的多条已保存配置串行备份：某条失败不影响后面的继续跑，整批由 batchFinished 事件收尾。 */
+  startBackupBatch: async (configIds) => {
+    await launchBackup(async () => {
+      await api.startBackupConfigs(configIds);
+      return "";
     });
-    try {
-      const recordId = await api.startBackup(request);
-      set((state) =>
-        state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
-      );
-      return recordId;
-    } catch (error) {
-      const message = String(error);
-      set((state) => {
-        const live = state.liveBackup;
-        // 与 launchContainer 同一口径：跑过再断只把状态收成失败，日志留着给人看。
-        return live && live.lines.length > 0
-          ? {
-              liveBackup: {
-                ...live,
-                status: "failed",
-                lines: [...live.lines, { level: "error", message }],
-              },
-            }
-          : { liveBackup: null };
-      });
-      get().toast("error", message);
-      throw error;
-    }
   },
 
   handleBackupEvent: (event) => {
+    if (event.type === "batchFinished") {
+      // 整批定性：中间某条在准备阶段就被拒、没有自己的记录，而上一条 finished 已把界面
+      // 定成绿色，只有这条能把批次改成失败。重载后 live 为空时不补建状态，只弹汇总。
+      set((state) =>
+        state.liveBackup
+          ? {
+              liveBackup: {
+                ...state.liveBackup,
+                status: event.failed > 0 ? "failed" : "success",
+                progress: 100,
+              },
+            }
+          : {},
+      );
+      get().toast(
+        event.failed > 0 ? "error" : "success",
+        i18n.t("backup.toast.batchSummary", {
+          total: event.total,
+          succeeded: event.succeeded,
+          failed: event.failed,
+        }),
+      );
+      return;
+    }
     applyTaskEvent<BackupRecord>(event, {
       getLive: () => get().liveBackup,
       setLive: (live) => set({ liveBackup: live }),

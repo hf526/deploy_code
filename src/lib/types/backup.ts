@@ -57,6 +57,8 @@ export type BackupEvent =
   | { type: "started"; recordId: string }
   | { type: "log"; level: LogLevel; message: string }
   | { type: "progress"; percent: number; message: string }
-  | { type: "finished"; record: BackupRecord };
+  | { type: "finished"; record: BackupRecord }
+  /** 只有批量备份会有：中间某条连记录都没写，最后一个 finished 会把界面定成绿色，整批只能由这条定性。 */
+  | { type: "batchFinished"; total: number; succeeded: number; failed: number };
 
 export type LiveBackup = LiveTask<BackupRecord>;

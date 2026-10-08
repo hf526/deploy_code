@@ -219,6 +219,37 @@ impl Drop for BackupTaskGuard {
     }
 }
 
+/// 批量备份的登记守卫：整批共用一次抢占和一个任务句柄，登记项随每条记录的开始与结束推进。
+///
+/// 与部署那份的差别是这里**没有 Drop**：批次任务被中止时，正在跑的那一条正是退出清理要
+/// 去远端删脚本、删导出包的那一条，登记必须留着；正常结束则由 `end` 准时摘掉，
+/// 免得退出清理对着一堆早已结束的旧 id 白连一趟服务器。
+pub struct BackupBatchTracking {
+    app: AppHandle,
+    abort: tokio::task::AbortHandle,
+}
+
+impl BackupBatchTracking {
+    pub fn new(app: AppHandle, abort: tokio::task::AbortHandle) -> Self {
+        Self { app, abort }
+    }
+
+    pub fn begin(&self, record: &deploy_core::models::BackupRecord) {
+        self.app.state::<AppState>().track_backup(
+            &record.id,
+            ActiveBackup {
+                server_id: record.server_id.clone(),
+                record_id: record.id.clone(),
+                abort: self.abort.clone(),
+            },
+        );
+    }
+
+    pub fn end(&self, record: &deploy_core::models::BackupRecord) {
+        self.app.state::<AppState>().untrack_backup(&record.id);
+    }
+}
+
 /// Pages 部署任务守卫：事件转发结束后释放 Pages 抢占标记。
 pub struct PagesTaskGuard {
     _claim: ClaimGuard,

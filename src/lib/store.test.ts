@@ -9,6 +9,7 @@ vi.mock("./api", () => ({
     restoreContainerBundle: vi.fn(async () => "c2"),
     startContainerConfigBackup: vi.fn(async () => "c3"),
     startBackup: vi.fn(async () => "db-1"),
+    startBackupConfigs: vi.fn(async () => 2),
     listHistory: vi.fn(async () => []),
     listBackups: vi.fn(async () => []),
     listPagesRecords: vi.fn(async () => []),
@@ -17,7 +18,7 @@ vi.mock("./api", () => ({
 vi.mock("./i18n", () => ({ default: { t: (key: string) => key } }));
 
 import { api } from "./api";
-import type { ContainerRequest, PagesDeployRecord } from "./types";
+import type { BackupRecord, ContainerRequest, PagesDeployRecord } from "./types";
 import { useApp } from "./store";
 
 // toast 内部用 window.setTimeout 自动消失；node 环境用桩即可。
@@ -51,6 +52,26 @@ function pagesRecord(status: PagesDeployRecord["status"]): PagesDeployRecord {
     startedAt: "",
     finishedAt: null,
     durationMs: 0,
+  };
+}
+
+function backupRecord(id: string, status: "success" | "failed"): BackupRecord {
+  return {
+    id,
+    serverId: "s1",
+    serverName: "77云",
+    database: "casdoor",
+    schema: "public",
+    targetName: "Neon",
+    target: "postgresql://neondb_owner:***@ep-example.neon.tech/casdoor",
+    status,
+    error: status === "failed" ? "role \"postgres\" does not exist" : null,
+    log: "",
+    dumpSize: 1024,
+    bundlePath: "",
+    startedAt: "",
+    finishedAt: null,
+    durationMs: 1000,
   };
 }
 
@@ -241,5 +262,56 @@ describe("store 长任务发起失败时的面板收敛", () => {
     vi.mocked(api.startContainerConfigBackup).mockRejectedValueOnce(new Error("已有容器任务"));
     await expect(useApp.getState().startContainerConfigBackup("other")).rejects.toThrow();
     expect(useApp.getState().liveContainer).toBeNull();
+  });
+});
+
+// 批量备份：中间某条在准备阶段就被拒、没有自己的记录，界面只能靠 batchFinished 给整批定性。
+describe("store 批量备份的收尾", () => {
+  it("发起批量时没有记录 id，由首条 started 事件补齐", async () => {
+    await useApp.getState().startBackupBatch(["c1", "c2"]);
+    expect(api.startBackupConfigs).toHaveBeenCalledWith(["c1", "c2"]);
+    expect(useApp.getState().liveBackup?.recordId).toBe("");
+
+    useApp.getState().handleBackupEvent({ type: "started", recordId: "b1" });
+    expect(useApp.getState().liveBackup?.recordId).toBe("b1");
+  });
+
+  it("上一条 finished 的绿色盖不住失败的那几条：整批由汇总事件改成失败", () => {
+    useApp.setState({
+      liveBackup: { recordId: "b1", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+    });
+    useApp.getState().handleBackupEvent({ type: "finished", record: backupRecord("b1", "success") });
+    expect(useApp.getState().liveBackup?.status).toBe("success");
+
+    useApp.getState().handleBackupEvent({ type: "batchFinished", total: 3, succeeded: 1, failed: 2 });
+    expect(useApp.getState().liveBackup?.status).toBe("failed");
+    expect(useApp.getState().liveBackup?.progress).toBe(100);
+  });
+
+  it("一条都没跑起来时（命令直接报错）收回占位，界面不会卡在「备份中」", async () => {
+    vi.mocked(api.startBackupConfigs).mockRejectedValueOnce(new Error("备份配置「casdoor」没有可用的备份目标"));
+    await expect(useApp.getState().startBackupBatch(["c1"])).rejects.toThrow();
+    expect(useApp.getState().liveBackup).toBeNull();
+
+    // 已经看到日志再失败则只收状态，别把用户正在看的批次行抹掉。
+    vi.mocked(api.startBackupConfigs).mockImplementationOnce(async () => {
+      useApp.getState().handleBackupEvent({ type: "log", level: "info", message: "[批量 1/2] casdoor" });
+      throw new Error("备份任务意外结束");
+    });
+    await expect(useApp.getState().startBackupBatch(["c1", "c2"])).rejects.toThrow();
+    const live = useApp.getState().liveBackup;
+    expect(live?.status).toBe("failed");
+    expect(live?.lines.map((line) => line.message)).toEqual([
+      "[批量 1/2] casdoor",
+      "Error: 备份任务意外结束",
+    ]);
+  });
+
+  it("全部成功时汇总把批次定成成功", () => {
+    useApp.setState({
+      liveBackup: { recordId: "b2", lines: [], progress: 0, progressMessage: "", status: "running", record: null },
+    });
+    useApp.getState().handleBackupEvent({ type: "batchFinished", total: 2, succeeded: 2, failed: 0 });
+    expect(useApp.getState().liveBackup?.status).toBe("success");
   });
 });

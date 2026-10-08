@@ -764,16 +764,18 @@
     "toast": {
       "running": "已有备份正在进行，请等待其完成后再试",
       "success": "{{name}} 备份成功",
-      "failed": "{{name}} 备份失败：{{error}}"
+      "failed": "{{name}} 备份失败：{{error}}",
+      "batchSummary": "批量备份结束：共 {{total}} 条，{{succeeded}} 成功 / {{failed}} 失败"
     },
     "title": "数据库备份",
     "subtitle": "把服务器上的 PostgreSQL schema 全量同步到备份目标",
     "refreshRecords": "刷新记录",
     "configSection": "备份配置",
-    "configDescription": "保存多套配置，点「立即备份」一键执行",
+    "configDescription": "保存多套配置，点「立即备份」单条执行，或勾选几条串行备份",
     "noConfigs": "暂无备份配置",
     "newConfig": "新建配置",
     "runConfig": "立即备份",
+    "runSelected": "备份所选（{{count}}）",
     "editConfig": "编辑配置",
     "copyConfig": "复制配置",
     "copyName": "{{name}} 副本",

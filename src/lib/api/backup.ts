@@ -12,6 +12,9 @@ import type {
 export const backupCommands = {
   // 数据库备份
   startBackup: (request: BackupRequest) => invoke<string>("start_backup", { request }),
+  /** 按勾选的多条已保存配置串行备份，返回本批条数；某条失败不影响后面的继续跑。 */
+  startBackupConfigs: (configIds: string[]) =>
+    invoke<number>("start_backup_configs", { configIds }),
   listBackups: (serverId?: string | null) =>
     invoke<BackupRecord[]>("list_backups", { serverId: serverId ?? null }),
   getBackup: (backupId: string) => invoke<BackupRecord>("get_backup", { backupId }),

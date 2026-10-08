@@ -764,16 +764,18 @@
     "toast": {
       "running": "A backup is already running. Please wait for it to finish.",
       "success": "{{name}} backed up successfully",
-      "failed": "{{name}} backup failed: {{error}}"
+      "failed": "{{name}} backup failed: {{error}}",
+      "batchSummary": "Batch backup finished: {{total}} configs, {{succeeded}} succeeded / {{failed}} failed"
     },
     "title": "Database Backup",
     "subtitle": "Full-sync the PostgreSQL schema on a server to a backup target",
     "refreshRecords": "Refresh Records",
     "configSection": "Backup Configs",
-    "configDescription": "Save multiple configs and back up with one click",
+    "configDescription": "Save multiple configs; run one with “Back up”, or tick several and run them in sequence",
     "noConfigs": "No backup configs yet",
     "newConfig": "New config",
     "runConfig": "Back up",
+    "runSelected": "Back Up Selected ({{count}})",
     "editConfig": "Edit config",
     "copyConfig": "Copy config",
     "copyName": "{{name}} copy",
