@@ -276,6 +276,16 @@ describe("store 批量备份的收尾", () => {
     expect(useApp.getState().liveBackup?.recordId).toBe("b1");
   });
 
+  it("首条 started 先于命令应答到达时，批量回包不许把 recordId 抹回空", async () => {
+    // invoke 应答与 backup://event 是两条通道，顺序没有保证。
+    vi.mocked(api.startBackupConfigs).mockImplementationOnce(async () => {
+      useApp.getState().handleBackupEvent({ type: "started", recordId: "b1" });
+      return 2;
+    });
+    await useApp.getState().startBackupBatch(["c1", "c2"]);
+    expect(useApp.getState().liveBackup?.recordId).toBe("b1");
+  });
+
   it("上一条 finished 的绿色盖不住失败的那几条：整批由汇总事件改成失败", () => {
     useApp.setState({
       liveBackup: { recordId: "b1", lines: [], progress: 0, progressMessage: "", status: "running", record: null },

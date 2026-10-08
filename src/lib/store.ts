@@ -215,9 +215,15 @@ async function launchBackup(start: () => Promise<string>): Promise<string> {
   });
   try {
     const recordId = await start();
-    useApp.setState((state) =>
-      state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
-    );
+    // 批量那条返回空串：一条配置一条记录，id 交给各自的 started 事件补齐，空值不回写。
+    // invoke 应答与 backup://event 是两条通道，顺序没有保证 —— 首条 started 先到时它已经把
+    // id 写上了，再回写空串等于抹掉：对账拿不到 id 又正好卡在两条记录之间，
+    // reconcileLiveTask 会把整块日志面板清成 null（见 liveTask.ts 的 findRunningId 分支）。
+    if (recordId) {
+      useApp.setState((state) =>
+        state.liveBackup ? { liveBackup: { ...state.liveBackup, recordId } } : {},
+      );
+    }
     return recordId;
   } catch (error) {
     const message = String(error);
