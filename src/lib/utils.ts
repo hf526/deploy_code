@@ -122,10 +122,11 @@ function firstIndexOf(value: string, chars: string[]): number {
 
 /** 遮蔽连接串中的密码（userinfo 与查询参数）。密码含未编码 @ / 也能正确遮蔽。 */
 export function maskUrlPassword(url: string): string {
+  // 没有 `://` 也要遮（与 Rust 侧 backup/db_url.rs::mask_database_url 同一口径）：服务器的
+  // supabase_url 存的时候不校验 scheme，原样返回等于把口令整段留在界面与导出上。
   const schemeEnd = url.indexOf("://");
-  if (schemeEnd < 0) return url;
-  const prefix = url.slice(0, schemeEnd + 3);
-  const rest = url.slice(schemeEnd + 3);
+  const prefix = schemeEnd < 0 ? "" : url.slice(0, schemeEnd + 3);
+  const rest = schemeEnd < 0 ? url : url.slice(schemeEnd + 3);
   // 只在查询 / 片段之前找最后一个 '@'，查询参数里的 '@' 不能当作 host 分界。
   // 但这个分界必须是「路径开始之后」的第一个 '?'/'#'：口令里就带这两个字符时（生成器给的强口令
   // 很常见，没有任何东西要求用户先编码），第一个 '?' 是口令的一部分，按它截断会把真正的 '@' 连同

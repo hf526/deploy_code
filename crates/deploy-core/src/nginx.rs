@@ -362,7 +362,7 @@ async fn read_config_optional(
     let (code, output) = client.exec_capture(&command, COMMAND_TIMEOUT_SECS).await?;
     if code == 0 {
         // docker 成功时也可能向 stderr 打警告（如 config.json 损坏），不能混进配置内容。
-        return Ok(Some(stdout_text(&output)));
+        return Ok(Some(config_text(&output, path)?));
     }
 
     // 用 sh 内置 test 判断文件是否存在：精简镜像里可能没有独立的 test/[/cat 二进制。
@@ -395,7 +395,7 @@ async fn read_config_at(client: &SshClient, container: &str, path: &str) -> Resu
             output.trim()
         )));
     }
-    Ok(stdout_text(&output))
+    config_text(&output, path)
 }
 
 async fn nginx_test(client: &SshClient, container: &str) -> Result<(i32, String)> {
@@ -443,6 +443,22 @@ fn stdout_text(output: &str) -> String {
     let mut text = lines.join("\n");
     text.push('\n');
     text
+}
+
+/// 配置文件必须是以能原样写回的形式交出来的。
+///
+/// `exec_capture` 对每一行做 lossy 解码，非 UTF-8 的文件（中文 Windows 记事本按 ANSI/GBK
+/// 另存是最常见的一种）取回来时认不出的字节已经变成 U+FFFD：写回容器就是静默改坏线上配置，
+/// 而 U+FFFD 摆在注释里照样过 `nginx -t` 并 reload，要等下次重载或容器重启才炸，回滚的底本
+/// 又是同一条通道取回来的。宁可拒绝编辑，也不递出一份「看着一样」的假副本。
+fn config_text(output: &str, path: &str) -> Result<String> {
+    let text = stdout_text(output);
+    if text.contains('\u{FFFD}') {
+        return Err(CoreError::config(format!(
+            "配置文件 {path} 不是 UTF-8（多半是在 Windows 记事本里按 ANSI 保存的），界面读写会把认不出的字节替换成占位符、静默改坏这份配置；请先在服务器上把它转存为 UTF-8 再编辑"
+        )));
+    }
+    Ok(text)
 }
 
 fn parse_containers(output: &str) -> Vec<NginxContainerInfo> {
@@ -654,6 +670,22 @@ mod tests {
         assert_eq!(stdout_text(""), "");
         assert_eq!(stdout_text("[stderr] only warning\n"), "");
         assert_eq!(stdout_text("single line\n"), "single line\n");
+    }
+
+    /// 非 UTF-8 的配置取回来时已是 U+FFFD，这条闸必须把它拦在「编辑」之前而不是写回之后。
+    #[test]
+    fn lossy_decoded_config_text_is_refused() {
+        let mangled = stdout_text("server {\n    # \u{FFFD}\u{FFFD}\n}\n");
+        let err = config_text(&mangled, "/etc/nginx/conf.d/app.conf")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("不是 UTF-8"), "{err}");
+        assert!(err.contains("/etc/nginx/conf.d/app.conf"), "{err}");
+        assert_eq!(
+            config_text(&stdout_text("server {\n}\n"), "/etc/nginx/conf.d/app.conf")
+                .unwrap(),
+            "server {\n}\n"
+        );
     }
 
     #[test]

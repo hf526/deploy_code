@@ -93,7 +93,15 @@ describe("maskUrlPassword", () => {
     );
   });
 
-  it("无 scheme 时原样返回", () => {
+  it("无 scheme 的连接串照样遮（与 Rust 侧同一组用例）", () => {
+    // supabase_url 存的时候不校验 scheme，原样返回等于把口令整段留在界面上。
+    expect(maskUrlPassword("localhost:5432/db?password=sec")).toBe(
+      "localhost:5432/db?password=***",
+    );
+    expect(maskUrlPassword("user:pass@db.example.com:5432/app")).toBe(
+      "user:***@db.example.com:5432/app",
+    );
+    // 既没有 '@' 也没有 password= 的纯文本不该被动。
     expect(maskUrlPassword("not-a-url")).toBe("not-a-url");
   });
 });

@@ -85,11 +85,13 @@ fn looks_like_host_port(prefix: &str) -> bool {
 
 /// 隐藏连接串中的密码（userinfo 与查询参数），用于日志与记录展示。
 pub fn mask_database_url(url: &str) -> String {
-    let Some(scheme_end) = url.find("://") else {
-        return url.to_string();
+    // 没有 `://` 也要遮：`supabase_url` 不经过 `validate_target_url`（保存服务器时不校验它的
+    // scheme），`localhost:5432/db?password=sec` 这类写法原样返回就等于把口令打进 CLI 的 JSON
+    // 输出与界面展示。本函数的口径是「宁可多遮蔽」，代价只是 `host:5432/db@name` 显示得更黑。
+    let (prefix, rest) = match url.find("://") {
+        Some(end) => (&url[..end + 3], &url[end + 3..]),
+        None => ("", url),
     };
-    let scheme = &url[..scheme_end];
-    let rest = &url[scheme_end + 3..];
 
     // 脱敏按「宁可多遮蔽」处理：不能因为无法区分而漏出密码明文。
     let (authority_end, at) = locate_authority(rest, true);
@@ -108,7 +110,7 @@ pub fn mask_database_url(url: &str) -> String {
     };
 
     format!(
-        "{scheme}://{authority}{}",
+        "{prefix}{authority}{}",
         mask_query_password(&rest[authority_end..])
     )
 }
@@ -317,6 +319,22 @@ mod tests {
             mask_database_url("postgresql://host:5432?password=sec@ret"),
             "postgresql://host:5432?password=***"
         );
+    }
+
+    /// 早返回曾经是这条红线的一个洞：`supabase_url` 存的时候不校验 scheme，所以一条不带
+    /// `://` 的连接串能原样走进 `redact_server` 与 `redact_target`，把口令整段打在 CLI 的
+    /// JSON 输出里。纯文本（既没有 `@` 也没有 `password=`）照旧不该被动。
+    #[test]
+    fn mask_covers_urls_written_without_a_scheme() {
+        assert_eq!(
+            mask_database_url("localhost:5432/db?password=sec"),
+            "localhost:5432/db?password=***"
+        );
+        assert_eq!(
+            mask_database_url("user:pass@db.example.com:5432/app"),
+            "user:***@db.example.com:5432/app"
+        );
+        assert_eq!(mask_database_url("not-a-url"), "not-a-url");
     }
 
     #[test]

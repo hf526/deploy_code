@@ -127,6 +127,15 @@ export function DeployConfigModal({
   // 初始仓库尚未解析时保持空值，等仓库列表就绪后再水合一次。
   const appliedRepo = useRef(initialRepo ? initialRepo.id : "");
   const editingRepoId = initial?.repoId ?? null;
+  // 「自动填过哪些目录」记在这里，供换勾选服务器时判断当前值能不能跟着改（口径同
+  // ContainerConfigModal 的 autoDirsRef）：编辑已有配置时那个目录是存下来的，不属于自动填。
+  const autoDirsRef = useRef<Set<string>>(
+    new Set(
+      initial || !initialRepo?.defaultTargetDir
+        ? []
+        : [initialRepo.defaultTargetDir.trim()].filter((dir) => dir !== ""),
+    ),
+  );
 
   useEffect(() => {
     if (repos.length === 0) return;
@@ -173,6 +182,9 @@ export function DeployConfigModal({
     setCustomRev(Boolean(preservedRev));
     setEnvFiles(files);
     setEnvFilesHydrated(true);
+    // 仓库默认目录同样是「自动填来的」，换勾选服务器时可以被那一台的默认目录重填。
+    const repoDir = repo.defaultTargetDir?.trim() ?? "";
+    if (repoDir) autoDirsRef.current.add(repoDir);
   }, [draft.repoId, repos, editingRepoId, initial]);
 
   /** 环境文件的所有修改都标记为已水合，避免因仓库列表缺失而丢弃用户刚做的编辑。 */
@@ -406,18 +418,21 @@ export function DeployConfigModal({
                 servers={servers}
                 checkedIds={draft.serverIds}
                 disabled={saving}
-                onChange={(ids) =>
+                onChange={(ids) => {
+                  // 目录空着、或当前值还是自动填来的那一个时，跟着第一台重填：
+                  // 只在为空时兜底的话，勾完 A 再勾 B 就把 B 部署进 A 的目录，覆盖的是另一台应用的文件。
+                  const autoDir =
+                    ids.length > 0
+                      ? servers.find((item) => item.id === ids[0])?.defaultTargetDir?.trim() ?? ""
+                      : "";
+                  const current = draft.targetDir.trim();
+                  const refill = autoDir !== "" && (current === "" || autoDirsRef.current.has(current));
+                  if (refill) autoDirsRef.current.add(autoDir);
                   update({
                     serverIds: ids,
-                    // 目录还空着时用这一台的默认目录兜底，省掉一次手填。
-                    ...(ids.length > 0 && !draft.targetDir.trim()
-                      ? {
-                          targetDir:
-                            servers.find((item) => item.id === ids[0])?.defaultTargetDir ?? "",
-                        }
-                      : {}),
-                  })
-                }
+                    ...(refill ? { targetDir: autoDir } : {}),
+                  });
+                }}
               />
             )}
             {servers.length === 0 && (
