@@ -842,6 +842,7 @@
       "started": "Scheduled backup started",
       "noConfig": "Scheduled backup skipped: no backup config selected",
       "failed": "Scheduled backup failed to start: {{error}}",
+      "skippedByShutdown": "Scheduled shutdown fired; this scheduled backup was skipped (space the backup and shutdown times apart)",
       "summary": "Enabled: backs up every day at {{time}} (keep the app running)",
       "disabled": "Disabled. When enabled, a backup runs automatically at the selected time while the app is running."
     },
@@ -1008,6 +1009,8 @@
     "restoreDirHint": "Leave empty to reuse the directory recorded in the bundle",
     "restoreDirPlaceholder": "Directory stored in the bundle",
     "restoreAcknowledge": "Volumes of project {{project}} on the target server will be overwritten by this bundle",
+    "restoreAcknowledgeRunningRestart": "Volumes of project {{project}} on the target server will be overwritten by this bundle; a running instance is stopped first and started again after the restore",
+    "restoreAcknowledgeRunningNoRestart": "Volumes of project {{project}} on the target server will be overwritten by this bundle; a running instance is stopped first and left stopped",
     "toast": {
       "running": "A container task is already running; wait for it or stop it first",
       "backedUp": "{{name}} backed up locally",

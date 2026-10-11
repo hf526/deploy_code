@@ -50,6 +50,8 @@ export interface SchedulerNotice {
     | "started"
     | "noConfig"
     | "failed"
+    /** 定时关机已下发，同时刻欠着的定时备份被跳过（关机优先）。 */
+    | "backupSkipped"
     | "containerStarted"
     | "containerNoConfig"
     | "containerFailed"

@@ -8,12 +8,14 @@ import { humanSize } from "../../lib/utils";
 
 /**
  * 把本机已有的容器备份包再恢复到一台服务器。
- * 目标目录留空时沿用备份包内记录的原目录；同名数据卷会被包里的内容覆盖。
+ * 目标目录留空时沿用备份包内记录的原目录；同名数据卷会被包里的内容覆盖（目标机同名项目
+ * 正在运行时先停服，恢复后按设置重新拉起），界面文案与远端脚本同一口径。
  */
 export function RestoreBundleModal({
   bundlePath,
   bundleSize,
   project,
+  hasVolumes,
   busy,
   onClose,
   onSubmitted,
@@ -21,6 +23,7 @@ export function RestoreBundleModal({
   bundlePath: string;
   bundleSize: number;
   project: string;
+  hasVolumes: boolean;
   busy: boolean;
   onClose: () => void;
   onSubmitted: () => void;
@@ -35,6 +38,13 @@ export function RestoreBundleModal({
   const [startServices, setStartServices] = useState(true);
   const [acknowledged, setAcknowledged] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+
+  // 确认文案只说这次恢复真会做的事：包内没有数据卷就不会停服；勾了「不启动」就不说「恢复后启动」。
+  const acknowledgeKey = !hasVolumes
+    ? "containers.restoreAcknowledge"
+    : startServices
+      ? "containers.restoreAcknowledgeRunningRestart"
+      : "containers.restoreAcknowledgeRunningNoRestart";
 
   async function handleSubmit() {
     if (!serverId) {
@@ -129,7 +139,7 @@ export function RestoreBundleModal({
           onChange={setAcknowledged}
           className="items-start"
         >
-          <span className="leading-relaxed">{t("containers.restoreAcknowledge", { project })}</span>
+          <span className="leading-relaxed">{t(acknowledgeKey, { project })}</span>
         </Checkbox>
       </div>
     </Modal>

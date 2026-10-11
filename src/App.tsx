@@ -111,6 +111,9 @@ export default function App() {
       case "noConfig":
         toast("error", i18n.t("backup.schedule.noConfig"));
         break;
+      case "backupSkipped":
+        toast("info", i18n.t("backup.schedule.skippedByShutdown"));
+        break;
       case "containerStarted":
         toast("success", i18n.t("containers.schedule.started"));
         break;

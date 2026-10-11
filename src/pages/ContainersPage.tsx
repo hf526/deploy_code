@@ -86,6 +86,7 @@ export default function ContainersPage() {
     bundlePath: string;
     bundleSize: number;
     project: string;
+    hasVolumes: boolean;
   } | null>(null);
   const [expanded, setExpanded] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -652,6 +653,7 @@ export default function ContainersPage() {
                               bundlePath: record.bundlePath,
                               bundleSize: record.bundleSize,
                               project: record.project,
+                              hasVolumes: record.includeVolumes,
                             })
                           }
                         >
@@ -724,6 +726,7 @@ export default function ContainersPage() {
           bundlePath={restoring.bundlePath}
           bundleSize={restoring.bundleSize}
           project={restoring.project}
+          hasVolumes={restoring.hasVolumes}
           busy={running}
           onClose={() => setRestoring(null)}
           onSubmitted={() => setRestoring(null)}

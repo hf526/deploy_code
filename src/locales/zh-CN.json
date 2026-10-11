@@ -842,6 +842,7 @@
       "started": "定时备份已开始执行",
       "noConfig": "定时备份未选择备份配置，已跳过本次执行",
       "failed": "定时备份启动失败：{{error}}",
+      "skippedByShutdown": "定时关机已触发，本次定时备份已跳过（请把备份与关机时间错开）",
       "summary": "已开启：每天 {{time}} 自动备份（需保持软件运行）",
       "disabled": "未开启。开启后，软件运行期间到点会自动备份一次。"
     },
@@ -1008,6 +1009,8 @@
     "restoreDirHint": "留空使用备份包里的原目录",
     "restoreDirPlaceholder": "备份包内记录的原目录",
     "restoreAcknowledge": "目标服务器上同名项目 {{project}} 的数据卷会被备份包内容覆盖",
+    "restoreAcknowledgeRunningRestart": "目标服务器上同名项目 {{project}} 的数据卷会被备份包内容覆盖；若该项目正在运行，会先被停止，恢复后重新启动",
+    "restoreAcknowledgeRunningNoRestart": "目标服务器上同名项目 {{project}} 的数据卷会被备份包内容覆盖；若该项目正在运行，会先被停止，且不会自动启动",
     "toast": {
       "running": "已有容器任务正在进行，请等待完成或先停止",
       "backedUp": "{{name}} 已备份到本机",

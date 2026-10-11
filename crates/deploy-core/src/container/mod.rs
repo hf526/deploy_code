@@ -1247,6 +1247,85 @@ DEPLOYCODE_LIST"));
         assert!(!script.contains("trap cleanup EXIT INT TERM"));
     }
 
+    /// 恢复到「同名项目正在运行」的目标机时，必须先把目标容器停下来再碰卷：运行中的数据库进程
+    /// 拿着卷里的文件，就地 tar 覆盖写的是撕裂数据；而且 compose up 对配置未变的已运行容器是
+    /// no-op，灌进去的数据不会被加载 —— 两条合起来就是「界面报成功、库其实坏了」。
+    /// 卷还要先清空再解包：tar -xf 是叠加语义，回滚旧包会把包外的新文件留在卷里。
+    #[test]
+    fn restore_script_stops_running_target_and_replaces_volume_contents() {
+        let script = build_restore_script(
+            "ff00",
+            "/root/.deploycode/containers".to_string(),
+            "/srv/blog",
+            true,
+            &manifest(),
+            &["docker".to_string(), "compose".to_string()],
+        );
+        assert!(script.contains("HAS_VOLUMES=1"));
+        let stop = script.find("docker stop $ids").expect("没有停止目标项目的那一步");
+        let clear = script
+            .find("find \"$mp\" -mindepth 1 -delete")
+            .expect("没有清空旧卷内容的那一步");
+        let extract = script
+            .find("tar -C \"$mp\" -xf \"$archive\"")
+            .expect("没有回灌卷内容的那一步");
+        assert!(stop < clear && clear < extract, "顺序应为：停服务 -> 清空 -> 回灌");
+        // 标记先于动作置位：stop 只停到一半、清空删到一半时，收尾方才知道该管什么。
+        assert!(script.find("STOPPED=1").unwrap() < stop, "停止标记要在 stop 之前");
+        assert!(script.find("TOUCHED=1").unwrap() < clear, "触碰标记要在清空之前");
+        // 清空失败必须停在这里：半清半灌比叠加语义更坏。
+        assert!(script.contains("find \"$mp\" -mindepth 1 -delete || {"));
+        // 兜底容器内路径同样先清空再解包。
+        assert!(script.contains("find /to -mindepth 1 -delete && tar -C /to -xf"));
+        // 包内缺卷要在清空之前拦下（此时数据还没动，cleanup 可以安全地起回服务）。
+        assert!(script.contains("[ ! -f \"$archive\" ]"));
+        // 「欠一次恢复」凭据与快照同一份文件：写在 stop 之前，动卷数据之前销掉 ——
+        // 取消 / SIGKILL 时 cleanup_remote 凭它把停下的目标项目起回，而半截数据绝不能被自动拉起。
+        assert!(script.contains("PAUSE_MARK=\"$ROOT/$ID.pause\""));
+        let mark = script
+            .find("printf '%s\\n' \"$PROJECT\" > \"$PAUSE_MARK\"")
+            .expect("没有写「欠一次恢复」的凭据");
+        assert!(mark < stop, "凭据要写在按下停止键之前");
+        assert_eq!(
+            script.matches("rm -f \"$PAUSE_MARK\"").count(),
+            3,
+            "cleanup 成功拉起、宿主机清空、容器内清空三处各销一次"
+        );
+        let touched = script.find("TOUCHED=1").unwrap();
+        assert!(
+            script[touched..clear].contains("rm -f \"$PAUSE_MARK\""),
+            "动卷数据前必须销掉凭据：半截数据不能被自动拉起"
+        );
+        // 起的动作交给 compose 后不再由 cleanup 兜底；失败且没动过数据则尝试起回。
+        assert_eq!(script.matches("STOPPED=0").count(), 2, "初始化与 compose up 之后各一次");
+        assert!(script.contains("目标项目已重新拉起"));
+        assert!(script.contains("目标项目未能自动拉起"));
+        assert!(script.contains("数据可能只恢复了一部分"));
+        // START=0 时用户也得知道项目被停过且不会自动启动。
+        assert!(script.contains("且按设置不自动启动"));
+    }
+
+    /// 「要不要碰卷」按真正写进脚本的清单算：名字不合法的条目会被 listable 丢掉，
+    /// 凭 manifest 里有没有卷去判断，就会出现「停了目标项目却压根没有卷要恢复」的空停。
+    #[test]
+    fn restore_script_skips_the_stop_when_no_volume_survives_the_list_filter() {
+        let mut bundle = manifest();
+        bundle.volumes = vec![BundleVolume {
+            name: "DEPLOYCODE_LIST".to_string(),
+            short: "data".to_string(),
+            image: "postgres:16".to_string(),
+        }];
+        let script = build_restore_script(
+            "ff00",
+            "/root/.deploycode/containers".to_string(),
+            "/srv/blog",
+            true,
+            &bundle,
+            &["docker".to_string(), "compose".to_string()],
+        );
+        assert!(script.contains("HAS_VOLUMES=0"));
+    }
+
     /// 来源服务器上的文件名属于外部输入：整行等于 here-doc 终止符的条目必须丢掉。
     #[test]
     fn list_items_that_would_close_the_heredoc_are_dropped() {

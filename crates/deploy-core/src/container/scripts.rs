@@ -209,16 +209,42 @@ PROJECT=__PROJECT__
 TARGET_DIR=__TARGET_DIR__
 COMPOSE_V2=__COMPOSE_V2__
 START=__START__
+HAS_VOLUMES=__HAS_VOLUMES__
 
 RUN="$ROOT/$ID"
 STAGE="$RUN/bundle"
 IN="$RUN/bundle.tar"
 PID_FILE="$RUN/restore.pid"
 SCRIPT="$0"
+# 「欠一次恢复」凭据：为恢复停过目标项目、且还没动过卷数据时留在盘上。
+# 取消 / SIGKILL 这类脚本 trap 跑不到的路径，靠它让 cleanup_remote 把服务起回来。
+PAUSE_MARK="$ROOT/$ID.pause"
+
+# 目标机上同名项目可能在运行；两个标记决定失败时怎么收场：
+# STOPPED=1 = 为恢复把它停过，得给个交代；TOUCHED=1 = 卷内容已被清空/回灌，数据可能只恢复了
+# 一部分，这时不能自动拉起（半截数据上把库拉起来比停着更糟），留给人工确认。
+STOPPED=0
+TOUCHED=0
+SUCCESS=0
 
 cleanup() {
   rm -rf "$RUN"
   rm -f "$PID_FILE" "$SCRIPT"
+  if [ "$STOPPED" = "1" ] && [ "$SUCCESS" = "0" ]; then
+    if [ "$TOUCHED" = "0" ]; then
+      # 一个字节都没动过：把为恢复停下的那批容器起回去（不需要 compose 文件，按项目标签找）。
+      # 起得来才销凭据；起不来留着，取消/退出清理还会再试一次并把结果写进记录。
+      ids=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)
+      if [ -n "$ids" ] && docker start $ids >/dev/null 2>&1; then
+        rm -f "$PAUSE_MARK"
+        echo '恢复未成功（尚未改动卷数据），目标项目已重新拉起'
+      else
+        echo '恢复未成功，目标项目未能自动拉起，请到该服务器执行 compose up -d' >&2
+      fi
+    else
+      echo '恢复未成功，目标项目已停或未完成启动：数据可能只恢复了一部分，应用不会再自动拉起它，请人工确认状态后再启动' >&2
+    fi
+  fi
 }
 trap cleanup EXIT
 # 信号那一路必须带着 exit，口径与上面的快照脚本、backup/scripts.rs 的备份脚本一致：handler 不含
@@ -250,23 +276,53 @@ for f in "$STAGE"/images/*.tar; do
 done
 
 echo '###STAGE:3:恢复数据卷 ...'
+if [ "$HAS_VOLUMES" = "1" ]; then
+  # 同名项目正在运行时先停下来：运行中的数据库进程拿着卷里的文件，就地 tar 覆盖写的是撕裂数据；
+  # 而且 compose up 对配置未变的已运行容器是 no-op，灌进去的新数据根本不会被加载 —— 两条合起来
+  # 就是「界面报成功、库其实坏了」。停完由后面的 compose up 重新拉起。
+  ids=$(docker ps -q --filter "label=com.docker.compose.project=$PROJECT" 2>/dev/null || true)
+  if [ -n "$ids" ]; then
+    # 先留「欠一次恢复」的凭据再按停止键（与快照暂停同一口径）：cleanup 自己跑不到时，
+    # 只有盘上的文件能让取消/退出清理知道这里还停着东西。
+    printf '%s\n' "$PROJECT" > "$PAUSE_MARK"
+    # 先置标记再停：stop 本身可能只停下一半，cleanup 要按标记把能起的起回来。
+    STOPPED=1
+    docker stop $ids >/dev/null
+    echo '目标项目已在运行：恢复前先停止其容器，完成后重新拉起'
+  fi
+fi
 while IFS=$'\t' read -r name short image; do
   [ -n "$name" ] || continue
   printf '###VOL:%s
 ' "$name"
+  archive="$STAGE/volumes/$name.tar"
+  if [ ! -f "$archive" ]; then
+    echo "备份包里缺少数据卷 $name 的内容: $archive" >&2
+    exit 1
+  fi
   docker volume create --label "com.docker.compose.project=$PROJECT" \
     --label "com.docker.compose.volume=$short" "$name" >/dev/null
   mp=$(docker volume inspect -f '{{.Mountpoint}}' "$name" 2>/dev/null || true)
-  if [ -n "$mp" ] && [ -d "$mp" ] && tar -C "$mp" -xf "$STAGE/volumes/$name.tar" 2>/dev/null; then
-    continue
+  if [ -n "$mp" ] && [ -d "$mp" ]; then
+    # 先清空再解包：这次恢复对用户的承诺是「数据卷会被备份包内容覆盖」，而 tar -xf 只是叠加 ——
+    # 不先清空，回滚旧包时会把包外的新文件留在卷里，库起来就是新旧混合。清空失败宁可停在这里。
+    TOUCHED=1
+    # 数据即将被改动：从这里起项目不能再被自动拉起（半截数据上把库拉起来比停着更糟），凭据就地销掉。
+    rm -f "$PAUSE_MARK"
+    find "$mp" -mindepth 1 -delete || { echo "数据卷 $name 的旧内容无法清空: $mp" >&2; exit 1; }
+    if tar -C "$mp" -xf "$archive" 2>/dev/null; then
+      continue
+    fi
   fi
   if [ -z "$image" ]; then
     echo "数据卷 $name 无法写入宿主机目录，且备份包里没有可用的镜像" >&2
     exit 1
   fi
+  TOUCHED=1
+  rm -f "$PAUSE_MARK"
   docker run --rm -v "$name":/to -v "$STAGE/volumes":/from:ro "$image" \
-    sh -c 'tar -C /to -xf "/from/$1.tar"' sh "$name" \
-    || { echo "数据卷 $name 恢复失败（镜像 $image 内需要有 tar 命令）" >&2; exit 1; }
+    sh -c 'find /to -mindepth 1 -delete && tar -C /to -xf "/from/$1.tar"' sh "$name" \
+    || { echo "数据卷 $name 恢复失败（镜像 $image 内需要有 tar 与 find 命令）" >&2; exit 1; }
 done <<'DEPLOYCODE_LIST'
 __VOLUME_LIST__
 DEPLOYCODE_LIST
@@ -277,6 +333,10 @@ cp -a "$STAGE/project/." "$TARGET_DIR/"
 
 if [ "$START" != "1" ]; then
   echo '###STAGE:5:按设置跳过启动'
+  if [ "$STOPPED" = "1" ]; then
+    echo '目标项目因数据恢复被停止，且按设置不自动启动：请确认数据正常后手动 compose up -d'
+  fi
+  SUCCESS=1
   echo '###DONE'
   exit 0
 fi
@@ -296,6 +356,8 @@ fi
 
 echo '###STAGE:5:启动服务（compose up -d）...'
 compose -p "$PROJECT" "${CF[@]}" up -d --no-build
+# 已经交给 compose 拉起了，收尾阶段不再由 cleanup 兜底（无论后面的状态校验成败）。
+STOPPED=0
 
 echo '###STAGE:6:校验容器状态 ...'
 running=0
@@ -315,6 +377,7 @@ if [ "$EXPECTED" -gt 0 ] && [ "$running" -eq 0 ]; then
   echo "启动后没有任何服务进入 running，请到目标服务器上查看 compose 日志" >&2
   exit 1
 fi
+SUCCESS=1
 echo '###DONE'
 "##;
 
@@ -409,6 +472,10 @@ pub(crate) fn build_restore_script(
     manifest: &BundleManifest,
     compose: &[String],
 ) -> String {
+    // 「要不要碰卷」按实际写进脚本的清单算，而不是看 manifest 里有没有卷：名字不合法的条目
+    // 会被 listable 丢掉，凭 manifest 判断就会出现「停了目标项目却根本没有卷要恢复」的空停。
+    let volume_list = restore_volume_list(&manifest.volumes);
+    let has_volumes = if volume_list.trim().is_empty() { "0" } else { "1" };
     render_template(
         RESTORE_TEMPLATE,
         &[
@@ -421,7 +488,8 @@ pub(crate) fn build_restore_script(
                 shell_quote(&if is_compose_v2(compose) { "1" } else { "0" }),
             ),
             ("__START__", shell_quote(&if start_services { "1" } else { "0" })),
-            ("__VOLUME_LIST__", restore_volume_list(&manifest.volumes)),
+            ("__HAS_VOLUMES__", shell_quote(has_volumes)),
+            ("__VOLUME_LIST__", volume_list),
             ("__CONFIG_LIST__", list_text(&manifest.config_files)),
             ("__SERVICE_LIST__", list_text(&manifest.services)),
             ("__EXPECTED__", shell_quote(&manifest.services.len().to_string())),

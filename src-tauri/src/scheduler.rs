@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use chrono::{Local, TimeZone};
@@ -34,6 +35,15 @@ struct SchedulerNotice {
     message: Option<String>,
 }
 
+/// 定时关机已下发。置位后两个调度循环都不再启动新任务：启动即会被退出清理 / `handle.exit(0)`
+/// 硬杀，只会在盘上留下一条永远停在 Running 的记录。
+static SHUTDOWN_FIRED: AtomicBool = AtomicBool::new(false);
+
+/// 进程正在退出：定时关机已下发，或退出清理已经开始（用户从托盘退出）。两个调度循环共用。
+fn exiting() -> bool {
+    SHUTDOWN_FIRED.load(Ordering::SeqCst) || crate::EXIT_CLEANUP_STARTED.load(Ordering::SeqCst)
+}
+
 /// 启动定时调度器：应用运行期间（含窗口隐藏到托盘）按设置的时间点自动执行备份与关机。
 ///
 /// 只在软件运行时生效；应用启动前已错过的时间点不补跑。
@@ -56,10 +66,32 @@ pub fn spawn(app: AppHandle) {
 
         loop {
             tokio::time::sleep(tick_interval(&app)).await;
+            if exiting() {
+                // 关机已下发或退出清理已开始：这一轮起不再排任何定时任务。
+                return;
+            }
             let now = Local::now();
 
             // 关机不依赖配置读取：即使 config.json 这一 tick 恰好读不出来也要到点执行。
-            fire_due_shutdown(&app, now);
+            if fire_due_shutdown(&app, now) {
+                // 关机已下发、退出清理在路上：这一跳绝不能继续走备份分支 —— 过去同一时刻的定时
+                // 备份会在这里被 start_backup 拉起来，然后随 exit(0) 被杀掉或整条丢失（记录停在
+                // Running）。若这一跳正好欠着一份定时备份，明确告诉用户已跳过。
+                let settings = app
+                    .state::<AppState>()
+                    .store
+                    .load_config()
+                    .map(|config| config.settings)
+                    .unwrap_or_default();
+                let backup_due = pending.is_some()
+                    || (settings.scheduled_backup_enabled
+                        && today_at(&settings.scheduled_backup_time, &now)
+                            .is_some_and(|scheduled| has_crossed(scheduled, last_tick, now, last_run)));
+                if backup_due {
+                    emit_notice(&app, "backupSkipped", None);
+                }
+                return;
+            }
 
             let Ok(config) = app.state::<AppState>().store.load_config() else {
                 // 读不出来（config.json 正被另一次写占着、盘一时读不动）时**不要推进
@@ -173,6 +205,10 @@ pub fn spawn_container(app: AppHandle) {
 
         loop {
             tokio::time::sleep(CHECK_INTERVAL).await;
+            if exiting() {
+                // 关机已下发或退出清理已开始：容器任务同样一个都不再排（启动即被硬杀）。
+                return;
+            }
             let now = Local::now();
             let Ok(config) = app.state::<AppState>().store.load_config() else {
                 // 同 spawn：这一跳没做判定就不能推进 last_tick，否则到点那一跳读失败
@@ -256,10 +292,13 @@ pub fn spawn_container(app: AppHandle) {
 }
 
 /// 倒计时到点的关机：先摘掉计划（与「取消」互斥），再下发系统关机请求并触发退出清理。
-fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) {
+///
+/// 返回 true 表示关机请求已成功下发：调用方必须立刻停止调度（`app.exit` 只是非阻塞地请求
+/// 退出，这一跳的代码还会继续跑），否则同一时刻的定时任务会被拉起来又被退出清理杀掉。
+fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) -> bool {
     let now_ms = now.timestamp_millis();
     let Some(plan) = app.state::<AppState>().take_due_shutdown(now_ms) else {
-        return;
+        return false;
     };
     // 计划在倒计时期间睡过去（合盖）或时钟前跳，唤醒后的第一个 tick 会发现它早已过期：
     // 照发就是掀开盖子就开始关机。放弃时计划已摘走，arm 侧当天也记过日期不会再排，
@@ -273,15 +312,18 @@ fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) {
             .unwrap_or_default();
         emit_status(app);
         emit_notice(app, "shutdownMissed", Some(planned));
-        return;
+        return false;
     }
     match request_shutdown(OS_GRACE_SECS) {
         Ok(()) => {
+            // 先置闸门再 exit：exit 只是请求退出，调度循环还会跑完这一跳，两个循环都靠它收手。
+            SHUTDOWN_FIRED.store(true, Ordering::SeqCst);
             emit_status(app);
             emit_notice(app, "shutdownFired", None);
             // 系统还有 OS_GRACE_SECS 秒才真关机，这段时间够应用走正常退出流程
             // （见 lib.rs：终止本地子进程 + 回收远端脚本），不至于被系统强杀在半路。
             app.exit(0);
+            true
         }
         // 不重试：轮询是秒级的，一次配置错误反复弹错会把日志和提示全刷掉。
         // 计划已经摘掉，状态也要跟着重发：否则状态栏的倒计时会一直空转，
@@ -289,6 +331,7 @@ fn fire_due_shutdown(app: &AppHandle, now: chrono::DateTime<Local>) {
         Err(err) => {
             emit_status(app);
             emit_notice(app, "shutdownFailed", Some(err.to_string()));
+            false
         }
     }
 }

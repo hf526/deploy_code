@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use crate::engine::kill_script;
 use crate::error::{CoreError, Result};
-use crate::models::{DeployStatus, ServerConfig};
+use crate::models::{ContainerRecordKind, DeployStatus, ServerConfig};
 use crate::process::shell_quote;
 use crate::ssh::SshClient;
 
@@ -15,10 +15,42 @@ use super::ContainerEngine;
 /// + 一次按标签的 `docker start`，实测要 6–8 秒。原来外面套的 5 秒会把整条 future 半路 drop，
 /// 于是连「这里停过东西」都没写进记录 —— 站点停着而界面一声不吭。
 const CLEANUP_TIMEOUT: Duration = Duration::from_secs(12);
-const RESUME_OK_NOTE: &str = "已替本次任务把来源服务重新拉起\n";
-const RESUME_FAILED_NOTE: &str = "来源服务未能自动拉起，请到该服务器执行 compose up -d\n";
-const RESUME_TIMEOUT_NOTE: &str =
-    "远端清理超时，未能确认来源服务是否已拉起；若这次勾了「暂停源服务」，请到该服务器执行 compose up -d\n";
+
+/// 「欠一次恢复」在这次清理对应的服务器上停的是哪一边：恢复任务只有目标机；迁移任务两台都
+/// 可能留凭据（来源机停的是来源项目、目标机停的是目标项目）；备份任务只可能在来源机。
+/// 记录里的提示要跟着这一边走，否则对着一台目标机写「来源服务」会把人指去另一台机器。
+#[derive(Clone, Copy)]
+enum ResumeSide {
+    Source,
+    Target,
+}
+
+impl ResumeSide {
+    fn ok_note(self) -> &'static str {
+        match self {
+            ResumeSide::Source => "已替本次任务把来源服务重新拉起\n",
+            ResumeSide::Target => "已替本次任务把目标项目重新拉起\n",
+        }
+    }
+
+    fn failed_note(self) -> &'static str {
+        match self {
+            ResumeSide::Source => "来源服务未能自动拉起，请到该服务器执行 compose up -d\n",
+            ResumeSide::Target => "目标项目未能自动拉起，请到该服务器执行 compose up -d\n",
+        }
+    }
+
+    fn timeout_note(self) -> &'static str {
+        match self {
+            ResumeSide::Source => {
+                "远端清理超时，未能确认来源服务是否已拉起；若这次勾了「暂停源服务」，请到该服务器执行 compose up -d\n"
+            }
+            ResumeSide::Target => {
+                "远端清理超时，未能确认目标项目是否已拉起；若这次恢复的是正在运行的项目，请到该服务器执行 compose up -d\n"
+            }
+        }
+    }
+}
 
 impl ContainerEngine {
     /// 应用退出 / 取消时清理某台服务器上本记录留下的远端文件。
@@ -31,22 +63,35 @@ impl ContainerEngine {
     /// 这一步自己带时间上限（[`CLEANUP_TIMEOUT`]）：调用方的预算比它小就会把整条 future 半路
     /// drop 掉，那样连「这里停过东西」都没人写下过，界面上零提示。
     pub async fn cleanup_remote(&self, server: &ServerConfig, record_id: &str) -> Result<()> {
+        let side = self.resume_side(server, record_id);
         match tokio::time::timeout(CLEANUP_TIMEOUT, self.cleanup_remote_inner(server, record_id))
             .await
         {
             Ok(result) => result,
             Err(_) => {
-                self.note_source_resume(record_id, RESUME_TIMEOUT_NOTE);
+                self.note_resume(record_id, side.timeout_note());
                 Err(CoreError::ssh(format!(
-                    "容器远端清理超时（{} 秒），来源服务是否已恢复未能确认",
+                    "容器远端清理超时（{} 秒），服务是否已恢复未能确认",
                     CLEANUP_TIMEOUT.as_secs()
                 )))
             }
         }
     }
 
+    /// 判断这次清理打到的服务器是任务的哪一边（写进记录的恢复提示要指明哪一边）。
+    fn resume_side(&self, server: &ServerConfig, record_id: &str) -> ResumeSide {
+        match self.store.find_container_record(record_id) {
+            // 恢复任务只有目标机（记录里 server_id 为空）；迁移任务的来源与目标都在
+            // server_ids 里，按 id 分边；备份等其余任务只有来源。
+            Ok(record) if record.kind == ContainerRecordKind::Restore => ResumeSide::Target,
+            Ok(record) if record.target_server_id == server.id => ResumeSide::Target,
+            _ => ResumeSide::Source,
+        }
+    }
+
     async fn cleanup_remote_inner(&self, server: &ServerConfig, record_id: &str) -> Result<()> {
         let settings = self.store.load_config()?.settings;
+        let side = self.resume_side(server, record_id);
         let client = SshClient::connect(server, settings.connect_timeout_secs).await?;
         let result = async {
             // 退出清理拿不到项目目录，逐个候选根目录都扫一遍（root 只在其中之一）。
@@ -81,12 +126,12 @@ impl ContainerEngine {
             }
             // 起没起来都要说出来：这条记录是取消之后用户唯一还能看到的地方。
             if resumed || resume_failed {
-                self.note_source_resume(
+                self.note_resume(
                     record_id,
                     if resumed {
-                        RESUME_OK_NOTE
+                        side.ok_note()
                     } else {
-                        RESUME_FAILED_NOTE
+                        side.failed_note()
                     },
                 );
             }
@@ -97,8 +142,8 @@ impl ContainerEngine {
         result
     }
 
-    /// 把清理时拉起源服务的结果补进那条记录。
-    fn note_source_resume(&self, record_id: &str, line: &str) {
+    /// 把清理时重新拉起服务的结果补进那条记录。
+    fn note_resume(&self, record_id: &str, line: &str) {
         let Ok(mut record) = self.store.find_container_record(record_id) else {
             return;
         };
@@ -116,13 +161,13 @@ impl ContainerEngine {
     }
 }
 
-/// 按快照脚本留下的「欠一次恢复」凭据把源服务拉起来，并把凭据销掉；没有凭据时一声不吭。
+/// 按快照/恢复脚本留下的「欠一次恢复」凭据把那一侧的服务拉起来，并把凭据销掉；没有凭据时一声不吭。
 ///
 /// 用 `docker start` 而不是 `compose start`：走到这条路上时手上只有记录 id 和文件里那个项目名，
 /// 没有项目目录与 compose 文件（那一次扫描随任务一起被 abort 了），而重新扫一次要在本就只有
 /// 十几秒的取消时间预算里多花一个来回。`compose stop` 停的正是这批带
 /// `com.docker.compose.project` 标签的容器，按同一个标签起回来就是同一批。
-/// 结果靠两行标记回传，由 [`ContainerEngine::note_source_resume`] 落到记录里。
+/// 结果靠两行标记回传，由 [`ContainerEngine::note_resume`] 落到记录里。
 fn resume_pause_mark(mark: &str) -> String {
     let file = shell_quote(mark);
     format!(
@@ -160,5 +205,18 @@ mod tests {
 
         // 整段包在子 shell 里：它跟在 kill_script 之后，不能因为这里判false 就把后面的 rm 带走。
         assert!(fragment.ends_with("fi )"), "{fragment}");
+    }
+
+    /// 「欠一次恢复」的提示要跟着实际停的那一边走：恢复任务只有目标机、迁移任务两台都可能停过，
+    /// 对着一台目标机写「来源服务」会把人指去另一台机器。
+    #[test]
+    fn resume_notes_follow_the_side_that_was_stopped() {
+        assert!(ResumeSide::Target.ok_note().contains("目标项目"));
+        assert!(ResumeSide::Target.failed_note().contains("目标项目"));
+        assert!(ResumeSide::Target.timeout_note().contains("目标项目"));
+
+        assert!(ResumeSide::Source.ok_note().contains("来源服务"));
+        assert!(ResumeSide::Source.failed_note().contains("来源服务"));
+        assert!(ResumeSide::Source.timeout_note().contains("来源服务"));
     }
 }
