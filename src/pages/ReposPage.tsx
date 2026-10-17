@@ -275,7 +275,10 @@ export default function ReposPage() {
                     {!repo.pathExists ? (
                       <Badge kind="red">{t("repos.pathUnavailable")}</Badge>
                     ) : repo.isRepo ? (
-                      <Badge kind="brand">{repo.currentBranch}</Badge>
+                      // 分支名可能很长（feature 分支），超出就截断，别把后面的变动数徽标挤成竖排。
+                      <Badge kind="brand" className="max-w-44 truncate">
+                        {repo.currentBranch}
+                      </Badge>
                     ) : (
                       <Badge kind="gray">{t("repos.notRepo")}</Badge>
                     )}

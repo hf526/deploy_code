@@ -13,3 +13,6 @@ pages.json
 *.key
 *.local
 .DS_Store
+
+# scripts/shot.mjs 的输出：界面截图与 headless Chrome profile
+tmp_shots*/

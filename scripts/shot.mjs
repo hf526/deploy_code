@@ -1,0 +1,165 @@
+// 自包含截图：spawn headless Chrome → 连 CDP → 抓 console → 截图 → 关闭
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+
+const CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const OUT = process.argv[2];
+// 其余参数: "name.png|#hash[:theme]" ...
+const shots = process.argv.slice(3);
+
+const chrome = spawn(CHROME, [
+  "--headless=new", "--disable-gpu", "--no-proxy-server", "--no-first-run",
+  "--hide-scrollbars", "--user-data-dir=" + OUT + "-prof",
+  "--remote-debugging-port=0", "about:blank",
+]);
+
+const wsUrl = await new Promise((res, rej) => {
+  let buf = "";
+  const timer = setTimeout(() => rej(new Error("chrome timeout")), 15000);
+  chrome.stderr.on("data", (d) => {
+    buf += d.toString();
+    const m = buf.match(/DevTools listening on (ws:\/\/\S+)/);
+    if (m) { clearTimeout(timer); res(m[1]); }
+  });
+});
+// ws://host:port/devtools/browser/... → http
+const httpBase = wsUrl.replace("ws://", "http://").split("/devtools")[0];
+
+const targets = await (await fetch(httpBase + "/json/list")).json();
+const page = targets.find((t) => t.type === "page");
+
+const ws = new WebSocket(page.webSocketDebuggerUrl);
+let id = 0;
+const pending = new Map();
+const logs = [];
+
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); return; }
+  const p = msg.params;
+  if (msg.method === "Runtime.exceptionThrown") {
+    logs.push("EXC " + (p.exceptionDetails.exception?.description || p.exceptionDetails.text).slice(0, 300));
+  } else if (msg.method === "Runtime.consoleAPICalled" && ["error", "warn"].includes(p.type)) {
+    logs.push(`[${p.type}] ` + p.args.map((a) => a.value ?? a.description ?? "").join(" ").slice(0, 250));
+  }
+};
+const send = (method, params = {}) => new Promise((res) => {
+  const n = ++id;
+  pending.set(n, res);
+  ws.send(JSON.stringify({ id: n, method, params }));
+});
+await new Promise((r) => (ws.onopen = r));
+await send("Runtime.enable");
+await send("Page.enable");
+
+// —— Tauri mock：让纯浏览器也能渲染真实界面 ——
+const FIXTURES = {
+  get_app_version: "0.1.6",
+  get_data_dir: "C:\\Users\\demo\\AppData\\Roaming\\deploy-code",
+  get_autostart: false,
+  list_repos: [
+    { id: "r1", name: "deploy_code", path: "E:\\code\\web_svcs\\deploy_code", pathExists: true, isRepo: true, currentBranch: "feat/server-mode-remote-control", remote: "git@github.com:demo/deploy-code.git", changeCount: 3, defaultServerId: "s1", defaultTargetDir: "/opt/app", envFiles: [] },
+    { id: "r2", name: "blog", path: "E:\\code\\blog", pathExists: true, isRepo: true, currentBranch: "main", remote: "git@github.com:demo/blog.git", changeCount: 0, defaultServerId: "s1", defaultTargetDir: "/var/www/blog", envFiles: [] },
+    { id: "r3", name: "qinglong-scripts", path: "E:\\code\\ql", pathExists: false, isRepo: true, currentBranch: "main", remote: null, changeCount: 0, defaultServerId: null, defaultTargetDir: "", envFiles: [] },
+  ],
+  list_servers: [
+    { id: "s1", name: "深圳轻量云", host: "1.2.3.4", port: 22, username: "root", auth: { type: "privateKey", keyPath: "C:\\keys\\id_ed25519", passphrase: null }, defaultTargetDir: "/opt/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-01 10:00:00" },
+    { id: "s2", name: "香港中转", host: "5.6.7.8", port: 2222, username: "ubuntu", auth: { type: "password", password: "" }, defaultTargetDir: "/home/ubuntu/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-15 10:00:00" },
+  ],
+  get_shutdown_status: null,
+  list_deploy_configs: [
+    { id: "d1", repoId: "r1", name: "deploy_code → 深圳轻量云", rev: "main", serverIds: ["s1"], targetDir: "/opt/app", scripts: ["./scripts/deploy.sh"], scriptDir: "docker", runScripts: true, uploadEnv: false, createdAt: "2026-09-10 10:00:00" },
+    { id: "d2", repoId: "r2", name: "blog 静态站", rev: "main", serverIds: ["s1", "s2"], targetDir: "/var/www/blog", scripts: [], scriptDir: "docker", runScripts: false, uploadEnv: true, createdAt: "2026-09-20 10:00:00" },
+  ],
+  list_backup_configs: [
+    { id: "b1", name: "生产库每夜备份", serverId: "s1", source: { mode: "docker", container: "pg-prod", database: "appdb", username: "postgres", password: "", schema: "public" }, targetId: "t1", supabaseUrl: null },
+  ],
+  list_backup_targets: [
+    { id: "t1", name: "本机 D 盘", url: "D:\\backups" },
+  ],
+  list_history: [
+    { id: "h1", kind: "deploy", repoName: "deploy_code", serverName: "深圳轻量云", status: "success", startedAt: "2026-10-17 22:10:00", finishedAt: "2026-10-17 22:11:32", durationMs: 92000, log: "", error: null },
+  ],
+  get_settings: {
+    scriptDir: "docker", runScripts: true, connectTimeoutSecs: 15, scriptTimeoutSecs: 1800,
+    keepRemoteArchive: false, historyLimit: 500, supabaseUrl: "", defaultBackupTargetId: null,
+    backupHistoryLimit: 200, backupTimeoutSecs: 3600, cloudflareApiToken: "", cloudflareAccountId: "",
+    masterPasswordHash: null, githubToken: "", cronjobApiKey: "", pagesHistoryLimit: 200,
+    containerHistoryLimit: 200, containerTimeoutSecs: 7200, containerBundleKeep: 2, dbBundleKeep: 0,
+    language: "", atomicRelease: false, releaseKeep: 5,
+    scheduledBackupEnabled: false, scheduledBackupTime: "03:00", scheduledBackupConfigId: null, scheduledBackupLastRun: "",
+    scheduledShutdownEnabled: false, scheduledShutdownTime: "04:00", scheduledShutdownLastRun: "",
+    scheduledContainerEnabled: false, scheduledContainerTime: "03:30", scheduledContainerConfigIds: [], scheduledContainerLastRun: "",
+  },
+};
+const _callbacks = new Map();
+await send("Page.addScriptToEvaluateOnNewDocument", {
+  source: `
+    const _callbacks = new Map();
+    const _reg = (cb, once) => {
+      const id = Math.floor(Math.random() * 1e9);
+      _callbacks.set(id, (data) => { if (once) _callbacks.delete(id); return cb && cb(data); });
+      return id;
+    };
+    window.__TAURI_INTERNALS__ = {
+      metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" }, currentMonitor: null },
+      transformCallback: _reg,
+      unregisterCallback: (id) => _callbacks.delete(id),
+      runCallback: (id, data) => { const c = _callbacks.get(id); if (c) c(data); },
+      callbacks: _callbacks,
+      invoke: (cmd, args) => {
+        const fx = window.__FIXTURES__;
+        if (cmd in fx) return Promise.resolve(fx[cmd]);
+        if (cmd === "plugin:event|listen" || cmd === "plugin:event|unlisten") return Promise.resolve(1);
+        if (cmd.startsWith("list_") || cmd.endsWith("_configs") || cmd.endsWith("_records")) return Promise.resolve([]);
+        return Promise.resolve(null);
+      },
+    };
+    window.__TAURI_EVENT_PLUGIN_INTERNALS__ = {
+      unregisterListener: (event, id) => _callbacks.delete(id),
+    };
+    window.__FIXTURES__ = ${JSON.stringify(FIXTURES)};
+  `,
+});
+await send("Network.enable");
+ws; // Network 失败请求也收集进 logs
+const _origOnMessage = ws.onmessage;
+ws.onmessage = (ev) => {
+  const msg = JSON.parse(ev.data);
+  if (msg.method === "Network.loadingFailed") {
+    logs.push(`NETFAIL ${msg.params.errorText} ${msg.params.type}`);
+  } else if (msg.method === "Network.responseReceived" && msg.params.response.status >= 400) {
+    logs.push(`HTTP${msg.params.response.status} ${msg.params.response.url.slice(0, 120)}`);
+  }
+  _origOnMessage(ev);
+};
+await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
+
+for (const spec of shots) {
+  const [name, rest] = spec.split("|");
+  const [hash, theme] = rest.split(":");
+  await send("Page.navigate", { url: "http://127.0.0.1:4173/" + hash });
+  await new Promise((r) => setTimeout(r, 4000));
+  if (theme) {
+    await send("Runtime.evaluate", { expression: `document.documentElement.dataset.theme="${theme}";` });
+    await new Promise((r) => setTimeout(r, 400));
+  }
+  const shot = await send("Page.captureScreenshot", { format: "png" });
+  if (shot.result?.data) {
+    fs.writeFileSync(OUT + "/" + name, Buffer.from(shot.result.data, "base64"));
+    console.log("saved", name);
+  } else console.log("FAILED", name, JSON.stringify(shot.error || shot).slice(0, 120));
+
+  const st = await send("Runtime.evaluate", {
+    expression:
+      'JSON.stringify({url:location.href.slice(0,60), rs:document.readyState, title:document.title, tauri:!!window.__TAURI_INTERNALS__, vite:!!window.__vite_plugin_react_preamble_installed__, rootLen:document.getElementById("root")?.innerHTML.length||0})',
+    returnByValue: true,
+  });
+  console.log("STATE", name, st.result?.result?.value);
+}
+
+console.log("\n--- console ---");
+console.log([...new Set(logs)].slice(0, 25).join("\n") || "(clean)");
+
+await send("Browser.close");
+process.exit(0);

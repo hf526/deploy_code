@@ -408,6 +408,8 @@ input[type="number"]::-webkit-inner-spin-button {
     font-size: 11px;
     font-weight: 500;
     line-height: 1.45;
+    /* 徽标是状态标签，折行会破坏胶囊形状（长分支名实测会把徽标撑成两行） */
+    white-space: nowrap;
   }
 
   .ui-badge-gray {
