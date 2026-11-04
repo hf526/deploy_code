@@ -13,16 +13,14 @@ on:
   pull_request:
 
 jobs:
-  # 纯 Rust 的两个 crate：不碰 tauri，也不需要前端产物，反馈最快。
-  core-and-cli:
+  # 核心库：不碰 tauri，也不需要前端产物，反馈最快。
+  core:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # deploy-cli 的用例钉的是「CLI 的 JSON 输出必须脱敏」那条红线
-      # （redact_server / redact_target / redact_backup_config）。
-      - run: cargo test -p deploy-core -p deploy-cli
+      - run: cargo test -p deploy-core
 
   # 前端门禁：tsc + vitest。i18n 的两份文案 1:1、格式与缩进也在 npm test 里。
   frontend:

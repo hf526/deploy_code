@@ -455,7 +455,7 @@ impl Git {
             let sensitive = self.sensitive_changes()?;
             if !sensitive.is_empty() {
                 return Err(CoreError::git(format!(
-                    "检测到疑似敏感文件，已阻止提交：\n  {}\n如确认不含密钥 / 密码：界面中可再次确认提交，命令行需加 --allow-sensitive。",
+                    "检测到疑似敏感文件，已阻止提交：\n  {}\n如确认不含密钥 / 密码：请在界面再次确认后提交。",
                     sensitive.join("\n  ")
                 )));
             }
@@ -775,9 +775,9 @@ fn validate_remote_url(value: &str) -> Result<String> {
 /// 把远端 URL 里内嵌的凭据遮成 `***`，供所有「给人看」的输出路径使用。
 ///
 /// HTTPS 地址把 token 当口令或当用户名内嵌（`https://user:ghp_x@…`、`https://ghp_x@…`）是
-/// 常见配置，原样打进 CLI 输出 / 日志就是泄漏；所以口令段与「无冒号但挂在 http(s) 上的
+/// 常见配置，原样打进日志或界面就是泄漏；所以口令段与「无冒号但挂在 http(s) 上的
 /// userinfo」一律遮掉。`git@host:path` 与 `ssh://git@host/…` 没有口令段，保持可读。
-/// 编辑入口不能吃这个值：调用方（CLI 输出、界面展示）只拿它给人看，改远端必须走原文。
+/// 编辑入口不能吃这个值：展示侧只拿它给人看，改远端必须走原文。
 pub fn mask_remote_url(url: &str) -> String {
     let Some(scheme_end) = url.find("://") else {
         return url.to_string();
@@ -968,8 +968,8 @@ pub fn is_sensitive_path(path: &str) -> bool {
 
 /// 对一段人读文本里的**每一处** `scheme://…` 做凭据遮蔽。
 ///
-/// git 失败的 stderr 与命令行参数都可能带着内嵌口令的远端 URL（`fatal: unable to access
-/// 'https://user:token@…'`），这条消息会进任务日志、记录与 CLI stderr；同一行里 URL 还可能
+/// git 失败的 stderr 与命令参数都可能带着内嵌口令的远端 URL（`fatal: unable to access
+/// 'https://user:token@…'`），这条消息会进任务日志与记录；同一行里 URL 还可能
 /// 出现多次，不能只遮第一处。URL 的边界取空白与常见引用符，遮不到的尾巴维持原文。
 fn mask_remote_urls_in_text(text: &str) -> String {
     const BOUNDARIES: &[char] = &[
@@ -1002,7 +1002,7 @@ fn git_error(args: &[&str], out: &CommandOutput) -> String {
     if detail.contains("not a git repository") {
         return "当前文件夹尚未绑定 Git 仓库，请先绑定远端仓库地址".to_string();
     }
-    // 失败回显会进任务日志 / 记录 / CLI stderr：stderr 与参数都可能带着内嵌口令的 URL。
+    // 失败回显会进任务日志与记录：stderr 与参数都可能带着内嵌口令的 URL。
     let args = args
         .iter()
         .map(|arg| mask_remote_url(arg))

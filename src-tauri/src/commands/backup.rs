@@ -226,7 +226,7 @@ pub fn save_backup_config(
     }
 
     let saved = state.store.mutate_config(|app| {
-        // 服务器必须以 id 形式存在；名称 / host 也允许（兼容 CLI）。
+        // 服务器必须以 id 形式存在；名称 / host 也允许（兼容旧数据）。
         let server = Store::find_server(app, &config.server_id)?.clone();
         config.server_id = server.id.clone();
 
@@ -301,7 +301,7 @@ pub fn save_backup_targets(
     targets: Vec<BackupTarget>,
 ) -> Result<Vec<BackupTarget>> {
     // 规范化、重名校验、以及「仍被引用的目标不许删」都在 deploy-core：
-    // 界面的整表回写和 CLI 的 `backup target remove` 必须走同一条，否则删法比界面宽松。
+    // 删除备份目标只能走这一条，否则绕过引用检查就会静默换库。
     state.store.replace_backup_targets(&targets)
 }
 

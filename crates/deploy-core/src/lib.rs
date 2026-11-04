@@ -1,12 +1,13 @@
 //! DeployCode 核心库。
 //!
-//! 该 crate 不依赖任何 GUI 框架，GUI（Tauri）与 CLI 共用同一套实现：
+//! 该 crate 不依赖任何 GUI 框架，只被 Tauri 桌面壳调用：
 //!
 //! - [`models`]：数据模型与序列化结构
 //! - [`store`]：配置与部署记录持久化
 //! - [`git`]：本地仓库 Git 操作
 //! - [`ssh`]：SSH 连接、命令执行与 SFTP 上传
 //! - [`security`]：服务器安全检查（登录日志 / sshd 配置 / 防火墙）
+//! - [`metrics`]：服务器主机资源占用（CPU / 内存，只读 `/proc`）
 //! - [`engine`]：部署流程编排
 //! - [`nginx`]：服务器 Nginx 容器配置管理
 //! - [`release`]：原子发布（releases + current 软链）
@@ -27,6 +28,7 @@ pub mod cronjob;
 pub mod engine;
 pub mod error;
 pub mod git;
+pub mod metrics;
 pub mod models;
 pub mod nginx;
 pub mod pages;
@@ -50,6 +52,7 @@ pub use cronjob::{CronHeader, CronJob, CronJobDraft, CronJobRun, CronSchedule, C
 pub use engine::{repo_info, DeployEngine, EventSender};
 pub use error::{CoreError, Result};
 pub use git::{mask_remote_url, Git};
+pub use metrics::{HostMetrics, ServerMetrics};
 pub use models::*;
 pub use nginx::{NginxConfigContent, NginxConfigFile, NginxContainerInfo, NginxEngine};
 pub use pages::{PagesEngine, PagesEventSender, PreparedPagesDeploy};

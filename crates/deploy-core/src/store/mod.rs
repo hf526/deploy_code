@@ -44,7 +44,7 @@ pub struct Store {
     write_lock: Mutex<()>,
 }
 
-/// 跨进程任务锁（GUI 与 CLI 抢占同一个任务时互斥）。
+/// 跨进程任务锁（两个进程抢占同一个任务时互斥）。
 pub struct TaskLock {
     file: std::fs::File,
     path: PathBuf,
@@ -105,7 +105,7 @@ impl Store {
         }
     }
 
-    /// 使用系统默认数据目录（GUI 与 CLI 共用同一份数据）。
+    /// 使用系统默认数据目录。
     pub fn default_store() -> Result<Self> {
         let dirs = ProjectDirs::from("com", "deploycode", "DeployCode")
             .ok_or_else(|| CoreError::config("无法定位系统数据目录"))?;

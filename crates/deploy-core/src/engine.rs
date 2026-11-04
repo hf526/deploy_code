@@ -48,7 +48,7 @@ impl Drop for TempArchiveGuard {
     }
 }
 
-/// 部署事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
+/// 部署事件发送端（GUI 转发为 Tauri 事件）。
 pub type EventSender = UnboundedSender<DeployEvent>;
 
 /// 一次批量的结果：每台一条记录，按执行顺序排列。
@@ -56,13 +56,11 @@ pub type EventSender = UnboundedSender<DeployEvent>;
 /// `blocked` 只在「第一台连准备都没通过」时有值：此时没有任何记录写盘、也没有
 /// started/finished 事件发出，界面等不到收敛信号，必须由调用方把错误带回给请求方。
 ///
-/// `aborted` 是另外半件事：**已经跑起来过**的批次被后面某台的准备失败掐断。界面靠
-/// [`DeployEvent::BatchAborted`] 就能定性，但命令行没有事件可等 —— 只看记录会得出
-/// 「第一台是 success，所以这批全发了」的结论并以 0 退出，脚本调用方就此把没部署的机器当成部署了。
+/// 「跑起来过之后被后面某台的准备失败掐断」不走这条返回值，由
+/// [`DeployEvent::BatchAborted`] 给批次定性。
 pub struct DeployBatch {
     pub records: Vec<DeployRecord>,
     pub blocked: Option<CoreError>,
-    pub aborted: Option<String>,
 }
 
 /// 部署引擎：组织“打包 -> 上传 -> 解压 -> 执行脚本”的完整流程。
@@ -185,7 +183,6 @@ impl DeployEngine {
         let total = server_ids.len();
         let mut results = Vec::with_capacity(total);
         let mut blocked = None;
-        let mut aborted = None;
         for (index, server_id) in server_ids.iter().enumerate() {
             let request = DeployRequest {
                 server_id: server_id.clone(),
@@ -209,20 +206,15 @@ impl DeployEngine {
                     // 它已经结束：把首台的准备错误带出去，由命令层像单台部署那样同步报错。
                     if results.is_empty() {
                         blocked = Some(err);
-                    } else {
-                        let reason = err.to_string();
-                        if let Some(sender) = &events {
-                            // 已经有机器成功时命令层在首台开始时就把台数返回了，之后全靠事件收敛界面；
-                            // 而那台成功的记录会把界面定成绿色「成功」，盖不住「这批还有机器没发出去」。
-                            // 这台没有记录可发 Finished，所以用一条独立的中止事件把批次定性。
-                            let _ = sender.send(DeployEvent::BatchAborted {
-                                succeeded: results.len(),
-                                total,
-                                reason: reason.clone(),
-                            });
-                        }
-                        // 没有事件通道的调用方（CLI）只能看返回值，否则它会拿着一份成功记录退 0。
-                        aborted = Some(reason);
+                    } else if let Some(sender) = &events {
+                        // 已经有机器成功时命令层在首台开始时就把台数返回了，之后全靠事件收敛界面；
+                        // 而那台成功的记录会把界面定成绿色「成功」，盖不住「这批还有机器没发出去」。
+                        // 这台没有记录可发 Finished，所以用一条独立的中止事件把批次定性。
+                        let _ = sender.send(DeployEvent::BatchAborted {
+                            succeeded: results.len(),
+                            total,
+                            reason: err.to_string(),
+                        });
                     }
                     break;
                 }
@@ -264,7 +256,6 @@ impl DeployEngine {
         DeployBatch {
             records: results,
             blocked,
-            aborted,
         }
     }
 
@@ -333,7 +324,7 @@ impl DeployEngine {
             .map(|config| config.settings.history_limit)
             .unwrap_or(500);
         if let Err(first_err) = self.store.upsert_history(&record, limit) {
-            // 写入失败不能让最终状态静默丢失：记录错误事件（CLI/GUI 均可见）后重试一次。
+            // 写入失败不能让最终状态静默丢失：记录错误事件（界面可见）后重试一次。
             logger.error(format!("保存部署记录失败: {first_err}"));
             record.log = logger.joined();
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -905,7 +896,7 @@ pub fn normalize_env_files(files: &[EnvFileConfig]) -> Result<Vec<EnvFileConfig>
         if local.is_empty() {
             return Err(CoreError::deploy("环境文件的本地路径不能为空"));
         }
-        // 必须是绝对路径。相对的 `.env` 会按「当前进程的工作目录」解释：CLI 从哪个目录起就不一样，
+        // 必须是绝对路径。相对的 `.env` 会按「当前进程的工作目录」解释：换个启动目录就不一样，
         // 一份从别处拷来的 config.json 里写着 `.env` 时，可能静默把本机某个无关文件覆盖到服务器上
         // 的部署目录里（非空即成功，看不出来）。仓库里其它地方的 env 路径语义也是绝对路径
         // （`models.rs::rebase_env_files` 搬的就是绝对路径）。

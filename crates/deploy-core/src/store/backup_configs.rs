@@ -63,7 +63,7 @@ impl Store {
 
     /// 用新列表整体替换备份目标：规范化校验 → 拒绝删除仍被引用的目标 → 落盘。
     ///
-    /// 界面的列表增删和 CLI 的 `backup target remove` 共用这一条，两边口径必须一致。
+    /// 界面的列表增删都走这一条，删法只有一份口径。
     pub fn replace_backup_targets(&self, targets: &[BackupTarget]) -> Result<Vec<BackupTarget>> {
         let mut normalized: Vec<BackupTarget> = Vec::with_capacity(targets.len());
         for target in targets {
@@ -272,7 +272,7 @@ impl Store {
 }
 
 /// 判断两个本地路径是否指向同一处：统一分隔符、忽略结尾斜杠。
-/// GUI 与 CLI 的仓库查重都走这里，避免各处自己写一套归一化而宽严不一。
+/// 各处的仓库查重都走这里，避免自己写一套归一化而宽严不一。
 pub fn paths_equal(a: &str, b: &str) -> bool {
     let normalize = |p: &str| {
         let normalized = p.replace('\\', "/");

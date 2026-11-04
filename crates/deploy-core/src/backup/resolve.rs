@@ -395,7 +395,7 @@ mod tests {
         config.backup_configs.push(saved.clone());
 
         let request = BackupRequest {
-            // 使用配置时允许 server_id 留空（CLI 可只给 --config）。
+            // 走已保存的配置时 server_id 可以留空，由这条配置自己提供。
             server_id: String::new(),
             backup_config_id: Some(saved.id.clone()),
             source: None,

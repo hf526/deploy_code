@@ -91,7 +91,7 @@ export default function BackupsPage() {
   const [selectedConfigs, setSelectedConfigs] = useState<Set<string>>(() => new Set());
   const [scheduleTime, setScheduleTime] = useState(settings.scheduledBackupTime);
 
-  // 配置 / 目标 / 设置可能被 CLI 改动，进入页面时拉取一次最新数据，避免展示与后端不一致。
+  // 配置 / 目标 / 设置可能被另一个实例改动，进入页面时拉取一次最新数据，避免展示与后端不一致。
   useEffect(() => {
     void refreshBackupConfigs();
     void refreshBackupTargets();
@@ -116,7 +116,7 @@ export default function BackupsPage() {
     [backups],
   );
 
-  // 后台刷新或 CLI 改过列表后，丢掉已经不存在的勾选。
+  // 后台刷新或别处改过列表后，丢掉已经不存在的勾选。
   useEffect(() => {
     setSelectedRecords((current) => {
       const pruned = pruneSelection(current, selectableRecordIds);
@@ -159,7 +159,7 @@ export default function BackupsPage() {
     [backupConfigs, backupTargets, t],
   );
 
-  // 目标被删掉或配置被 CLI 改过之后，丢掉已经不可选的勾选。
+  // 目标被删掉或配置在别处改过之后，丢掉已经不可选的勾选。
   useEffect(() => {
     setSelectedConfigs((current) => {
       const pruned = pruneSelection(current, selectableConfigIds);

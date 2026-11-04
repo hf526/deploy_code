@@ -38,7 +38,7 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
     server.tunnels = normalize_rules(&server.tunnels)?;
 
     let (saved, servers) = state.store.mutate_config(|config| {
-        // 名称是 CLI / 仓库默认服务器的查找键之一，重名会导致命中错误服务器。
+        // 名称是仓库默认服务器的查找键之一，重名会导致命中错误服务器。
         if config
             .servers
             .iter()
@@ -97,6 +97,18 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
 #[tauri::command]
 pub async fn test_server(state: State<'_, AppState>, server: ServerConfig) -> Result<String> {
     state.engine().test_server(&server).await
+}
+
+/// 逐台采集主机资源占用（CPU / 内存）。
+///
+/// 读的是服务器上的 `/proc`，一条一秒钟的只读命令，和 `list_compose_stacks` 同一条口径：
+/// 不占任务名额、不发事件，任务在跑时也能看；某一台连不上只影响它自己那一行。
+#[tauri::command]
+pub async fn list_server_metrics(
+    state: State<'_, AppState>,
+) -> Result<Vec<deploy_core::ServerMetrics>> {
+    let config = state.store.load_config()?;
+    Ok(deploy_core::metrics::collect_all(&config.servers, config.settings.connect_timeout_secs).await)
 }
 
 /// 采集服务器安全检查报告（登录失败、成功登录、防火墙、sshd 配置）。

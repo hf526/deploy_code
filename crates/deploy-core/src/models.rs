@@ -15,7 +15,7 @@ pub enum DeployStatus {
 pub enum SshAuth {
     Password { password: String },
     PrivateKey {
-        // alias 兼容 CLI/旧版本写出的 key_path 字段。
+        // alias 兼容旧版本写出的 key_path 字段。
         #[serde(alias = "key_path")]
         key_path: String,
         #[serde(default)]
@@ -644,7 +644,7 @@ pub struct RemoteRelease {
     pub modified: String,
 }
 
-/// 部署过程中推送的事件（GUI 通过 Tauri event 转发，CLI 直接打印）。
+/// 部署过程中推送的事件（GUI 通过 Tauri event 转发）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum DeployEvent {
@@ -731,7 +731,7 @@ pub struct BackupRecord {
     pub duration_ms: u64,
 }
 
-/// 备份过程中推送的事件（GUI 通过 Tauri event 转发，CLI 直接打印）。
+/// 备份过程中推送的事件（GUI 通过 Tauri event 转发）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum BackupEvent {
@@ -1296,7 +1296,7 @@ pub struct ImportPreview {
 
 impl ExportData {
     pub fn new(config: &AppConfig) -> Self {
-        // 脱敏：清空敏感字段。一律用空串，而不是 CLI 输出里那种 "***" 占位符——
+        // 脱敏：清空敏感字段。一律用空串，不用 "***" 占位符——
         // 导入时「空」的语义是「本次没提供，保留本机值」（见 store::keep_when_blank），
         // 填占位符会把本机能用的凭据覆盖成废值。
         let mut servers = config.servers.clone();

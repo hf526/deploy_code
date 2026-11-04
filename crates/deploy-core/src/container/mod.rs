@@ -53,7 +53,7 @@ use crate::store::Store;
 use crate::tasklog::TaskLogger;
 use crate::util::{format_duration, human_size};
 
-/// 容器任务事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
+/// 容器任务事件发送端（GUI 转发为 Tauri 事件）。
 pub type ContainerEventSender = UnboundedSender<ContainerEvent>;
 
 /// 已解析并登记好的容器任务。

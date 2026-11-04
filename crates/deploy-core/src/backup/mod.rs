@@ -69,7 +69,7 @@ fn emit_log(events: &Option<BackupEventSender>, level: LogLevel, message: String
     }
 }
 
-/// 备份事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
+/// 备份事件发送端（GUI 转发为 Tauri 事件）。
 pub type BackupEventSender = UnboundedSender<BackupEvent>;
 
 /// 已校验并解析好的备份任务。
@@ -230,7 +230,7 @@ impl BackupEngine {
     ) -> BackupBatch {
         let total = config_ids.len();
         // 名称只用于日志归属（报错要点名是哪条配置）；执行参数仍由 prepare 重新读盘解析，
-        // 免得这份快照与 CLI 刚改过的配置不一致时，批次照着旧名字跑。
+        // 免得这份快照与盘上刚改过的配置不一致时，批次照着旧名字跑。
         let names: Vec<String> = self
             .store
             .load_config()

@@ -40,8 +40,8 @@ fn locate_authority(rest: &str, assume_late_at_is_userinfo: bool) -> (usize, Opt
     let query_limit = rest.find(['?', '#']).unwrap_or(rest.len());
     // 脱敏这一路搜 `@` 的右界不能直接用第一个 `?`/`#`：口令里就带这两个字符时（生成器给的强口令
     // 很常见，而这里没有任何东西要求用户先编码），第一个 `?` 是口令的一部分，真正的 `@` 和口令尾部
-    // 会被关在搜索区之外，于是整串一条不遮地原样返回 —— 而这份串落进 BackupRecord.target 与 CLI 的
-    // JSON 输出。按 RFC 3986，`?`/`#` 只有在路径开始（第一个 `/`）之后才当查询/片段分界；一条 `/`
+    // 会被关在搜索区之外，于是整串一条不遮地原样返回 —— 而这份串落进 BackupRecord.target
+    // （backups.json）。按 RFC 3986，`?`/`#` 只有在路径开始（第一个 `/`）之后才当查询/片段分界；一条 `/`
     // 都没有时（`host:5432?x=1` 这种）它确实是分界，照旧用 query_limit。
     let mask_limit = match rest.find('/') {
         Some(slash) => rest[slash..]
@@ -86,8 +86,8 @@ fn looks_like_host_port(prefix: &str) -> bool {
 /// 隐藏连接串中的密码（userinfo 与查询参数），用于日志与记录展示。
 pub fn mask_database_url(url: &str) -> String {
     // 没有 `://` 也要遮：`supabase_url` 不经过 `validate_target_url`（保存服务器时不校验它的
-    // scheme），`localhost:5432/db?password=sec` 这类写法原样返回就等于把口令打进 CLI 的 JSON
-    // 输出与界面展示。本函数的口径是「宁可多遮蔽」，代价只是 `host:5432/db@name` 显示得更黑。
+    // scheme），`localhost:5432/db?password=sec` 这类写法原样返回就等于把口令打进
+    // 日志与界面展示。本函数的口径是「宁可多遮蔽」，代价只是 `host:5432/db@name` 显示得更黑。
     let (prefix, rest) = match url.find("://") {
         Some(end) => (&url[..end + 3], &url[end + 3..]),
         None => ("", url),
@@ -303,7 +303,7 @@ mod tests {
 
     /// 口令里带未编码的 `?` / `#` 是最容易被漏掉的一类：这两个字符正是查询与片段的分界，
     /// 拿「第一个 `?`/`#`」当分界去搜 `@`，真正的 `@` 就落在搜索区之外，于是整串一条不遮地
-    /// 原样返回 —— 而这份串会进 `BackupRecord.target`（落 backups.json）与 CLI 的 JSON 输出。
+    /// 原样返回 —— 而这份串会进 `BackupRecord.target`（落 backups.json）与任务日志。
     #[test]
     fn mask_covers_passwords_holding_query_or_fragment_delimiters() {
         assert_eq!(
@@ -322,8 +322,8 @@ mod tests {
     }
 
     /// 早返回曾经是这条红线的一个洞：`supabase_url` 存的时候不校验 scheme，所以一条不带
-    /// `://` 的连接串能原样走进 `redact_server` 与 `redact_target`，把口令整段打在 CLI 的
-    /// JSON 输出里。纯文本（既没有 `@` 也没有 `password=`）照旧不该被动。
+    /// `://` 的连接串能原样走进落盘的 `ServerConfig.supabase_url`，把口令整段打在
+    /// 记录与界面里。纯文本（既没有 `@` 也没有 `password=`）照旧不该被动。
     #[test]
     fn mask_covers_urls_written_without_a_scheme() {
         assert_eq!(

@@ -1,4 +1,4 @@
-//! 部署 / 容器 / Pages 配置的校验、保存与删除（GUI 与 CLI 共用，保证两端行为一致）。
+//! 部署 / 容器 / Pages 配置的校验、保存与删除（界面与命令层共用，保证行为一致）。
 
 use super::Store;
 use crate::error::{CoreError, Result};
@@ -9,7 +9,7 @@ use crate::models::{
 impl Store {
     /// 按 id / 名称查找部署配置；id 精确命中优先，避免与名称歧义。
     /// 服务器被删除后收敛部署配置：从目标列表里摘掉这一台，没有剩余目标的配置整条删除。
-    /// GUI 与 CLI 共用，避免两条清理路径的语义分叉。
+    /// 几条清理路径共用，避免语义分叉。
     pub fn detach_server_from_deploy_configs(config: &mut AppConfig, server_id: &str) {
         for saved in config.deploy_configs.iter_mut() {
             saved.server_ids.retain(|id| id != server_id);
@@ -32,7 +32,7 @@ impl Store {
     }
 
     /// 新建或更新一条部署配置：规范化仓库 / 服务器引用并校验名称唯一。
-    /// GUI 与 CLI 共用，保证两端保存行为一致。
+    /// 保存入口共用，保证行为一致。
     pub fn save_deploy_config(store: &Store, config: DeployConfig) -> Result<DeployConfig> {
         let mut config = config;
         config.name = config.name.trim().to_string();
@@ -77,7 +77,7 @@ impl Store {
             .collect();
 
         store.mutate_config(|app| {
-            // 仓库 / 服务器必须存在；名称与 host 也允许（兼容 CLI 习惯）。
+            // 仓库 / 服务器必须存在；名称与 host 也允许（兼容旧数据）。
             let repo = Store::find_repo(app, &config.repo_id)?.clone();
             config.repo_id = repo.id.clone();
             // 逐台解析成真实 id：按名称 / host 写进来的、以及解析后撞同一台的都在这里收敛。
@@ -94,7 +94,7 @@ impl Store {
             if config.id.is_empty() {
                 config.id = new_id();
             } else if by_id.is_none() {
-                // 明确携带 id 却不存在（配置已被其它窗口 / CLI 删除）：报错而不是静默新建，
+                // 明确携带 id 却不存在（配置已被其它窗口删除）：报错而不是静默新建，
                 // 避免「复活」已删除配置或用任意 id 注入条目。
                 return Err(CoreError::not_found(format!(
                     "部署配置不存在（可能已被删除）: {}",
@@ -196,7 +196,7 @@ impl Store {
         config.server_id = config.server_id.trim().to_string();
 
         store.mutate_config(|app| {
-            // 服务器必须以 id 形式存在；名称 / host 也允许（兼容 CLI）。
+            // 服务器必须以 id 形式存在；名称 / host 也允许（兼容旧数据）。
             let source = Store::find_server(app, &config.server_id)?.clone();
             config.server_id = source.id.clone();
 
@@ -324,7 +324,7 @@ impl Store {
 
     /// 新建或更新一条 Pages 配置：仓库必须存在，同一仓库内名称唯一。
     /// id 留空表示新建（补 uuid），携带不存在的 id 则报错而不是静默新建。
-    /// GUI 与 CLI 共用，保证两端保存行为一致。
+    /// 保存入口共用，保证行为一致。
     pub fn save_pages_config(store: &Store, entry: PagesConfigEntry) -> Result<PagesConfigEntry> {
         let mut entry = entry;
         entry.name = entry.name.trim().to_string();
@@ -351,7 +351,7 @@ impl Store {
             if entry.id.is_empty() {
                 entry.id = new_id();
             } else if by_id.is_none() {
-                // 明确携带 id 却不存在（已被 CLI / 其它窗口删除）：报错而不是静默新建。
+                // 明确携带 id 却不存在（已被其它窗口删除）：报错而不是静默新建。
                 return Err(CoreError::not_found(format!(
                     "Pages 配置不存在（可能已被删除）: {}",
                     entry.id

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/deploy-core", "crates/deploy-cli", "src-tauri"]
+members = ["crates/deploy-core", "src-tauri"]
 
 [workspace.package]
 version = "0.1.6"
@@ -24,6 +24,5 @@ tokio = { version = "1", features = [
   "net",
 ] }
 directories = "6"
-clap = { version = "4", features = ["derive"] }
 sha2 = "0.10"
 deploy-core = { path = "crates/deploy-core" }

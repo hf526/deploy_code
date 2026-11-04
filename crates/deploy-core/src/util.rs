@@ -1,4 +1,4 @@
-//! 展示用格式化工具（GUI 与 CLI 共用，避免各写一份）。
+//! 展示用格式化工具。
 
 /// 字节数转可读尺寸，保留一位（KB）或两位（MB / GB）小数。
 pub fn human_size(bytes: u64) -> String {

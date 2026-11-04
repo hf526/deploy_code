@@ -45,7 +45,7 @@ export const SETTINGS_FIELD_GROUPS: Record<keyof Settings, SettingsGroupName> = 
   containerTimeoutSecs: "containerParams",
   containerBundleKeep: "containerParams",
   // 还没有任何界面写它：后端默认 0（不落本机导出包）。登记成 storage 是待办标记，
-  // 要么补进 StorageSection，要么明确「只给 CLI 用」。
+  // 要么补进 StorageSection，要么明确「只能改配置文件」。
   dbBundleKeep: "storage",
   scheduledBackupEnabled: "scheduledBackup",
   scheduledBackupTime: "scheduledBackup",

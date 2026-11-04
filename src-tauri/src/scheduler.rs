@@ -160,7 +160,7 @@ pub fn spawn(app: AppHandle) {
                     emit_notice(&app, "started", None);
                 }
                 Err(err) => {
-                    // 已有备份（手动或 CLI）在跑：窗口内继续等待，不算失败。
+                    // 已有备份任务在跑：窗口内继续等待，不算失败。
                     // 用错误类型判断而非字符串匹配，文案变化不会让重试逻辑静默失效。
                     let busy = app.state::<AppState>().is_backup_active()
                         || matches!(&err, CoreError::Busy(_));

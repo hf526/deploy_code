@@ -65,6 +65,13 @@ const FIXTURES = {
   list_servers: [
     { id: "s1", name: "深圳轻量云", host: "1.2.3.4", port: 22, username: "root", auth: { type: "privateKey", keyPath: "C:\\keys\\id_ed25519", passphrase: null }, defaultTargetDir: "/opt/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-01 10:00:00" },
     { id: "s2", name: "香港中转", host: "5.6.7.8", port: 2222, username: "ubuntu", auth: { type: "password", password: "" }, defaultTargetDir: "/home/ubuntu/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-15 10:00:00" },
+    { id: "s3", name: "老机器（采不到）", host: "10.0.0.9", port: 22, username: "deploy", auth: { type: "privateKey", keyPath: "C:\\keys\\id_rsa", passphrase: null }, defaultTargetDir: "/srv/legacy", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-10-02 10:00:00" },
+  ],
+  // 一台正常、一台双指标越线（警示色）、一台采集失败（红色 + 悬停看原因）。
+  list_server_metrics: [
+    { serverId: "s1", metrics: { cpuPercent: 12, cpuCores: 4, memoryTotalBytes: 8074006528, memoryUsedBytes: 2415919104 }, error: null },
+    { serverId: "s2", metrics: { cpuPercent: 93, cpuCores: 2, memoryTotalBytes: 4194304000, memoryUsedBytes: 3972005888 }, error: null },
+    { serverId: "s3", metrics: null, error: "连接超时（15s）" },
   ],
   get_shutdown_status: null,
   list_deploy_configs: [
@@ -77,8 +84,11 @@ const FIXTURES = {
   list_backup_targets: [
     { id: "t1", name: "本机 D 盘", url: "D:\\backups" },
   ],
+  // 字段按 DeployRecord 全量给：少一个（例如 commitSubject）就会在 HistoryPage 的
+  // shortPath 上抛 undefined，而 SPA 不重载，后续路由会跟着整页空白，看着像应用坏了。
   list_history: [
-    { id: "h1", kind: "deploy", repoName: "deploy_code", serverName: "深圳轻量云", status: "success", startedAt: "2026-10-17 22:10:00", finishedAt: "2026-10-17 22:11:32", durationMs: 92000, log: "", error: null },
+    { id: "h1", repoId: "r1", repoName: "deploy_code", rev: "main", branch: "main", worktree: false, atomicRelease: true, releaseDir: "/opt/app/releases/20261017-221000-3b2424f", commit: "3b2424f9c1a2e3f4a5b6c7d8e9f0a1b2c3d4e5f6", commitShort: "3b2424f", commitSubject: "feat: 一份配置部署到多台服务器", serverId: "s1", serverName: "深圳轻量云", targetDir: "/opt/app", scriptDir: "docker", scripts: ["deploy.sh"], runScripts: true, envFiles: [], status: "success", error: null, log: "", startedAt: "2026-10-17 22:10:00", finishedAt: "2026-10-17 22:11:32", durationMs: 92000 },
+    { id: "h2", repoId: "r2", repoName: "blog", rev: "", branch: "(工作区)", worktree: true, atomicRelease: false, releaseDir: null, commit: "", commitShort: "", commitSubject: "", serverId: "s2", serverName: "香港中转", targetDir: "/var/www/blog", scriptDir: "docker", scripts: [], runScripts: false, envFiles: [{ localPath: "E:\\code\\blog\\.env.local", remotePath: ".env" }], status: "failed", error: "脚本 docker/build.sh 退出码 1", log: "", startedAt: "2026-10-18 09:02:00", finishedAt: "2026-10-18 09:02:41", durationMs: 41000 },
   ],
   get_settings: {
     scriptDir: "docker", runScripts: true, connectTimeoutSecs: 15, scriptTimeoutSecs: 1800,

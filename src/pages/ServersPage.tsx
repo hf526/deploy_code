@@ -42,16 +42,27 @@ import type {
   OnlineSession,
   SecurityReport,
   ServerConfig,
+  ServerMetrics,
+  HostMetrics,
   ServerTunnelStatus,
   SecuritySetting,
 } from "../lib/types";
-import { authSummary, newServerTemplate } from "../lib/utils";
+import { authSummary, humanSize, newServerTemplate } from "../lib/utils";
 
 function firewallLabel(firewall: string): string {
   if (firewall === "none") return i18n.t("servers.firewallNone");
   if (firewall === "unknown") return i18n.t("servers.firewallUnknown");
   if (firewall === "ufw") return "UFW";
   return firewall;
+}
+
+/** 到这两个比例就把数字换成警示色：界面上不用点开详情也能扫出哪台快撑不住。 */
+const CPU_WARN_PERCENT = 85;
+const MEMORY_WARN_PERCENT = 90;
+
+function memoryPercent(metrics: HostMetrics): number {
+  if (metrics.memoryTotalBytes <= 0) return 0;
+  return Math.round((metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100);
 }
 
 function settingTone(setting: SecuritySetting): "green" | "red" | "amber" | "gray" {
@@ -82,6 +93,7 @@ export default function ServersPage() {
   const [removing, setRemoving] = useState<ServerConfig | null>(null);
   const [tunneling, setTunneling] = useState<ServerConfig | null>(null);
   const [tunnelStatuses, setTunnelStatuses] = useState<ServerTunnelStatus[]>([]);
+  const [metrics, setMetrics] = useState<Record<string, ServerMetrics>>({});
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
 
@@ -99,6 +111,16 @@ export default function ServersPage() {
       setTunnelStatuses(await api.listTunnelStatus());
     },
     { minGapMs: 3000 },
+  );
+
+  // 资源占用每台都要一次 SSH 往返，所以同样只在进页面 / 窗口聚焦时采一次，外加表头那个手动按钮；
+  // 不轮询——一屏几台机器每秒建连接没有意义，界面上的数字本来就是「上一次采集那一刻」的。
+  const { refresh: refreshMetrics, refreshing: metricsRefreshing } = useAutoRefresh(
+    async () => {
+      const items = await api.listServerMetrics();
+      setMetrics(Object.fromEntries(items.map((item) => [item.serverId, item])));
+    },
+    { minGapMs: 5000 },
   );
 
   // 扫描请求序号 + 当前打开的服务器：切换/关闭后，旧服务器操作触发的重扫直接丢弃，
@@ -228,9 +250,20 @@ export default function ServersPage() {
       title={t("nav.servers")}
       subtitle={t("servers.subtitle")}
       actions={
-        <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
-          {t("servers.add")}
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button
+            variant="secondary"
+            icon={<RefreshCw className="size-4" />}
+            loading={metricsRefreshing}
+            title={t("servers.refreshMetricsHint")}
+            onClick={() => void refreshMetrics(true)}
+          >
+            {t("servers.refreshMetrics")}
+          </Button>
+          <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
+            {t("servers.add")}
+          </Button>
+        </div>
       }
     >
       {servers.length === 0 ? (
@@ -249,6 +282,8 @@ export default function ServersPage() {
           <ul className="divide-y divide-line">
             {servers.map((server) => {
               const enabledTunnels = activeTunnelCount(server.tunnels);
+              const usage = metrics[server.id];
+              const host = usage?.metrics ?? null;
               return (
               <li
                 key={server.id}
@@ -276,6 +311,39 @@ export default function ServersPage() {
                   <p className="mt-0.5 truncate font-mono text-[11px] text-ink-dim">
                     {server.username}@{server.host}:{server.port}
                   </p>
+                  {host ? (
+                    <p className="mt-0.5 flex items-center gap-2 truncate text-[11px] text-ink-faint">
+                      <span className={host.cpuPercent >= CPU_WARN_PERCENT ? "text-warn" : undefined}>
+                        {t("servers.metricsCpu", { percent: host.cpuPercent })}
+                      </span>
+                      {/* 少数虚拟化内核的 /proc/cpuinfo 数不出核数，读 0 就干脆不写这一项。 */}
+                      {host.cpuCores > 0 && (
+                        <span>{t("servers.metricsCores", { cores: host.cpuCores })}</span>
+                      )}
+                      <span
+                        className={
+                          memoryPercent(host) >= MEMORY_WARN_PERCENT ? "text-warn" : undefined
+                        }
+                      >
+                        {t("servers.metricsMemory", {
+                          used: humanSize(host.memoryUsedBytes),
+                          total: humanSize(host.memoryTotalBytes),
+                        })}
+                      </span>
+                    </p>
+                  ) : usage ? (
+                    // 采到了失败也要留在行上：这一台是真的没数据，不能退回成「什么都没写」。
+                    <p
+                      className="mt-0.5 truncate text-[11px] text-neg"
+                      title={usage.error ?? undefined}
+                    >
+                      {t("servers.metricsFailed")}
+                    </p>
+                  ) : metricsRefreshing ? (
+                    <p className="mt-0.5 truncate text-[11px] text-ink-faint">
+                      {t("servers.metricsPending")}
+                    </p>
+                  ) : null}
                 </div>
                 <div className="hidden w-56 shrink-0 truncate md:block" title={server.defaultTargetDir}>
                   {server.defaultTargetDir ? (
@@ -342,6 +410,8 @@ export default function ServersPage() {
           void refreshServers();
           // 服务器表单也能带隧道规则，保存后本机端口分配可能就变了。
           void refreshTunnels(true);
+          // 新加的那台当场就能看到占用，不用等下次聚焦本页。
+          void refreshMetrics(true);
         }}
       />
 

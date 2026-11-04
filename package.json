@@ -10,8 +10,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "app:dev": "tauri dev",
-    "app:build": "tauri build",
-    "cli": "cargo run -p deploy-cli --"
+    "app:build": "tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

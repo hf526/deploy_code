@@ -111,7 +111,7 @@ export default function ContainersPage() {
       .getContainerBackupDir()
       .then(setBundleDir)
       .catch(() => undefined);
-    // 配置列表可能被 CLI 或另一个窗口改过，进页面拉一次最新数据。
+    // 配置列表可能被另一个窗口改过，进页面拉一次最新数据。
     void refreshConfigs();
   }, [refreshConfigs]);
 

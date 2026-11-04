@@ -68,8 +68,8 @@ impl CoreError {
     /// 记录由任务结束时自己写回（`upsert_*`），中途删掉它就等于把「这条任务还在跑」
     /// 这个事实从盘上抹掉了 —— 界面对账（`reconcileLiveTask`）找不到记录就只能保持原状，
     /// 于是发起按钮被 running 状态一直挡住、停止按钮又解析不出 recordId，
-    /// 只能重启应用；CLI 的 `history clear` 撞上正在跑的备份是同一个后果。
-    /// 所以拦在 Store 这一层：GUI 与 CLI 都绕不过去。
+    /// 只能重启应用；清空记录撞上正在跑的备份是同一个后果。
+    /// 所以拦在 Store 这一层：谁调都绕不过去。
     pub fn delete_busy(subject: &str, task: &str) -> Self {
         Self::busy(format!(
             "有{task}任务正在进行，不能删除{subject}记录；请先等它结束或停止它"

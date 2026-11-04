@@ -17,3 +17,19 @@ export interface ServerConfig {
   tunnels: TunnelRule[];
   createdAt: string;
 }
+
+/** 一台主机在采集那一刻的资源占用，镜像 deploy-core `metrics::HostMetrics`。 */
+export interface HostMetrics {
+  /** 整机 CPU 占用百分比（0-100，所有核心合起来算）。 */
+  cpuPercent: number;
+  cpuCores: number;
+  memoryTotalBytes: number;
+  memoryUsedBytes: number;
+}
+
+/** 逐台采集的结果：连不上的那台只影响它自己这一行。 */
+export interface ServerMetrics {
+  serverId: string;
+  metrics: HostMetrics | null;
+  error: string | null;
+}

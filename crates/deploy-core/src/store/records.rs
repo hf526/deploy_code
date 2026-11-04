@@ -27,8 +27,8 @@ pub struct OrphanBundle {
 ///
 /// 记录由任务结束时自己写回（`upsert_*`），中途被删掉就等于把「这条任务还在跑」这个事实
 /// 从盘上抹掉：界面对账（`reconcileLiveTask`）找不到记录只能保持原状，发起按钮被 running
-/// 一直挡住、停止按钮又解析不出 recordId —— 用户唯一的出口是重启应用。CLI 的
-/// `history clear` 撞上正在跑的备份是同一个后果，所以拦在 Store 层而不是命令层。
+/// 一直挡住、停止按钮又解析不出 recordId —— 用户唯一的出口是重启应用。所以拦在
+/// Store 层而不是命令层。
 ///
 /// `subject` 是被删的东西（如 "部署记录" 的 "部署"），`task` 是提示里那个任务名，`lock` 是任务锁名。
 fn guard_delete(subject: &str, task: &str, lock: &str, store: &Store) -> Result<()> {
@@ -298,7 +298,7 @@ impl Store {
 
     /// 启动时把上次异常退出（崩溃/强杀）遗留的 Running 记录收敛为失败，
     /// 避免历史里永远显示"进行中"且无法重新部署。
-    /// 全程持有写守卫，防止与并发写（如 CLI 完成任务）互相覆盖。
+    /// 全程持有写守卫，防止与并发写（如任务收尾写回）互相覆盖。
     pub fn mark_interrupted(&self) -> Result<usize> {
         let _guard = self.write_guard()?;
         let message = "任务被中断（应用退出或崩溃）";
@@ -329,7 +329,7 @@ impl Store {
     }
 
     /// 仅当没有其他进程正在执行部署 / 备份 / Pages / 容器任务时，才收敛遗留的 Running 记录。
-    /// GUI 启动和 CLI 启动共用，避免误伤正在运行的任务。
+    /// 只在没有其他进程握着任务锁时执行，避免误伤正在运行的任务。
     pub fn reconcile_interrupted(&self) -> Result<usize> {
         let deploy = self.try_task_lock("deploy")?;
         let backup = self.try_task_lock("backup")?;
@@ -632,7 +632,7 @@ mod tests {
 
     /// 任务在跑时那条记录必须留着：删掉它，界面对账（`reconcileLiveTask`）找不到记录
     /// 只能保持 running，发起按钮被挡住、停止按钮又解析不出 id —— 用户只能重启应用。
-    /// CLI 的 `history clear` 撞上正在跑的备份是同一个后果，所以四类记录都要拦。
+    /// 清空记录撞上正在跑的备份是同一个后果，所以四类记录都要拦。
     #[test]
     fn delete_is_refused_while_that_task_is_running() {
         let (store, dir) = temp_store();
@@ -859,7 +859,7 @@ mod tests {
             .collect();
         assert_eq!(ids, vec!["h2".to_string(), "h3".to_string()]);
 
-        // limit 为 0 表示不裁剪（CLI / 迁移场景）。
+        // limit 为 0 表示不裁剪（迁移场景）。
         store
             .upsert_history(&history_record("h4", DeployStatus::Success), 0)
             .unwrap();

@@ -346,7 +346,7 @@ pub struct AppState {
     /// 取消之后的远端清理正在进行：那段时间里旧任务还会按 compose 标签把容器 `docker start`
     /// 回来，而任务名额已经随被 abort 的那条任务一起放了（见 `ContainerCleanupGuard`）。
     container_cleanup: AtomicBool,
-    /// 部署跨进程任务锁（持有时禁止 CLI 等其他进程执行部署）。
+    /// 部署跨进程任务锁（持有时禁止其他进程执行部署）。
     deploy_lock: Mutex<Option<TaskLock>>,
     /// 备份跨进程任务锁。
     backup_lock: Mutex<Option<TaskLock>>,
@@ -387,7 +387,7 @@ impl AppState {
     /// 尝试占用任务名额：**双重保护机制**
     /// 
     /// 1️⃣ **进程内互斥**: `AtomicBool.compare_exchange` 确保同一进程只允许一个任务抢占成功
-    /// 2️⃣ **跨进程互斥**: `try_task_lock` 文件锁确保不同进程（GUI/CLI）不会同时执行同类任务
+    /// 2️⃣ **跨进程互斥**: `try_task_lock` 文件锁确保不同进程不会同时执行同类任务
     /// 
     /// ⚠️ 注意：两步操作不是原子的，但设计如此——先快速失败（原子标记），再精确控制（文件锁）
     /// 如果原子标记成功但文件锁失败，说明有其他进程抢到了锁，此时必须释放原子标记让出机会
@@ -412,7 +412,7 @@ impl AppState {
                 *slot = Some(lock);
                 Ok(true)
             }
-            // 其他进程（如 CLI）正在执行同类任务，释放原子标记让下次重试。
+            // 其他进程正在执行同类任务，释放原子标记让下次重试。
             Ok(None) => {
                 claimed.store(false, Ordering::SeqCst);
                 Ok(false)

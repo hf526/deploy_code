@@ -123,7 +123,7 @@ export default function DeployPage() {
   const [cancelling, setCancelling] = useState(false);
   const [viewKind, setViewKind] = useState<"server" | "pages">("server");
 
-  // 配置与记录可能被 CLI 或其它页面（删除服务器 / 仓库）改动，进入页面时拉取一次最新数据。
+  // 配置与记录可能被其它页面（删除服务器 / 仓库）改动，进入页面时拉取一次最新数据。
   useEffect(() => {
     void refreshDeployConfigs();
     void refreshPagesConfigs();
@@ -205,7 +205,7 @@ export default function DeployPage() {
     [recentPagesDeploys],
   );
 
-  // 后台刷新或 CLI 改过列表后，丢掉已经不存在的勾选。
+  // 后台刷新或别处改过列表后，丢掉已经不存在的勾选。
   useEffect(() => {
     setSelectedPages((current) => {
       const pruned = pruneSelection(current, selectablePagesIds);
@@ -273,7 +273,7 @@ export default function DeployPage() {
       if (removed) {
         toast("success", t("deploy.configDeleted", { name: deleting.name }));
       } else {
-        // 配置可能已被 CLI / 其它页面删除：只刷新列表，不误报成功。
+        // 配置可能已被其它页面删除：只刷新列表，不误报成功。
         toast("info", t("deploy.configMissing"));
       }
     } catch (error) {

@@ -111,6 +111,7 @@ pub fn run() {
             commands::servers::save_server,
             commands::servers::delete_server,
             commands::servers::test_server,
+            commands::servers::list_server_metrics,
             commands::servers::scan_server_security,
             commands::servers::block_server_ip,
             commands::servers::unblock_server_ip,

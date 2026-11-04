@@ -50,7 +50,7 @@ pub fn get_settings(state: State<AppState>) -> Result<Settings> {
 }
 
 /// 引用的备份配置 / 备份目标被删除后，设置里残留的悬空引用一律清空，
-/// 避免旧快照（CLI 删除目标 / 多页面并发保存）把已删除的 id 写回，导致备份解析失败。
+/// 避免旧快照（多页面并发保存）把已删除的 id 写回，导致备份解析失败。
 fn sanitize_settings(
     settings: &mut Settings,
     configs: &[BackupConfig],

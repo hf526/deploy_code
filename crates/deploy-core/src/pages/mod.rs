@@ -36,7 +36,7 @@ use crate::util::format_duration;
 use cloudflare::cf_envs;
 use github::{parse_github_remote, test_github};
 
-/// Pages 部署事件发送端（GUI 转发为 Tauri 事件，CLI 直接打印）。
+/// Pages 部署事件发送端（GUI 转发为 Tauri 事件）。
 pub type PagesEventSender = UnboundedSender<PagesEvent>;
 
 /// 已校验并解析好的 Pages 部署任务。
@@ -325,7 +325,7 @@ impl PagesEngine {
 }
 
 impl PagesConfig {
-    /// 规范化表单配置：去空白并补默认值（保存与测试共用，GUI / CLI 都调用）。
+    /// 规范化表单配置：去空白并补默认值（保存与测试共用）。
     pub fn normalize(mut self) -> Self {
         self.provider = self.provider.trim().to_lowercase();
         if self.provider.is_empty() {
@@ -643,7 +643,7 @@ mod tests {
             engine.prepare(&request(Some("p2"))).unwrap().config.project_name,
             "site-b"
         );
-        // 不带 config_id 时照旧按仓库默认解析（CLI 与旧数据走这条路）。
+        // 不带 config_id 时照旧按仓库默认解析（旧数据走这条路）。
         assert_eq!(
             engine.prepare(&request(None)).unwrap().config.project_name,
             "site-a"

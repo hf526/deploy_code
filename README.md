@@ -2,7 +2,7 @@
 
 DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多个本地 Git 仓库和远端 Linux 服务器，把指定分支 / 标签 / 提交打包部署到服务器，并执行项目内的部署脚本。
 
-提供 **Tauri 2 桌面客户端** 和 **Rust CLI** 两种入口，二者共享同一份配置与部署历史。
+入口是 **Tauri 2 桌面客户端**，配置与部署历史存在本机数据目录。
 
 ## 功能特性
 
@@ -31,12 +31,13 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 - 工作区状态与文件 diff 在左栏「源代码管理」面板
 - 文件树浏览、文件预览 / 编辑、内容搜索与批量替换
 - 提交改动、硬回退、fetch / pull / push
-- 提交保护：自动检测 `.env` / `*.pem` / `id_rsa` / `credentials` 等疑似敏感文件，默认阻止提交，界面二次确认后才放行（CLI 需 `--allow-sensitive`）
+- 提交保护：自动检测 `.env` / `*.pem` / `id_rsa` / `credentials` 等疑似敏感文件，默认阻止提交，界面二次确认后才放行
 - 工作区文件监听，外部改动自动刷新界面
 
 ### 服务器管理
 
 - SSH 密码 / 私钥（含 passphrase）认证，连接测试
+- 每台服务器直接显示主机的 CPU 占用与内存用量（进页面或点「刷新占用」时采集，读远端 `/proc`，不占用任务名额；某一台采不到只影响它自己那一行）
 - 安全检查：失败登录统计（按账号 + IP）、成功登录、在线会话、sshd 关键配置、防火墙状态（ufw / firewalld / iptables）
 - 一键拉黑 / 解除 IP、踢出在线会话
 - 服务器端自动防护：写入 guard 脚本 + `/etc/cron.d/deploycode-guard` 每分钟任务，按失败登录阈值自动封禁，阈值与统计窗口可配置
@@ -81,7 +82,6 @@ DeployCode 是一个本地多仓库管理与 SSH 一键部署工具：管理多�
 - 预检与提示：compose 命令可用性（`docker compose` / `docker-compose`）、远端磁盘空间、卷能否从宿主机直接读（不能则改用容器内 `tar`）、匿名卷与项目目录之外的 bind mount 会明确提示带不走
 - 快照与恢复都在服务器上跑一个可中断的脚本（pidfile + 进程组终止），进度与结果实时显示，任务记录持久化；应用退出会回收两台服务器上残留的工作目录
 - 已完成的记录可再次「恢复到服务器」（用本机备份包），需显式确认同名数据卷会被覆盖
-- CLI：`deploy-code-cli container ls / inspect / backup / migrate / restore / list / show`
 
 ### Pages 部署（Cloudflare / GitHub）
 
@@ -104,17 +104,13 @@ GitHub Pages（`gh-pages`）：
 
 两种平台都依赖本机 Node.js（wrangler / gh-pages 通过 `npx` 调用）。
 
-### CLI
-
-命令行覆盖仓库 / 分支 / 服务器 / 部署 / 备份 / 容器 / Pages / 历史等操作，适合脚本化与服务器环境使用。
-
 ## 技术栈
 
 | 层 | 技术 |
 | --- | --- |
 | 前端 | React 19 · TypeScript · Vite 8 · Tailwind CSS 4 · Zustand · React Router · highlight.js |
 | 桌面 | Tauri 2（NSIS 打包） |
-| 后端 | Rust · tokio · russh + russh-sftp · clap · serde · notify · flate2 |
+| 后端 | Rust · tokio · russh + russh-sftp · serde · notify · flate2 |
 | 存储 | 本地 JSON（系统数据目录，见下文） |
 
 ## 项目结构
@@ -124,8 +120,7 @@ deploy_code/
 ├─ src/                  # React 前端
 ├─ src-tauri/            # Tauri 桌面壳（命令注册、应用状态）
 ├─ crates/
-│  ├─ deploy-core/       # 核心库：Git / SSH / 安全扫描 / 部署引擎 / 存储
-│  └─ deploy-cli/        # 命令行工具（deploy-code-cli）
+│  └─ deploy-core/       # 核心库：Git / SSH / 安全扫描 / 部署引擎 / 存储
 ├─ scripts/              # 辅助脚本（图标生成等）
 └─ .cargo/config.toml    # Windows 构建规避 360 误拦截的 rustflags
 ```
@@ -146,7 +141,7 @@ deploy_code/
 - Windows：`%APPDATA%\deploycode\DeployCode\data`
 - 文件：`config.json`（服务器 / 仓库 / 部署配置 / 备份目标 / 备份配置 / 设置）、`history.json`（部署记录）、`backups.json`（备份记录）、`containers.json`（容器备份 / 迁移记录）、`pages.json`（Pages 部署记录）、`containers/`（容器备份包）、`temp/`（临时归档）
 
-> ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。CLI 可用 `--data-dir` 指定其他数据目录，`deploy-code-cli where` 可查看当前路径。
+> ⚠️ SSH 密码、私钥口令与备份目标连接串均以明文保存在 `config.json` 中，请勿分享该文件。
 
 ### 备份目标连接串
 
@@ -176,80 +171,6 @@ npm run app:dev       # 桌面端开发（Tauri）
 npm run dev           # 仅前端开发（http://localhost:1420）
 npm run app:build     # 打包桌面端（产物在 target/release/bundle/nsis）
 ```
-
-CLI：
-
-```bash
-cargo run -p deploy-cli -- --help        # 直接运行
-cargo build -p deploy-cli --release      # 构建 release 二进制
-```
-
-测试与检查：
-
-```bash
-cargo test           # Rust 单元测试
-npm run build        # tsc 类型检查 + 前端构建
-```
-
-## CLI 示例
-
-```bash
-# 添加服务器（私钥认证）
-deploy-code-cli server add prod --host 192.168.1.10 --user root --key ~/.ssh/id_ed25519
-
-# 添加仓库并设置默认服务器 / 部署目录
-deploy-code-cli repo add /path/to/myapp --name myapp --server prod --dir /opt/myapp
-
-# 查看分支 / 部署 main 分支 / 查看历史
-deploy-code-cli branch list myapp --all
-deploy-code-cli deploy myapp --rev main
-# 使用客户端保存的部署配置（仓库、服务器、目录、脚本等取自配置，命令行参数可覆盖）
-deploy-code-cli deploy --config 生产环境
-deploy-code-cli history list -n 10
-
-# 原子发布的历史版本（需在设置中开启「原子发布」）
-deploy-code-cli release list prod --dir /opt/myapp
-deploy-code-cli release switch prod --dir /opt/myapp 20260914-153001-3b2424f-abc123
-
-# 数据库备份（服务器 PG -> Supabase / Aiven / Neon 等）
-deploy-code-cli backup target add Aiven "postgresql://user:password@host:5432/db"
-deploy-code-cli backup target add Neon "postgresql://user:password@host:5432/db"
-deploy-code-cli backup target list
-# 保存一套备份配置（服务器 + 来源 + 目标），之后按名称一键备份
-deploy-code-cli backup config add prod-app --server prod --database app --username postgres --target Aiven
-deploy-code-cli backup config list
-deploy-code-cli backup test --config prod-app
-deploy-code-cli backup run --config prod-app
-# 也可以继续用服务器参数直接执行
-deploy-code-cli backup test prod
-deploy-code-cli backup run prod --target Aiven
-deploy-code-cli backup list -n 10
-deploy-code-cli backup show <记录ID>
-
-# 容器备份与迁移（docker-compose 项目经本机中转）
-deploy-code-cli container dir
-deploy-code-cli container ls --server prod
-deploy-code-cli container inspect --server prod --project blog
-# 只打包到本机（默认带数据卷与镜像；--pause 会在导出卷前暂停源服务）
-deploy-code-cli container backup --server prod --project blog --pause
-# 打包并迁移到另一台服务器（来源服务器上的服务保持不变）
-deploy-code-cli container migrate --server prod --project blog --to staging --dir /opt/blog
-# 用本机已有的备份包再恢复到一台服务器
-deploy-code-cli container restore --bundle "<数据目录>\containerslog-20260926-031000-ab12cd34.tar" --to staging
-deploy-code-cli container list -n 10
-deploy-code-cli container show <记录ID>
-
-# Cloudflare Pages 部署
-deploy-code-cli pages config myapp --project my-site --build "npm run build" --output dist
-deploy-code-cli pages test myapp
-deploy-code-cli pages run myapp
-deploy-code-cli pages list -n 10
-deploy-code-cli pages show <记录ID>
-
-# 查看数据目录
-deploy-code-cli where
-```
-
 ## License
 
 MIT
