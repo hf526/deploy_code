@@ -54,7 +54,7 @@ await send("Page.enable");
 
 // —— Tauri mock：让纯浏览器也能渲染真实界面 ——
 const FIXTURES = {
-  get_app_version: "0.1.7",
+  get_app_version: "0.1.8",
   get_data_dir: "C:\\Users\\demo\\AppData\\Roaming\\deploy-code",
   get_autostart: false,
   list_repos: [
