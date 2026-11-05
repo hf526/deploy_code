@@ -129,10 +129,17 @@ struct BoundRule {
     listener: Arc<TcpListener>,
 }
 
+/// 一台常驻任务当前活着的那条会话，供上层（终端）在同一会话上开通道。
+///
+/// 只在这里发布「这一轮」的会话：轮次在同一个 `supervise` 任务里是串行的，所以槽里
+/// 最多只有一条会话；任务被 abort 时槽随条目一起消失，不会留下一条没人管的旧句柄。
+type LiveSession = Arc<Mutex<Option<Arc<SshClient>>>>;
+
 struct RunningLink {
     abort: tokio::task::AbortHandle,
     fingerprint: String,
     status: Arc<Mutex<ServerHostStatus>>,
+    session: LiveSession,
 }
 
 /// 常驻连接登记表：每台已登记的服务器一个任务。
@@ -176,13 +183,15 @@ impl HostLinkManager {
             }
             let mark = task_fingerprint(&server);
             let status = initial_status(&server);
-            let handle = tokio::spawn(supervise(server, status.clone()));
+            let session: LiveSession = Arc::new(Mutex::new(None));
+            let handle = tokio::spawn(supervise(server, status.clone(), session.clone()));
             running.insert(
                 id,
                 RunningLink {
                     abort: handle.abort_handle(),
                     fingerprint: mark,
                     status,
+                    session,
                 },
             );
         }
@@ -198,13 +207,15 @@ impl HostLinkManager {
             entry.abort.abort();
         }
         let status = initial_status(server);
-        let handle = tokio::spawn(supervise(server.clone(), status.clone()));
+        let session: LiveSession = Arc::new(Mutex::new(None));
+        let handle = tokio::spawn(supervise(server.clone(), status.clone(), session.clone()));
         running.insert(
             server.id.clone(),
             RunningLink {
                 abort: handle.abort_handle(),
                 fingerprint: task_fingerprint(server),
                 status,
+                session,
             },
         );
     }
@@ -218,6 +229,20 @@ impl HostLinkManager {
             .collect();
         list.sort_by(|a, b| a.server_name.cmp(&b.server_name));
         list
+    }
+
+    /// 这一台当前在线的那条会话：终端要在它上面再开一条 PTY 通道，而不是自己再认证一次。
+    ///
+    /// 会话已判死（`is_closed`）时返回 None，而不是把那条连不上的句柄交出去——拿着它
+    /// 只会开出一个永远等不到数据的通道，界面再显示成「终端已打开」。
+    pub fn client(&self, server_id: &str) -> Option<Arc<SshClient>> {
+        let running = lock(&self.running);
+        let entry = running.get(server_id)?;
+        let client = lock(&entry.session).clone()?;
+        if client.is_closed() {
+            return None;
+        }
+        Some(client)
     }
 
     /// 退出时收掉所有会话与监听：本机端口立刻释放，远端也不会留下悬着的通道。
@@ -263,7 +288,11 @@ fn initial_status(server: &ServerConfig) -> Arc<Mutex<ServerHostStatus>> {
 }
 
 /// 一台服务器的主循环：补绑本机端口 -> 建会话 -> 转发 + 探针直到会话不可用 -> 退避重来。
-async fn supervise(server: ServerConfig, status: Arc<Mutex<ServerHostStatus>>) {
+async fn supervise(
+    server: ServerConfig,
+    status: Arc<Mutex<ServerHostStatus>>,
+    session: LiveSession,
+) {
     let rules = server.active_tunnels();
     let mut bound: Vec<BoundRule> = Vec::with_capacity(rules.len());
     let mut backoff = RECONNECT_MIN_SECS;
@@ -281,7 +310,7 @@ async fn supervise(server: ServerConfig, status: Arc<Mutex<ServerHostStatus>>) {
         bind_pending_rules(&rules, &mut bound, &status).await;
 
         let started_at = Instant::now();
-        let outcome = connect_and_serve(&server, &bound, &status).await;
+        let outcome = connect_and_serve(&server, &bound, &status, &session).await;
         let held = started_at.elapsed();
         match outcome {
             // 会话正常结束（多为网络中断或 sshd 重启）：单条转发失败留下的错误不覆盖。
@@ -384,6 +413,7 @@ async fn connect_and_serve(
     server: &ServerConfig,
     bound: &[BoundRule],
     status: &Arc<Mutex<ServerHostStatus>>,
+    session: &LiveSession,
 ) -> Result<()> {
     let client = Arc::new(SshClient::connect_tunnel(server, CONNECT_TIMEOUT_SECS).await?);
 
@@ -400,6 +430,9 @@ async fn connect_and_serve(
             }
         }
     });
+
+    // 会话一在线就发布出去：终端要的是同一条会话，不是再一次认证。
+    *lock(session) = Some(client.clone());
 
     let (stop_tx, stop_rx) = watch::channel(false);
     let mut tasks = JoinSet::new();
@@ -438,6 +471,9 @@ async fn connect_and_serve(
         // 任务被取消（退出清理）或 panic：当作会话不可用，交给外层退避重连。
         _ => Err(CoreError::ssh("连接已断开，正在重连")),
     };
+    // 这一轮作废，槽里的句柄同步收回：留着它，终端会拿到一条看着在线、实际再也收不到
+    // 任何数据的会话——而重新连上的那一条已经在下一轮里了。
+    *lock(session) = None;
     // client 在此处随作用域结束而释放：会话关闭，本机端口仍由 supervise 持有。
     reason
 }
@@ -701,6 +737,28 @@ mod tests {
         assert!(!status.connected);
         assert!(status.metrics.is_none());
         manager.stop_all();
+    }
+
+    /// 没连上的那一条会话不许出现在槽里：终端拿到句柄就会开出一条永远等不到数据的通道，
+    /// 而界面已经把它当成「终端已打开」。
+    #[tokio::test]
+    async fn no_live_session_is_published_until_the_server_connects() {
+        let dead = free_port().await;
+        let mut target = server("a", vec![]);
+        target.host = "127.0.0.1".to_string();
+        target.port = dead;
+
+        let manager = HostLinkManager::new();
+        assert_eq!(manager.sync(&[target]), 1);
+        let failed = wait_for(&manager, |status| status.retries > 0)
+            .await
+            .expect("连不上要记下重试");
+        assert!(!failed.connected);
+        assert!(manager.client("a").is_none(), "没连上就不该有可复用的会话");
+        assert!(manager.client("不存在的 id").is_none());
+
+        manager.stop_all();
+        assert!(manager.client("a").is_none(), "停止之后条目连带它的槽一起消失");
     }
 
     /// 绑定结果与错误要成对更新。

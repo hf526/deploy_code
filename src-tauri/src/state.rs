@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use deploy_core::store::TaskLock;
-use deploy_core::{DeployEngine, HostLinkManager, Result, Store};
+use deploy_core::{DeployEngine, HostLinkManager, Result, Store, TerminalManager};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -333,6 +333,8 @@ pub struct AppState {
     pending_shutdown: Mutex<Option<PendingShutdown>>,
     /// 主机常驻连接：每台已登记的服务器一条 SSH 会话，跑隧道转发与资源探针。
     pub hosts: Arc<HostLinkManager>,
+    /// 打开中的交互式终端：每条只是常驻会话上多出来的一条 PTY 通道，不占任务名额。
+    pub terminals: Arc<TerminalManager>,
     /// 部署抢占标记：在 prepare 之前原子占位，避免两个并发命令同时通过检查。
     deploy_claim: AtomicBool,
     /// 备份抢占标记：同一时间只允许一个数据库备份。
@@ -370,6 +372,7 @@ impl AppState {
             pending_container_cleanups: Mutex::new(Vec::new()),
             pending_shutdown: Mutex::new(None),
             hosts: Arc::new(HostLinkManager::new()),
+            terminals: TerminalManager::new(),
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),

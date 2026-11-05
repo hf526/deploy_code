@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use russh::client::{self, Handle};
 use russh::keys::{load_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
-use russh::{ChannelMsg, Disconnect};
+use russh::{ChannelMsg, ChannelReadHalf, ChannelWriteHalf, Disconnect};
 use russh_sftp::client::SftpSession;
 use tokio::io::{copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -259,6 +259,44 @@ impl SshClient {
         flush_rest_bytes(&mut stdout_buf, OutputKind::Stdout, on_output);
         flush_rest_bytes(&mut stderr_buf, OutputKind::Stderr, on_output);
         Ok(exit_code)
+    }
+
+    /// 在已连接的会话上开一个交互式伪终端，返回读、写两半。
+    ///
+    /// 与 [`exec_stream`](Self::exec_stream) 的区别是这里**不设超时**：终端的存活时间由
+    /// 用户决定，远端在等输入时就该一直等，套一个超时会把一个正在看 man 页的会话判成失败。
+    ///
+    /// `want_reply` 一律传 false：russh 的 `ChannelMsg` 里没有「请求应答」这一类消息，
+    /// 要一个收不到的确认只会白挂着。服务器拒绝分配 PTY 时这条通道会当场关闭，由读到的
+    /// 那一侧结束来暴露，不在这里猜。
+    pub async fn open_shell(
+        &self,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(ChannelReadHalf, ChannelWriteHalf<client::Msg>)> {
+        let channel = self
+            .session
+            .channel_open_session()
+            .await
+            .map_err(|e| CoreError::ssh(format!("打开终端通道失败: {e}")))?;
+        channel
+            .request_pty(
+                false,
+                "xterm-256color",
+                u32::from(cols),
+                u32::from(rows),
+                0,
+                0,
+                &[],
+            )
+            .await
+            .map_err(|e| CoreError::ssh(format!("申请伪终端失败: {e}")))?;
+        channel
+            .request_shell(false)
+            .await
+            .map_err(|e| CoreError::ssh(format!("启动远端 shell 失败: {e}")))?;
+        // 拆成读写两半：读的那半归采集任务循环，写的那半留着收键盘输入与窗口尺寸变化。
+        Ok(channel.split())
     }
 
     /// 递归创建远端目录。

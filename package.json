@@ -1,7 +1,7 @@
 {
   "name": "deploy-code",
   "private": true,
-  "version": "0.1.8",
+  "version": "0.1.9",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -15,6 +15,8 @@
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",
     "@tauri-apps/plugin-dialog": "^2.7.3",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "highlight.js": "^11.12.0",
     "i18next": "^26.4.2",
     "lucide-react": "^1.45.0",

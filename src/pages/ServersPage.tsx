@@ -11,11 +11,13 @@ import {
   RefreshCw,
   Server,
   ShieldCheck,
+  TerminalSquare,
   Trash2,
   Wifi,
   X,
 } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
+import { useNavigate } from "react-router-dom";
 import { open } from "@tauri-apps/plugin-dialog";
 
 import {
@@ -86,6 +88,7 @@ export default function ServersPage() {
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
+  const navigate = useNavigate();
 
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ServerConfig | null>(null);
@@ -309,6 +312,7 @@ export default function ServersPage() {
                         {t("servers.metricsMemory", {
                           used: humanSize(host.memoryUsedBytes),
                           total: humanSize(host.memoryTotalBytes),
+                          percent: memoryPercent(host),
                         })}
                       </span>
                     </p>
@@ -364,6 +368,15 @@ export default function ServersPage() {
                     onClick={() => openSecurity(server)}
                   >
                     {t("servers.securityButton")}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    title={t("servers.terminalButtonTip")}
+                    icon={<TerminalSquare className="size-3.5" />}
+                    onClick={() => navigate(`/terminal?server=${server.id}`)}
+                  >
+                    {t("servers.terminalButton")}
                   </Button>
                   <Button size="sm" variant="secondary" onClick={() => openForm(server)}>
                     {t("servers.configure")}

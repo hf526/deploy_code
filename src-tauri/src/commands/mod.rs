@@ -10,5 +10,6 @@ pub mod pages;
 pub mod repos;
 pub mod servers;
 pub mod shutdown;
+pub mod terminal;
 pub mod tray;
 pub mod watch;

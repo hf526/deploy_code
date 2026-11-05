@@ -21,6 +21,7 @@
 //! - [`process`]：本地命令执行与 shell 工具
 //! - [`tasklog`]：三类任务共用的日志器
 //! - [`tunnel`]：SSH 本地端口转发规则（把远端容器端口接到本机）的语义与校验
+//! - [`terminal`]：交互式终端（在常驻会话上再开一条 PTY 通道）
 //! - [`util`]：展示用格式化工具
 
 pub mod backup;
@@ -42,6 +43,7 @@ pub mod shutdown;
 pub mod ssh;
 pub mod store;
 pub mod tasklog;
+pub mod terminal;
 pub mod tunnel;
 pub mod util;
 
@@ -70,5 +72,8 @@ pub use shutdown::{
 };
 pub use store::{OrphanBundle, Store};
 pub use tasklog::TaskLogger;
+pub use terminal::{
+    MAX_TERMINALS_PER_SERVER, MAX_TERMINALS_TOTAL, TerminalEvent, TerminalInfo, TerminalManager,
+};
 pub use tunnel::TunnelRuleStatus;
 pub use util::{format_duration, human_size};

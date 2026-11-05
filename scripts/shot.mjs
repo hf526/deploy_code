@@ -54,7 +54,7 @@ await send("Page.enable");
 
 // —— Tauri mock：让纯浏览器也能渲染真实界面 ——
 const FIXTURES = {
-  get_app_version: "0.1.8",
+  get_app_version: "0.1.9",
   get_data_dir: "C:\\Users\\demo\\AppData\\Roaming\\deploy-code",
   get_autostart: false,
   list_repos: [
@@ -76,6 +76,11 @@ const FIXTURES = {
     { serverId: "s4", serverName: "刚加的（还没采）", connected: false, retries: 0, lastError: null, connectedAt: null, forwarded: 0, rules: [], metrics: null, metricsError: null, sampledAt: null },
   ],
   get_shutdown_status: null,
+  // 终端：给一个还活着的标签，验证 xterm 挂载、标签条排版与主题取色（真 PTY 要活服务器）。
+  list_terminals: [
+    { id: "t1", serverId: "s1", serverName: "深圳轻量云", cols: 100, rows: 30 },
+    { id: "t2", serverId: "s2", serverName: "港机", cols: 100, rows: 30 },
+  ],
   list_deploy_configs: [
     { id: "d1", repoId: "r1", name: "deploy_code → 深圳轻量云", rev: "main", serverIds: ["s1"], targetDir: "/opt/app", scripts: ["./scripts/deploy.sh"], scriptDir: "docker", runScripts: true, uploadEnv: false, createdAt: "2026-09-10 10:00:00" },
     { id: "d2", repoId: "r2", name: "blog 静态站", rev: "main", serverIds: ["s1", "s2"], targetDir: "/var/www/blog", scripts: [], scriptDir: "docker", runScripts: false, uploadEnv: true, createdAt: "2026-09-20 10:00:00" },
@@ -121,6 +126,19 @@ await send("Page.addScriptToEvaluateOnNewDocument", {
       callbacks: _callbacks,
       invoke: (cmd, args) => {
         const fx = window.__FIXTURES__;
+        // 开标签这条路必须按参数造返回值：固定 id 会让「同一动作被触发两次」在界面上合并成
+        // 一个标签，正好把要验的那一类缺陷遮掉。
+        if (cmd === "open_terminal") {
+          window.__OPEN_SEQ__ = (window.__OPEN_SEQ__ || 0) + 1;
+          const srv = (fx.list_servers || []).find((s) => s.id === (args && args.serverId));
+          return Promise.resolve({
+            id: "open-" + window.__OPEN_SEQ__,
+            serverId: (args && args.serverId) || "",
+            serverName: srv ? srv.name : "?",
+            cols: (args && args.cols) || 80,
+            rows: (args && args.rows) || 24,
+          });
+        }
         if (cmd in fx) return Promise.resolve(fx[cmd]);
         if (cmd === "plugin:event|listen" || cmd === "plugin:event|unlisten") return Promise.resolve(1);
         if (cmd.startsWith("list_") || cmd.endsWith("_configs") || cmd.endsWith("_records")) return Promise.resolve([]);
@@ -164,7 +182,7 @@ for (const spec of shots) {
 
   const st = await send("Runtime.evaluate", {
     expression:
-      'JSON.stringify({url:location.href.slice(0,60), rs:document.readyState, title:document.title, tauri:!!window.__TAURI_INTERNALS__, vite:!!window.__vite_plugin_react_preamble_installed__, rootLen:document.getElementById("root")?.innerHTML.length||0})',
+      'JSON.stringify({url:location.href.slice(0,60), rs:document.readyState, title:document.title, tauri:!!window.__TAURI_INTERNALS__, vite:!!window.__vite_plugin_react_preamble_installed__, rootLen:document.getElementById("root")?.innerHTML.length||0, terms:[...document.querySelectorAll(".xterm")].map((e)=>({hidden:!!e.closest(".hidden"), rows:e.querySelectorAll(".xterm-rows > div").length}))})',
     returnByValue: true,
   });
   console.log("STATE", name, st.result?.result?.value);
