@@ -842,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-code"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "chrono",
  "deploy-core",
@@ -858,7 +858,7 @@ dependencies = [
 
 [[package]]
 name = "deploy-core"
-version = "0.1.9"
+version = "0.1.10"
 dependencies = [
  "base64 0.22.1",
  "chrono",
