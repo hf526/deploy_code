@@ -6,11 +6,11 @@ import {
   activeTunnelCount,
   draftToRule,
   emptyTunnelDraft,
-  findTunnelStatus,
+  findHostStatus,
   tunnelEndpoint,
   tunnelTone,
 } from "./tunnel";
-import type { ServerTunnelStatus, TunnelRule } from "./types";
+import type { ServerHostStatus, TunnelRule } from "./types";
 
 function rule(patch: Partial<TunnelRule> = {}): TunnelRule {
   return {
@@ -23,7 +23,7 @@ function rule(patch: Partial<TunnelRule> = {}): TunnelRule {
   };
 }
 
-function status(patch: Partial<ServerTunnelStatus> = {}): ServerTunnelStatus {
+function status(patch: Partial<ServerHostStatus> = {}): ServerHostStatus {
   return {
     serverId: "s1",
     serverName: "prod-a",
@@ -33,6 +33,9 @@ function status(patch: Partial<ServerTunnelStatus> = {}): ServerTunnelStatus {
     connectedAt: "2026-09-27 10:00:00",
     forwarded: 3,
     rules: [{ ruleId: "r1", localPort: 18080, remoteLabel: "127.0.0.1:8080", bound: true, active: true, error: null }],
+    metrics: { cpuPercent: 12, cpuCores: 4, memoryTotalBytes: 8192, memoryUsedBytes: 2048 },
+    metricsError: null,
+    sampledAt: "2026-11-05 03:00:00",
     ...patch,
   };
 }
@@ -99,8 +102,8 @@ describe("展示辅助", () => {
 
   it("按服务器 id 找状态", () => {
     const list = [status({ serverId: "s2" })];
-    expect(findTunnelStatus(list, "s2")?.serverName).toBe("prod-a");
-    expect(findTunnelStatus(list, "s1")).toBeUndefined();
+    expect(findHostStatus(list, "s2")?.serverName).toBe("prod-a");
+    expect(findHostStatus(list, "s1")).toBeUndefined();
   });
 
   it("活跃条数只算 active 的规则", () => {

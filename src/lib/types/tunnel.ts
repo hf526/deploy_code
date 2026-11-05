@@ -18,16 +18,3 @@ export interface TunnelRuleStatus {
   active: boolean;
   error: string | null;
 }
-
-export interface ServerTunnelStatus {
-  serverId: string;
-  serverName: string;
-  connected: boolean;
-  /** 连续重连次数，连上即清零。 */
-  retries: number;
-  lastError: string | null;
-  connectedAt: string | null;
-  /** 本次在线期间转发过的连接数。 */
-  forwarded: number;
-  rules: TunnelRuleStatus[];
-}

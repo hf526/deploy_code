@@ -6,6 +6,7 @@
 //! - [`store`]：配置与部署记录持久化
 //! - [`git`]：本地仓库 Git 操作
 //! - [`ssh`]：SSH 连接、命令执行与 SFTP 上传
+//! - [`hostlink`]：每台服务器一条常驻 SSH 会话（隧道转发 + 主机资源探针）
 //! - [`security`]：服务器安全检查（登录日志 / sshd 配置 / 防火墙）
 //! - [`metrics`]：服务器主机资源占用（CPU / 内存，只读 `/proc`）
 //! - [`engine`]：部署流程编排
@@ -19,7 +20,7 @@
 //! - [`shutdown`]：本机定时关机（下发 Windows 关机请求）
 //! - [`process`]：本地命令执行与 shell 工具
 //! - [`tasklog`]：三类任务共用的日志器
-//! - [`tunnel`]：SSH 本地端口转发（把远端容器端口接到本机）与保活重连
+//! - [`tunnel`]：SSH 本地端口转发规则（把远端容器端口接到本机）的语义与校验
 //! - [`util`]：展示用格式化工具
 
 pub mod backup;
@@ -28,6 +29,7 @@ pub mod cronjob;
 pub mod engine;
 pub mod error;
 pub mod git;
+pub mod hostlink;
 pub mod metrics;
 pub mod models;
 pub mod nginx;
@@ -52,7 +54,8 @@ pub use cronjob::{CronHeader, CronJob, CronJobDraft, CronJobRun, CronSchedule, C
 pub use engine::{repo_info, DeployEngine, EventSender};
 pub use error::{CoreError, Result};
 pub use git::{mask_remote_url, Git};
-pub use metrics::{HostMetrics, ServerMetrics};
+pub use hostlink::{HostLinkManager, ServerHostStatus};
+pub use metrics::HostMetrics;
 pub use models::*;
 pub use nginx::{NginxConfigContent, NginxConfigFile, NginxContainerInfo, NginxEngine};
 pub use pages::{PagesEngine, PagesEventSender, PreparedPagesDeploy};
@@ -67,5 +70,5 @@ pub use shutdown::{
 };
 pub use store::{OrphanBundle, Store};
 pub use tasklog::TaskLogger;
-pub use tunnel::{ServerTunnelStatus, TunnelManager, TunnelRuleStatus};
+pub use tunnel::TunnelRuleStatus;
 pub use util::{format_duration, human_size};

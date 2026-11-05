@@ -1,19 +1,30 @@
 //! 服务器主机的资源占用采集（CPU / 内存）。
 //!
-//! 只读 `/proc`，跑的是一个固定的短脚本，因此既不占任务名额也不发事件：
-//! 它和 `list_compose_stacks` 那类扫描命令同一条口径，任务正在跑时照样能看。
+//! 只读 `/proc`，跑的是一个固定的短脚本，既不占任务名额也不发事件：它和
+//! `list_compose_stacks` 那类扫描命令同一条口径，任务正在跑时照样能看。
+//!
+//! 采集只负责「在一次已有会话上取一个数」，什么时候采、连不上怎么办全在
+//! [`crate::hostlink`] 那一侧——会话是常驻的，这里不再自己建连接。
 
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinSet;
 
 use crate::error::{CoreError, Result};
-use crate::models::ServerConfig;
-use crate::ssh::SshClient;
+use crate::ssh::{OutputKind, SshClient};
 
 /// 脚本里两次读 `/proc/stat` 之间的间隔秒数；这段睡眠就是采样的窗口。
-const SAMPLE_SECS: &str = "1";
-/// 采集命令的整体超时：正常一秒钟出头就结束，留足余量只为慢机器，不为长任务兜底。
-const EXEC_TIMEOUT_SECS: u64 = 30;
+///
+/// 常驻循环按它安排下一次采集（间隔必须比窗口大），所以这一项是公开的。
+pub const SAMPLE_WINDOW_SECS: u64 = 1;
+/// 一次采集的预算。**由调用方掐表**（`hostlink::probe_loop`），不是这里内部用。
+pub const SAMPLE_TIMEOUT_SECS: u64 = 15;
+/// `exec` 自己的兜底上限，刻意是外层预算的两倍：真正掐表的是调用方，必须让外层先响，
+/// 因为「外层到点」这一路会换掉整条会话，把被掐断的通道一起带走。两边同值或反过来的话，
+/// 谁先响就交给调度了，而那正是这条要避开的分叉。
+pub const SAMPLE_CEILING_SECS: u64 = SAMPLE_TIMEOUT_SECS * 2;
+/// 采集输出的上限：正常就是 5 行短数字。会话没有校验主机密钥，对端回多少不由它定；
+/// 这一路又每 5 秒自动跑一次，所以不能像一次性采集那样「点了才读一次」。
+/// 到上限只是不再接新行，已经收下的照原样交给解析判定。
+const SAMPLE_MAX_BYTES: usize = 64 * 1024;
 
 /// 一台主机在采集那一刻的资源占用。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -26,15 +37,6 @@ pub struct HostMetrics {
     pub memory_used_bytes: u64,
 }
 
-/// 逐台的采集结果：连不上的那台不影响其余，错误随这一条返回，界面按台显示。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ServerMetrics {
-    pub server_id: String,
-    pub metrics: Option<HostMetrics>,
-    pub error: Option<String>,
-}
-
 /// 采集脚本输出的是「键 值」行，解析端按键取值、认不出的行忽略。
 ///
 /// CPU 必须取两次读数之差：`/proc/stat` 第一行是开机以来的累计时间片，单次读数算出来的是
@@ -43,7 +45,7 @@ pub struct ServerMetrics {
 fn collect_script() -> String {
     format!(
         r#"R1=$(head -n1 /proc/stat)
-sleep {SAMPLE_SECS}
+sleep {SAMPLE_WINDOW_SECS}
 R2=$(head -n1 /proc/stat)
 set -- $R1
 U1=${{2:-0}}; N1=${{3:-0}}; S1=${{4:-0}}; I1=${{5:-0}}; W1=${{6:-0}}; Q1=${{7:-0}}; F1=${{8:-0}}; T1=${{9:-0}}
@@ -74,12 +76,18 @@ echo DONE"#
     )
 }
 
-/// 连接服务器并采集一次资源占用。
-pub async fn collect(server: &ServerConfig, connect_timeout_secs: u64) -> Result<HostMetrics> {
-    let client = SshClient::connect(server, connect_timeout_secs).await?;
-    let result = client.exec_capture(&collect_script(), EXEC_TIMEOUT_SECS).await;
-    client.disconnect().await;
-    let (code, output) = result?;
+/// 在一条已经建好的会话上采一次占用：只开一条通道，不再新建 SSH 连接。
+///
+/// 采集是只读的、可重复的，失败本身不代表会话没了（会话是否可用由 `is_closed()` 判），
+/// 所以调用方按「这一台暂时没有数字 + 原因」处理，不要把一次采集失败升级成断线重连。
+/// **例外是超时**：那一路必须由调用方掐表并换掉整条会话，理由见 [`SAMPLE_CEILING_SECS`]。
+pub async fn sample(client: &SshClient) -> Result<HostMetrics> {
+    let mut output = String::new();
+    let mut sink = |kind: OutputKind, line: String| push_line(&mut output, kind, &line);
+    let code = client
+        .exec_stream(&collect_script(), SAMPLE_CEILING_SECS, &mut sink)
+        .await?;
+    drop(sink);
     // 脚本最后一步是 echo DONE，非 0 说明中途就断了（读不到 /proc、没有 sh）：
     // 把残缺输出当成功会显示出一个假数字，不如报错。
     if code != 0 {
@@ -91,40 +99,25 @@ pub async fn collect(server: &ServerConfig, connect_timeout_secs: u64) -> Result
     parse_metrics(&output)
 }
 
-/// 逐台并发采集：一台连不上只影响它自己那一行，不阻塞其余服务器。
+/// 把一行接进缓冲区，与 `exec_capture` 同口径（stderr 行加前缀，解析端靠它区分）。
 ///
-/// 并发度不额外设限——服务器数量是个位数，而这里每次只是一条一秒钟的只读命令。
-pub async fn collect_all(
-    servers: &[ServerConfig],
-    connect_timeout_secs: u64,
-) -> Vec<ServerMetrics> {
-    let mut tasks = JoinSet::new();
-    for server in servers {
-        let server = server.clone();
-        tasks.spawn(async move {
-            let item = match collect(&server, connect_timeout_secs).await {
-                Ok(metrics) => ServerMetrics {
-                    server_id: server.id.clone(),
-                    metrics: Some(metrics),
-                    error: None,
-                },
-                Err(err) => ServerMetrics {
-                    server_id: server.id.clone(),
-                    metrics: None,
-                    error: Some(err.to_string()),
-                },
-            };
-            item
-        });
+/// 到上限之后一行都不再接，但**已经接进去的留着**：这一路要挡的是「对端写多少我们就
+/// 得留多少」，不是要把输出处处作废。解析认的是五行齐全，五行在被灌满之前就到了的话
+/// 那本来就是真读数；被灌满之后才到齐的那次会自然报「没有跑完」。
+fn push_line(output: &mut String, kind: OutputKind, line: &str) {
+    let prefix = if kind == OutputKind::Stderr {
+        "[stderr] "
+    } else {
+        ""
+    };
+    // 前缀与换行一起算：上限要的是「缓冲区从头到尾不超过这么多」，
+    // 只比正文的话每次都还能多漏出几个字节。
+    if output.len() + prefix.len() + line.len() + 1 > SAMPLE_MAX_BYTES {
+        return;
     }
-    let mut results = Vec::with_capacity(servers.len());
-    while let Some(joined) = tasks.join_next().await {
-        // 任务 panic 只会丢掉这一台；界面对没回来的行显示「未取到」而不是旧数字。
-        if let Ok(item) = joined {
-            results.push(item);
-        }
-    }
-    results
+    output.push_str(prefix);
+    output.push_str(line);
+    output.push('\n');
 }
 
 fn parse_metrics(output: &str) -> Result<HostMetrics> {
@@ -247,6 +240,84 @@ mod tests {
         // 只剩 stdout 的半截数据时不拿它当原因：那是个看着像指标的数。
         assert_eq!(failure_reason("CPU 0\nlast line\n"), "无错误输出");
         assert_eq!(failure_reason(""), "无错误输出");
+    }
+
+    /// 到上限就停止接收新行。这一路防的是「对端写多少我们就得留多少」，
+    /// 而会话没有校验主机密钥、采集又每 5 秒自动跑一次。
+    #[test]
+    fn the_sink_stops_at_the_byte_cap() {
+        let mut output = String::new();
+
+        // 收到接近上限后，再把总量顶过线的那一行不接，缓冲区一个字都不许变。
+        let big = "y".repeat(SAMPLE_MAX_BYTES - 8);
+        push_line(&mut output, OutputKind::Stdout, &big);
+        assert_eq!(output.len(), big.len() + 1, "第一行还装得下");
+        push_line(&mut output, OutputKind::Stdout, &big);
+        assert_eq!(output.len(), big.len() + 1, "越界的行不许改变缓冲区");
+
+        // 上限是对总量的逐行判断，不是「一越线就永久关闭」：还没顶满时小的正常行照收。
+        push_line(&mut output, OutputKind::Stdout, "DONE");
+        assert_eq!(output.len(), big.len() + 6);
+
+        // 被垃圾顶住的那一次凑不齐五行，由解析报错，不会变成一个假读数。
+        assert!(parse_metrics(&output).is_err());
+    }
+
+    /// 远端一直不写换行时，`ssh.rs::drain_lines_bytes` 会按 1 MiB 一块吐出来（它自带
+    /// `MAX_PENDING` 上限）。那种块必须整个进不来：否则上限就只是「攒到 1 MiB 再说」。
+    #[test]
+    fn an_oversized_chunk_never_enters() {
+        let mut output = String::new();
+        push_line(&mut output, OutputKind::Stdout, &"z".repeat(1024 * 1024));
+        assert!(output.is_empty(), "一块 1 MiB 的洪水不许留下任何东西");
+
+        // 前缀与换行一起算，所以正好等于上限的那一行也进不来。
+        push_line(&mut output, OutputKind::Stderr, &"z".repeat(SAMPLE_MAX_BYTES));
+        assert!(output.is_empty());
+        for _ in 0..64 {
+            push_line(
+                &mut output,
+                OutputKind::Stdout,
+                &"w".repeat(SAMPLE_MAX_BYTES / 2),
+            );
+            assert!(output.len() <= SAMPLE_MAX_BYTES, "攒多少轮都不许越过上限");
+        }
+    }
+
+    /// 五行在被灌满之前到齐的话，后面再来多少垃圾都不该弄丢这一次读数。
+    /// 上限只是「不再收」，不是「收到的全不算」。
+    #[test]
+    fn a_flood_after_the_real_lines_does_not_lose_the_reading() {
+        let mut output = String::new();
+        for line in ["CPU 12", "CORES 4", "MEM_TOTAL 100", "MEM_USED 40", "DONE"] {
+            push_line(&mut output, OutputKind::Stdout, line);
+        }
+        let junk = "y".repeat(SAMPLE_MAX_BYTES);
+        push_line(&mut output, OutputKind::Stderr, &junk);
+        assert_eq!(
+            parse_metrics(&output).expect("五行齐了就够").cpu_percent,
+            12,
+            "垃圾行本来就被解析端忽略"
+        );
+    }
+
+    /// 正常输出要走得通，且 stderr 前缀要和 `exec_capture` 同口径——
+    /// `failure_reason` 与 `parse_metrics` 现有那套解析全靠这两个字节。
+    #[test]
+    fn bounded_sink_keeps_normal_output_and_the_stderr_prefix() {
+        let mut output = String::new();
+        push_line(&mut output, OutputKind::Stderr, "motd: banner");
+        push_line(&mut output, OutputKind::Stdout, "CPU 12");
+        assert_eq!(output, "[stderr] motd: banner\nCPU 12\n");
+    }
+
+    /// 外层预算必须先于兜底上限响：那一路会换掉整条会话，把掐断的通道一起带走。
+    #[test]
+    fn the_caller_deadline_fires_before_the_exec_ceiling() {
+        assert!(
+            SAMPLE_TIMEOUT_SECS < SAMPLE_CEILING_SECS,
+            "同值或反向时，谁先响就交给调度了"
+        );
     }
 
     #[test]

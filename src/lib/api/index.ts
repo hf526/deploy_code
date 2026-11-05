@@ -2,7 +2,7 @@ import { appCommands } from "./app";
 import { reposCommands } from "./repos";
 import { gitCommands } from "./git";
 import { serversCommands } from "./servers";
-import { tunnelCommands } from "./tunnel";
+import { hostCommands } from "./host";
 import { nginxCommands } from "./nginx";
 import { deployCommands } from "./deploy";
 import { backupCommands } from "./backup";
@@ -16,7 +16,7 @@ export const api = {
   ...reposCommands,
   ...gitCommands,
   ...serversCommands,
-  ...tunnelCommands,
+  ...hostCommands,
   ...nginxCommands,
   ...deployCommands,
   ...backupCommands,

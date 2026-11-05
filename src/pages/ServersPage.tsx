@@ -34,7 +34,7 @@ import { api } from "../lib/api";
 import i18n from "../lib/i18n";
 import { blockGuardReason, isWhitelisted, type BlockGuardReason } from "../lib/security";
 import { useApp } from "../lib/store";
-import { activeTunnelCount, findTunnelStatus, tunnelTone } from "../lib/tunnel";
+import { activeTunnelCount, findHostStatus, tunnelTone } from "../lib/tunnel";
 import { useAutoRefresh } from "../lib/useAutoRefresh";
 import { GuardSection } from "./servers/GuardSection";
 import { TunnelModal } from "./servers/TunnelModal";
@@ -42,9 +42,8 @@ import type {
   OnlineSession,
   SecurityReport,
   ServerConfig,
-  ServerMetrics,
+  ServerHostStatus,
   HostMetrics,
-  ServerTunnelStatus,
   SecuritySetting,
 } from "../lib/types";
 import { authSummary, humanSize, newServerTemplate } from "../lib/utils";
@@ -92,8 +91,7 @@ export default function ServersPage() {
   const [editing, setEditing] = useState<ServerConfig | null>(null);
   const [removing, setRemoving] = useState<ServerConfig | null>(null);
   const [tunneling, setTunneling] = useState<ServerConfig | null>(null);
-  const [tunnelStatuses, setTunnelStatuses] = useState<ServerTunnelStatus[]>([]);
-  const [metrics, setMetrics] = useState<Record<string, ServerMetrics>>({});
+  const [hostStatuses, setHostStatuses] = useState<ServerHostStatus[]>([]);
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
 
@@ -105,22 +103,14 @@ export default function ServersPage() {
   const [kicking, setKicking] = useState<OnlineSession | null>(null);
   const [sessionBusy, setSessionBusy] = useState<string | null>(null);
 
-  // 隧道状态只是读内存里的登记表（不含 SSH 往返），所以进页面 / 窗口聚焦时补一次即可，不轮询。
-  const { refresh: refreshTunnels } = useAutoRefresh(
+  // 会话状态、每条规则的监听情况与资源占用都由那一条常驻连接自己维护，这一句只读内存里的
+  // 快照，不含任何 SSH 往返——所以可以按秒轮询，界面上的数字就是它此刻的样子。
+  // 采集本身在后台每几秒跑一次（切到别的应用时不必读，回到窗口再补上）。
+  const { refresh: refreshHosts } = useAutoRefresh(
     async () => {
-      setTunnelStatuses(await api.listTunnelStatus());
+      setHostStatuses(await api.listHostStatus());
     },
-    { minGapMs: 3000 },
-  );
-
-  // 资源占用每台都要一次 SSH 往返，所以同样只在进页面 / 窗口聚焦时采一次，外加表头那个手动按钮；
-  // 不轮询——一屏几台机器每秒建连接没有意义，界面上的数字本来就是「上一次采集那一刻」的。
-  const { refresh: refreshMetrics, refreshing: metricsRefreshing } = useAutoRefresh(
-    async () => {
-      const items = await api.listServerMetrics();
-      setMetrics(Object.fromEntries(items.map((item) => [item.serverId, item])));
-    },
-    { minGapMs: 5000 },
+    { intervalMs: 2000, minGapMs: 1500 },
   );
 
   // 扫描请求序号 + 当前打开的服务器：切换/关闭后，旧服务器操作触发的重扫直接丢弃，
@@ -220,7 +210,7 @@ export default function ServersPage() {
       // 后端会一并删除该服务器的备份配置并清理定时备份引用，同步刷新避免残留悬空配置 / 选择。
       await Promise.all([refreshServers(), refreshBackupConfigs()]);
       // 删掉的那台会释放它的本机端口，徽章与状态要跟着收。
-      void refreshTunnels(true);
+      void refreshHosts(true);
       void api
         .getSettings()
         .then(setSettings)
@@ -251,15 +241,6 @@ export default function ServersPage() {
       subtitle={t("servers.subtitle")}
       actions={
         <div className="flex items-center gap-2">
-          <Button
-            variant="secondary"
-            icon={<RefreshCw className="size-4" />}
-            loading={metricsRefreshing}
-            title={t("servers.refreshMetricsHint")}
-            onClick={() => void refreshMetrics(true)}
-          >
-            {t("servers.refreshMetrics")}
-          </Button>
           <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
             {t("servers.add")}
           </Button>
@@ -282,8 +263,8 @@ export default function ServersPage() {
           <ul className="divide-y divide-line">
             {servers.map((server) => {
               const enabledTunnels = activeTunnelCount(server.tunnels);
-              const usage = metrics[server.id];
-              const host = usage?.metrics ?? null;
+              const status = findHostStatus(hostStatuses, server.id);
+              const host = status?.metrics ?? null;
               return (
               <li
                 key={server.id}
@@ -303,7 +284,7 @@ export default function ServersPage() {
                     </p>
                     <Badge kind="gray">{authSummary(server)}</Badge>
                     {enabledTunnels > 0 && (
-                      <Badge kind={tunnelTone(findTunnelStatus(tunnelStatuses, server.id), enabledTunnels)}>
+                      <Badge kind={tunnelTone(status, enabledTunnels)}>
                         {t("servers.tunnelBadge", { count: enabledTunnels })}
                       </Badge>
                     )}
@@ -331,19 +312,21 @@ export default function ServersPage() {
                         })}
                       </span>
                     </p>
-                  ) : usage ? (
-                    // 采到了失败也要留在行上：这一台是真的没数据，不能退回成「什么都没写」。
+                  ) : status?.metricsError ? (
+                    // 真的采不到才红：原因挂在悬停上，不许退回成「什么都没写」，
+                    // 也不许留着断线前那一个看着像实时的旧值。
                     <p
                       className="mt-0.5 truncate text-[11px] text-neg"
-                      title={usage.error ?? undefined}
+                      title={status.metricsError}
                     >
                       {t("servers.metricsFailed")}
                     </p>
-                  ) : metricsRefreshing ? (
+                  ) : (
+                    // 刚加进来、会话还在建，或这一轮还没采完：谈不上失败，标成待采。
                     <p className="mt-0.5 truncate text-[11px] text-ink-faint">
                       {t("servers.metricsPending")}
                     </p>
-                  ) : null}
+                  )}
                 </div>
                 <div className="hidden w-56 shrink-0 truncate md:block" title={server.defaultTargetDir}>
                   {server.defaultTargetDir ? (
@@ -408,10 +391,9 @@ export default function ServersPage() {
         onSaved={() => {
           setFormOpen(false);
           void refreshServers();
-          // 服务器表单也能带隧道规则，保存后本机端口分配可能就变了。
-          void refreshTunnels(true);
-          // 新加的那台当场就能看到占用，不用等下次聚焦本页。
-          void refreshMetrics(true);
+          // 服务器表单也能带隧道规则，保存后本机端口分配可能就变了；
+          // 新加的那台也会在这一轮起会话，状态读回来就能看到占用。
+          void refreshHosts(true);
         }}
       />
 
@@ -423,7 +405,7 @@ export default function ServersPage() {
           onSaved={(saved) => {
             setTunneling(saved);
             void refreshServers();
-            void refreshTunnels(true);
+            void refreshHosts(true);
           }}
         />
       )}

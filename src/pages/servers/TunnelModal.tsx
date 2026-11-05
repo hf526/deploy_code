@@ -10,12 +10,12 @@ import {
   activeTunnelCount,
   draftToRule,
   emptyTunnelDraft,
-  findTunnelStatus,
+  findHostStatus,
   tunnelEndpoint,
   tunnelTone,
   type TunnelDraft,
 } from "../../lib/tunnel";
-import type { ServerConfig, ServerTunnelStatus, TunnelRule } from "../../lib/types";
+import type { ServerConfig, ServerHostStatus, TunnelRule } from "../../lib/types";
 
 /** 四种整体状态的文案 key：在线 / 等重连 / 端口绑不上 / 没在跑。 */
 const TONE_KEYS = {
@@ -47,7 +47,7 @@ export function TunnelModal({
 
   const [rules, setRules] = useState<TunnelRule[]>([]);
   const [draft, setDraft] = useState<TunnelDraft>(emptyTunnelDraft);
-  const [status, setStatus] = useState<ServerTunnelStatus | null>(null);
+  const [status, setStatus] = useState<ServerHostStatus | null>(null);
   const [saving, setSaving] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
@@ -62,9 +62,9 @@ export function TunnelModal({
     const target = serverIdRef.current;
     setRefreshing(true);
     try {
-      const list = await api.listTunnelStatus();
+      const list = await api.listHostStatus();
       if (request === seq.current && target === serverIdRef.current) {
-        setStatus(findTunnelStatus(list, target) ?? null);
+        setStatus(findHostStatus(list, target) ?? null);
       }
     } catch {
       // 状态读不到不打断编辑：规则本身在配置里，不依赖这次请求。
@@ -113,7 +113,7 @@ export function TunnelModal({
     if (reconnecting) return;
     setReconnecting(true);
     try {
-      await api.reconnectTunnels(server.id);
+      await api.reconnectHost(server.id);
       // 重连是后台事：给一点建立时间再读状态，读不到就靠刷新按钮。
       await new Promise((resolve) => setTimeout(resolve, 800));
       await refreshStatus();

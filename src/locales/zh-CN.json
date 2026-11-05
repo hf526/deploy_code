@@ -402,8 +402,6 @@
     "metricsMemory": "内存 {{used}}/{{total}}",
     "metricsFailed": "占用未取到",
     "metricsPending": "占用采集中…",
-    "refreshMetrics": "刷新占用",
-    "refreshMetricsHint": "重新采集每台服务器的 CPU 与内存占用",
     "tunnelConnected": "已连接",
     "tunnelRetrying": "重连中",
     "tunnelPortBlocked": "本机端口占用",

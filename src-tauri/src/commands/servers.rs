@@ -51,8 +51,8 @@ pub fn save_server(state: State<AppState>, mut server: ServerConfig) -> Result<S
         Store::upsert_server(config, server.clone())?;
         Ok((server.clone(), config.servers.clone()))
     })?;
-    // 配置已落盘：按新规则对齐隧道（规则变了的重建监听，删掉的让出端口）。
-    state.tunnels.sync(&servers);
+    // 配置已落盘：按新配置对齐这一台的常驻会话（连接参数或规则变了就重建，规则没了照样连着）。
+    state.hosts.sync(&servers);
     Ok(saved)
 }
 
@@ -88,8 +88,9 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
         }
         Ok(config.servers.clone())
     })?;
-    // 这台机器的隧道监听必须马上收掉，否则本机端口会一直被已删除的服务器占着。
-    state.tunnels.sync(&servers);
+    // 这台机器的常驻会话与本机端口监听必须马上收掉，否则端口会一直被已删除的服务器占着，
+    // 而它的资源探针还会对着一个不存在的目标一直重连。
+    state.hosts.sync(&servers);
     Ok(())
 }
 
@@ -97,18 +98,6 @@ pub fn delete_server(state: State<AppState>, server_id: String) -> Result<()> {
 #[tauri::command]
 pub async fn test_server(state: State<'_, AppState>, server: ServerConfig) -> Result<String> {
     state.engine().test_server(&server).await
-}
-
-/// 逐台采集主机资源占用（CPU / 内存）。
-///
-/// 读的是服务器上的 `/proc`，一条一秒钟的只读命令，和 `list_compose_stacks` 同一条口径：
-/// 不占任务名额、不发事件，任务在跑时也能看；某一台连不上只影响它自己那一行。
-#[tauri::command]
-pub async fn list_server_metrics(
-    state: State<'_, AppState>,
-) -> Result<Vec<deploy_core::ServerMetrics>> {
-    let config = state.store.load_config()?;
-    Ok(deploy_core::metrics::collect_all(&config.servers, config.settings.connect_timeout_secs).await)
 }
 
 /// 采集服务器安全检查报告（登录失败、成功登录、防火墙、sshd 配置）。

@@ -63,15 +63,17 @@ const FIXTURES = {
     { id: "r3", name: "qinglong-scripts", path: "E:\\code\\ql", pathExists: false, isRepo: true, currentBranch: "main", remote: null, changeCount: 0, defaultServerId: null, defaultTargetDir: "", envFiles: [] },
   ],
   list_servers: [
-    { id: "s1", name: "深圳轻量云", host: "1.2.3.4", port: 22, username: "root", auth: { type: "privateKey", keyPath: "C:\\keys\\id_ed25519", passphrase: null }, defaultTargetDir: "/opt/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-01 10:00:00" },
+    { id: "s1", name: "深圳轻量云", host: "1.2.3.4", port: 22, username: "root", auth: { type: "privateKey", keyPath: "C:\\keys\\id_ed25519", passphrase: null }, defaultTargetDir: "/opt/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [{ id: "t1", localPort: 18080, remoteHost: "127.0.0.1", remotePort: 8080, enabled: true }], createdAt: "2026-09-01 10:00:00" },
     { id: "s2", name: "香港中转", host: "5.6.7.8", port: 2222, username: "ubuntu", auth: { type: "password", password: "" }, defaultTargetDir: "/home/ubuntu/app", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-09-15 10:00:00" },
     { id: "s3", name: "老机器（采不到）", host: "10.0.0.9", port: 22, username: "deploy", auth: { type: "privateKey", keyPath: "C:\\keys\\id_rsa", passphrase: null }, defaultTargetDir: "/srv/legacy", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-10-02 10:00:00" },
+    { id: "s4", name: "刚加的（还没采）", host: "10.0.0.30", port: 22, username: "root", auth: { type: "password", password: "" }, defaultTargetDir: "/opt/new", dbBackup: null, backupTargetId: null, supabaseUrl: null, tunnels: [], createdAt: "2026-11-05 02:59:00" },
   ],
-  // 一台正常、一台双指标越线（警示色）、一台采集失败（红色 + 悬停看原因）。
-  list_server_metrics: [
-    { serverId: "s1", metrics: { cpuPercent: 12, cpuCores: 4, memoryTotalBytes: 8074006528, memoryUsedBytes: 2415919104 }, error: null },
-    { serverId: "s2", metrics: { cpuPercent: 93, cpuCores: 2, memoryTotalBytes: 4194304000, memoryUsedBytes: 3972005888 }, error: null },
-    { serverId: "s3", metrics: null, error: "连接超时（15s）" },
+  // 常驻连接的快照：一台正常在线、一台双指标越线（警示色）、一台会话断了（红色 + 悬停看原因）。
+  list_host_status: [
+    { serverId: "s1", serverName: "深圳轻量云", connected: true, retries: 0, lastError: null, connectedAt: "2026-11-05 02:58:12", forwarded: 2, rules: [{ ruleId: "t1", localPort: 18080, remoteLabel: "127.0.0.1:8080", bound: true, active: true, error: null }], metrics: { cpuPercent: 12, cpuCores: 4, memoryTotalBytes: 8074006528, memoryUsedBytes: 2415919104 }, metricsError: null, sampledAt: "2026-11-05 03:00:04" },
+    { serverId: "s2", serverName: "香港中转", connected: true, retries: 0, lastError: null, connectedAt: "2026-11-05 02:59:40", forwarded: 0, rules: [], metrics: { cpuPercent: 93, cpuCores: 2, memoryTotalBytes: 4194304000, memoryUsedBytes: 3972005888 }, metricsError: null, sampledAt: "2026-11-05 03:00:05" },
+    { serverId: "s3", serverName: "老机器（采不到）", connected: false, retries: 4, lastError: "连接 10.0.0.9:22 超时", connectedAt: null, forwarded: 0, rules: [], metrics: null, metricsError: "资源采集失败：连接已断开，正在重连", sampledAt: null },
+    { serverId: "s4", serverName: "刚加的（还没采）", connected: false, retries: 0, lastError: null, connectedAt: null, forwarded: 0, rules: [], metrics: null, metricsError: null, sampledAt: null },
   ],
   get_shutdown_status: null,
   list_deploy_configs: [

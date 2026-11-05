@@ -3,7 +3,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   SecurityReport,
   ServerConfig,
-  ServerMetrics,
 } from "../types";
 
 export const serversCommands = {
@@ -12,7 +11,6 @@ export const serversCommands = {
   saveServer: (server: ServerConfig) => invoke<ServerConfig>("save_server", { server }),
   deleteServer: (serverId: string) => invoke<void>("delete_server", { serverId }),
   testServer: (server: ServerConfig) => invoke<string>("test_server", { server }),
-  listServerMetrics: () => invoke<ServerMetrics[]>("list_server_metrics"),
   scanServerSecurity: (server: ServerConfig) =>
     invoke<SecurityReport>("scan_server_security", { server }),
   blockServerIp: (server: ServerConfig, ip: string) =>

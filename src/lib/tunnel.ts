@@ -1,4 +1,4 @@
-import type { ServerTunnelStatus, TunnelRule } from "./types";
+import type { ServerHostStatus, TunnelRule } from "./types";
 
 /** 隧道表单的草稿：端口用文本输入，校验前不先变成 NaN。 */
 export interface TunnelDraft {
@@ -53,10 +53,10 @@ export function activeTunnelCount(rules: TunnelRule[]): number {
   return rules.filter((rule) => rule.enabled).length;
 }
 
-export function findTunnelStatus(
-  list: ServerTunnelStatus[],
+export function findHostStatus(
+  list: ServerHostStatus[],
   serverId: string,
-): ServerTunnelStatus | undefined {
+): ServerHostStatus | undefined {
   return list.find((item) => item.serverId === serverId);
 }
 
@@ -65,7 +65,7 @@ export function findTunnelStatus(
  * 端口就绑不上是配置问题（红），连不上服务器只是等重连（琥珀）。
  */
 export function tunnelTone(
-  status: ServerTunnelStatus | null | undefined,
+  status: ServerHostStatus | null | undefined,
   enabledCount: number,
 ): "green" | "amber" | "red" | "gray" {
   if (enabledCount === 0 || !status) return "gray";
@@ -75,7 +75,7 @@ export function tunnelTone(
 }
 
 /** 状态摘要：当前真正能转出去的端口条数（已绑定 + 会话在线）。 */
-export function activeRuleCount(status: ServerTunnelStatus | null | undefined): number {
+export function activeRuleCount(status: ServerHostStatus | null | undefined): number {
   if (!status) return 0;
   return status.rules.filter((rule) => rule.active).length;
 }

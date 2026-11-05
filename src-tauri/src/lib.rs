@@ -41,13 +41,14 @@ pub fn run() {
             scheduler::spawn(app.handle().clone());
             // 容器备份另起一个循环：一条任务动辄几十分钟，队列推进的节奏与数据库备份不同。
             scheduler::spawn_container(app.handle().clone());
-            // 隧道：打开软件就按已保存的规则把本机端口接到远端容器上。
-            // 放在运行时任务里做，因为建立监听要 tokio::spawn；连不上的服务器只记状态、不打扰启动。
-            let tunnels = app.state::<AppState>().tunnels.clone();
-            let tunnel_store = app.state::<AppState>().store.clone();
+            // 主机常驻连接：打开软件就按已保存的服务器把会话接起来（隧道转发 + 资源探针）。
+            // 放在运行时任务里做，因为建监听与采样循环都要 tokio::spawn；
+            // 连不上的服务器只记状态、不打扰启动。
+            let hosts = app.state::<AppState>().hosts.clone();
+            let host_store = app.state::<AppState>().store.clone();
             tauri::async_runtime::spawn(async move {
-                if let Ok(config) = tunnel_store.load_config() {
-                    tunnels.sync(&config.servers);
+                if let Ok(config) = host_store.load_config() {
+                    hosts.sync(&config.servers);
                 }
             });
             Ok(())
@@ -111,16 +112,15 @@ pub fn run() {
             commands::servers::save_server,
             commands::servers::delete_server,
             commands::servers::test_server,
-            commands::servers::list_server_metrics,
             commands::servers::scan_server_security,
             commands::servers::block_server_ip,
             commands::servers::unblock_server_ip,
             commands::servers::kick_server_session,
             commands::servers::enable_server_guard,
             commands::servers::disable_server_guard,
-            commands::tunnel::save_server_tunnels,
-            commands::tunnel::list_tunnel_status,
-            commands::tunnel::reconnect_tunnels,
+            commands::host::save_server_tunnels,
+            commands::host::list_host_status,
+            commands::host::reconnect_host,
             commands::nginx::list_nginx_containers,
             commands::nginx::list_nginx_configs,
             commands::nginx::read_nginx_config,
@@ -194,8 +194,8 @@ pub fn run() {
             }
             // 终止仍在运行的本地子进程（构建 / wrangler 等），避免残留。
             deploy_core::process::kill_all_children();
-            // 隧道是本机监听：立刻收掉，把端口让出来给下次启动或别的应用。
-            app_handle.state::<AppState>().tunnels.stop_all();
+            // 常驻会话是本机监听 + 远端通道的持有者：立刻收掉，把端口让出来给下次启动或别的应用。
+            app_handle.state::<AppState>().hosts.stop_all();
 
             if !EXIT_CLEANUP_STARTED.swap(true, Ordering::SeqCst) {
                 let state = app_handle.state::<AppState>();

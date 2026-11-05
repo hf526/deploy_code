@@ -402,8 +402,6 @@
     "metricsMemory": "Memory {{used}}/{{total}}",
     "metricsFailed": "Usage unavailable",
     "metricsPending": "Collecting usage…",
-    "refreshMetrics": "Refresh usage",
-    "refreshMetricsHint": "Re-collect CPU and memory usage for every server",
     "tunnelConnected": "Connected",
     "tunnelRetrying": "Reconnecting",
     "tunnelPortBlocked": "Local port in use",
