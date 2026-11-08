@@ -4,6 +4,7 @@ import fs from "node:fs";
 
 const CHROME = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
 const OUT = process.argv[2];
+fs.mkdirSync(OUT, { recursive: true });
 // 其余参数: "name.png|#hash[:theme]" ...
 const shots = process.argv.slice(3);
 
@@ -54,7 +55,7 @@ await send("Page.enable");
 
 // —— Tauri mock：让纯浏览器也能渲染真实界面 ——
 const FIXTURES = {
-  get_app_version: "0.1.10",
+  get_app_version: "0.1.11",
   get_data_dir: "C:\\Users\\demo\\AppData\\Roaming\\deploy-code",
   get_autostart: false,
   list_repos: [
@@ -80,6 +81,12 @@ const FIXTURES = {
   list_terminals: [
     { id: "t1", serverId: "s1", serverName: "深圳轻量云", cols: 100, rows: 30 },
     { id: "t2", serverId: "s2", serverName: "港机", cols: 100, rows: 30 },
+  ],
+  // 文件传输（SFTP）：弹窗默认值要 remote_home，重开界面要对账要 list_transfers。
+  // 没这两条的话 start_upload 那一路会拿到 null，条带上出现一行字段全 undefined 的幽灵进度。
+  remote_home: "/root",
+  list_transfers: [
+    { id: "tr-seed", serverId: "s1", serverName: "深圳轻量云", direction: "download", fileName: "app.log", remotePath: "/var/log/app.log" },
   ],
   list_deploy_configs: [
     { id: "d1", repoId: "r1", name: "deploy_code → 深圳轻量云", rev: "main", serverIds: ["s1"], targetDir: "/opt/app", scripts: ["./scripts/deploy.sh"], scriptDir: "docker", runScripts: true, uploadEnv: false, createdAt: "2026-09-10 10:00:00" },
@@ -118,6 +125,12 @@ await send("Page.addScriptToEvaluateOnNewDocument", {
       _callbacks.set(id, (data) => { if (once) _callbacks.delete(id); return cb && cb(data); });
       return id;
     };
+    // 事件名 → handler id：让截图脚本能往 terminal://event 推真实输出（验 16 色 / 内边距 / 搜索）。
+    window.__EVENT_HANDLERS__ = {};
+    window.__EMIT__ = (event, payload) => {
+      const h = window.__EVENT_HANDLERS__[event];
+      if (h) window.__TAURI_INTERNALS__.runCallback(h, { event, id: 1, payload });
+    };
     window.__TAURI_INTERNALS__ = {
       metadata: { currentWindow: { label: "main" }, currentWebview: { label: "main" }, currentMonitor: null },
       transformCallback: _reg,
@@ -140,7 +153,25 @@ await send("Page.addScriptToEvaluateOnNewDocument", {
           });
         }
         if (cmd in fx) return Promise.resolve(fx[cmd]);
-        if (cmd === "plugin:event|listen" || cmd === "plugin:event|unlisten") return Promise.resolve(1);
+        // 传输这两条也要按参数造登记信息：id 固定会让两次发起并成一条，正好看不到条带叠加。
+        if (cmd === "start_upload" || cmd === "start_download") {
+          window.__TRANSFER_SEQ__ = (window.__TRANSFER_SEQ__ || 0) + 1;
+          const sep = String.fromCharCode(92);
+          const base = (p) => p.split("/").concat(p.split(sep)).filter(Boolean).pop() || "";
+          const srv = (fx.list_servers || []).find((s) => s.id === (args && args.serverId));
+          const remote = (args && args.remotePath) || "";
+          const local = (args && args.localPath) || "";
+          return Promise.resolve({
+            id: "tr-" + window.__TRANSFER_SEQ__,
+            serverId: (args && args.serverId) || "",
+            serverName: srv ? srv.name : "?",
+            direction: cmd === "start_upload" ? "upload" : "download",
+            fileName: cmd === "start_upload" ? base(local) : base(remote),
+            remotePath: remote.endsWith("/") ? remote + base(local) : remote,
+          });
+        }
+        if (cmd === "plugin:event|listen") { window.__EVENT_HANDLERS__[args.event] = args.handler; return Promise.resolve(1); }
+        if (cmd === "plugin:event|unlisten") return Promise.resolve(1);
         if (cmd.startsWith("list_") || cmd.endsWith("_configs") || cmd.endsWith("_records")) return Promise.resolve([]);
         return Promise.resolve(null);
       },
@@ -165,14 +196,22 @@ ws.onmessage = (ev) => {
 };
 await send("Emulation.setDeviceMetricsOverride", { width: 1440, height: 900, deviceScaleFactor: 1, mobile: false });
 
+// 主题走 prefers-color-scheme：应用的主题默认是 system（theme.ts），直接改 data-theme
+// 会被模块加载时那次 applyTheme 盖回去，截出来两张一样的图。
 for (const spec of shots) {
-  const [name, rest] = spec.split("|");
+  const [name, rest, script] = spec.split("|");
   const [hash, theme] = rest.split(":");
+  await send("Emulation.setEmulatedMedia", {
+    features: theme ? [{ name: "prefers-color-scheme", value: theme }] : [],
+  });
   await send("Page.navigate", { url: "http://127.0.0.1:4173/" + hash });
   await new Promise((r) => setTimeout(r, 4000));
-  if (theme) {
-    await send("Runtime.evaluate", { expression: `document.documentElement.dataset.theme="${theme}";` });
-    await new Promise((r) => setTimeout(r, 400));
+  // 第三段是先执行再拍：双击开标签、字号按钮、右键菜单这些只能算「交互」，静态图证明不了接上了。
+  if (script) {
+    const run = await send("Runtime.evaluate", { expression: script, awaitPromise: true });
+    if (run.exceptionDetails) console.log("EVAL-ERR", name, JSON.stringify(run.exceptionDetails).slice(0, 200));
+    else if (run.result?.result?.value !== undefined) console.log("EVAL", name, String(run.result.result.value).slice(0, 400));
+    await new Promise((r) => setTimeout(r, 900));
   }
   const shot = await send("Page.captureScreenshot", { format: "png" });
   if (shot.result?.data) {

@@ -44,6 +44,7 @@ pub mod ssh;
 pub mod store;
 pub mod tasklog;
 pub mod terminal;
+pub mod transfer;
 pub mod tunnel;
 pub mod util;
 
@@ -74,6 +75,10 @@ pub use store::{OrphanBundle, Store};
 pub use tasklog::TaskLogger;
 pub use terminal::{
     MAX_TERMINALS_PER_SERVER, MAX_TERMINALS_TOTAL, TerminalEvent, TerminalInfo, TerminalManager,
+};
+pub use transfer::{
+    MAX_TRANSFERS_PER_SERVER, MAX_TRANSFERS_TOTAL, TransferDirection, TransferEvent, TransferInfo,
+    TransferManager,
 };
 pub use tunnel::TunnelRuleStatus;
 pub use util::{format_duration, human_size};

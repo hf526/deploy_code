@@ -1,13 +1,27 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  FONT_SIZE_DEFAULT,
+  FONT_SIZE_MAX,
+  FONT_SIZE_MIN,
+  FONT_SIZE_STEP,
+  clampFontSize,
   createDispatcher,
   decodeTerminalBytes,
   dropTab,
   markTabClosed,
+  nextFontSize,
+  normalizeSplit,
+  pickSplitTarget,
+  readStoredFontSize,
   reconcileTabs,
+  resolveShortcut,
+  searchDecorations,
+  tabCountByServer,
+  tabDisplayName,
   tabFromInfo,
   terminalTheme,
+  type ShortcutKey,
   type TerminalSink,
   type TerminalTab,
 } from "./terminal";
@@ -135,6 +149,26 @@ describe("terminalTheme", () => {
     expect(theme.green).toBe("var(--pos)");
     expect(theme.yellow).toBe("var(--warn)");
   });
+
+  // 蓝/品红/青同色时 ls --color 与提示符分不出谁是谁，这三色必须各自独立。
+  it("蓝、品红、青互不相同", () => {
+    const theme = terminalTheme(read);
+    expect(theme.magenta).toBe("var(--term-magenta)");
+    expect(theme.cyan).toBe("var(--term-cyan)");
+    expect(new Set([theme.blue, theme.magenta, theme.cyan]).size).toBe(3);
+  });
+});
+
+describe("searchDecorations", () => {
+  it("四个色都从 token 取，普通命中与当前命中分得开", () => {
+    const read = (name: string) => `var(${name})`;
+    const deco = searchDecorations(read);
+    expect(deco.matchBackground).toBe("var(--term-search-match)");
+    expect(deco.activeMatchBackground).toBe("var(--term-search-active)");
+    expect(deco.matchOverviewRuler).toBe("var(--term-search-match)");
+    expect(deco.activeMatchColorOverviewRuler).toBe("var(--term-search-active)");
+    expect(deco.matchBackground).not.toBe(deco.activeMatchBackground);
+  });
 });
 
 describe("tabFromInfo", () => {
@@ -204,5 +238,135 @@ describe("createDispatcher", () => {
     dispatcher.push("b", new Uint8Array([2]));
     expect(a.written).toEqual([]);
     expect(b.written).toEqual([[2]]);
+  });
+});
+
+describe("tabDisplayName", () => {
+  it("一台一个标签时不挂序号", () => {
+    const tabs = [tab("a"), tab("b", { serverId: "s-other", serverName: "港机" })];
+    expect(tabDisplayName(tabs, tabs[0])).toBe("深圳");
+    expect(tabDisplayName(tabs, tabs[1])).toBe("港机");
+  });
+
+  // 同一台开第二个标签时，两个一模一样的名字没法分——这是要修的那件事本身。
+  it("同一台的第二个标签起带位次，第一个也一起带上", () => {
+    const tabs = [
+      tab("a", { serverId: "s1" }),
+      tab("b", { serverId: "s1" }),
+      tab("c", { serverId: "s1" }),
+    ];
+    expect(tabs.map((item) => tabDisplayName(tabs, item))).toEqual([
+      "深圳 · 1",
+      "深圳 · 2",
+      "深圳 · 3",
+    ]);
+  });
+
+  it("关掉中间那个之后序号重排，不会留下没有对应标签的位次", () => {
+    const tabs = [tab("a", { serverId: "s1" }), tab("b", { serverId: "s1" })];
+    const remaining = dropTab(tabs, "a");
+    expect(tabDisplayName(remaining, remaining[0])).toBe("深圳");
+  });
+
+  it("查不到自己时退回服务器名而不是「· 0」", () => {
+    const tabs = [tab("a", { serverId: "s1" }), tab("b", { serverId: "s1" })];
+    expect(tabDisplayName(tabs, tab("zzz", { serverId: "s1" }))).toBe("深圳");
+  });
+});
+
+describe("分屏", () => {
+  it("右侧标签被关掉或与左侧重合时归一成 null", () => {
+    const tabs = [tab("a"), tab("b")];
+    expect(normalizeSplit(tabs, "a", "b")).toBe("b");
+    expect(normalizeSplit(tabs, "a", "a")).toBeNull();
+    expect(normalizeSplit(tabs, "a", "zzz")).toBeNull();
+    expect(normalizeSplit(tabs, "a", null)).toBeNull();
+    expect(normalizeSplit([tab("a")], "a", "b")).toBeNull();
+  });
+
+  it("打开分屏时右侧给除当前外的第一个，只有一个标签时没得分", () => {
+    expect(pickSplitTarget([tab("a"), tab("b"), tab("c")], "a")).toBe("b");
+    expect(pickSplitTarget([tab("a"), tab("b")], "b")).toBe("a");
+    expect(pickSplitTarget([tab("a")], "a")).toBeNull();
+    expect(pickSplitTarget([], "")).toBeNull();
+  });
+});
+
+describe("tabCountByServer", () => {
+  it("按服务器分组数标签，没开的分组干脆不出现", () => {
+    const tabs = [
+      tab("a", { serverId: "s1" }),
+      tab("b", { serverId: "s1" }),
+      tab("c", { serverId: "s2" }),
+    ];
+    expect(tabCountByServer(tabs)).toEqual({ s1: 2, s2: 1 });
+    expect(tabCountByServer([])).toEqual({});
+  });
+});
+
+describe("字号", () => {
+  it("限幅在两端夹住，不做环绕", () => {
+    expect(nextFontSize(FONT_SIZE_MIN, -FONT_SIZE_STEP)).toBe(FONT_SIZE_MIN);
+    expect(nextFontSize(FONT_SIZE_MAX, FONT_SIZE_STEP)).toBe(FONT_SIZE_MAX);
+    expect(nextFontSize(14, FONT_SIZE_STEP)).toBe(15);
+    expect(clampFontSize(999)).toBe(FONT_SIZE_MAX);
+    expect(clampFontSize(4)).toBe(FONT_SIZE_MIN);
+  });
+
+  it("非数字、0、负数都回落到默认而不是把 NaN 喂给 xterm", () => {
+    expect(readStoredFontSize(null)).toBe(FONT_SIZE_DEFAULT);
+    expect(readStoredFontSize("")).toBe(FONT_SIZE_DEFAULT);
+    expect(readStoredFontSize("abc")).toBe(FONT_SIZE_DEFAULT);
+    expect(readStoredFontSize("0")).toBe(FONT_SIZE_DEFAULT);
+    expect(readStoredFontSize("-13")).toBe(FONT_SIZE_DEFAULT);
+    expect(clampFontSize(Number.NaN)).toBe(FONT_SIZE_DEFAULT);
+  });
+
+  it("盘上越界的值夹回端点，认得出的数字不会被当成没读到", () => {
+    expect(readStoredFontSize("18")).toBe(18);
+    expect(readStoredFontSize("40")).toBe(FONT_SIZE_MAX);
+  });
+});
+
+describe("resolveShortcut", () => {
+  function key(overrides: Partial<ShortcutKey> = {}): ShortcutKey {
+    return { ctrlKey: false, shiftKey: false, altKey: false, metaKey: false, code: "", key: "", ...overrides };
+  }
+
+  // Ctrl+C 是远端的 SIGINT，抢不得；复制只能走 Ctrl+Shift+C。
+  it("不带 Shift 的 Ctrl+C 与 Ctrl+V 不是快捷键", () => {
+    expect(resolveShortcut(key({ ctrlKey: true, key: "c", code: "KeyC" }))).toBeNull();
+    expect(resolveShortcut(key({ ctrlKey: true, key: "v", code: "KeyV" }))).toBeNull();
+  });
+
+  it("Ctrl+Shift 的复制/粘贴/全选/关标签/搜索", () => {
+    expect(resolveShortcut(key({ ctrlKey: true, shiftKey: true, key: "C", code: "KeyC" }))).toBe("copy");
+    expect(resolveShortcut(key({ ctrlKey: true, shiftKey: true, key: "V", code: "KeyV" }))).toBe("paste");
+    expect(resolveShortcut(key({ ctrlKey: true, shiftKey: true, key: "A", code: "KeyA" }))).toBe("selectAll");
+    expect(resolveShortcut(key({ ctrlKey: true, shiftKey: true, key: "W", code: "KeyW" }))).toBe("closeTab");
+    expect(resolveShortcut(key({ ctrlKey: true, shiftKey: true, key: "F", code: "KeyF" }))).toBe("find");
+  });
+
+  it("Shift+Insert 粘贴、Ctrl+Insert 复制", () => {
+    expect(resolveShortcut(key({ shiftKey: true, key: "Insert", code: "Insert" }))).toBe("paste");
+    expect(resolveShortcut(key({ ctrlKey: true, key: "Insert", code: "Insert" }))).toBe("copy");
+    expect(resolveShortcut(key({ key: "Insert", code: "Insert" }))).toBeNull();
+  });
+
+  it("切标签用 Ctrl+PageUp/Down，带 Alt 的一律放行给远端", () => {
+    expect(resolveShortcut(key({ ctrlKey: true, code: "PageUp", key: "PageUp" }))).toBe("prevTab");
+    expect(resolveShortcut(key({ ctrlKey: true, code: "PageDown", key: "PageDown" }))).toBe("nextTab");
+    expect(resolveShortcut(key({ altKey: true, ctrlKey: true, shiftKey: true, key: "C" }))).toBeNull();
+  });
+
+  // readline 的删词与转置：这两条被抢掉的话，终端里打字会变得更难用，不是更好用。
+  it("不劫持 Ctrl+W 与 Ctrl+T", () => {
+    expect(resolveShortcut(key({ ctrlKey: true, key: "w", code: "KeyW" }))).toBeNull();
+    expect(resolveShortcut(key({ ctrlKey: true, key: "t", code: "KeyT" }))).toBeNull();
+  });
+
+  it("⌘ 组合与 Ctrl 同等对待，纯字母键不命中", () => {
+    expect(resolveShortcut(key({ metaKey: true, shiftKey: true, key: "c", code: "KeyC" }))).toBe("copy");
+    expect(resolveShortcut(key({ key: "a", code: "KeyA" }))).toBeNull();
   });
 });

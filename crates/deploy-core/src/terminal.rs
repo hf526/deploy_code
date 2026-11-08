@@ -57,6 +57,11 @@ pub enum TerminalEvent {
     /// `bytes` 是 base64：PTY 输出是任意字节，按 UTF-8 有损转换会把 vim 的控制序列打成
     /// 乱码，而界面那一侧要的正是这些控制序列。
     Data { id: String, bytes: String },
+    /// 远端起了 ZMODEM 会话（`rz` / `sz`），而这个终端不实现那套协议。
+    ///
+    /// 只发提示，字节一个都不截：界面据此说一句「这里请走上传 / 下载」，而远端那个 `rz`
+    /// 该等多久还是等多久——那是它自己的协议状态，我们替它收尾只会编出一个假的成功。
+    ZmodemHint { id: String },
     /// `reason` 为 `None` 表示远端 shell 自己退出了，没出别的岔子。
     Closed { id: String, reason: Option<String> },
 }
@@ -255,6 +260,69 @@ fn count_for_server(infos: &[TerminalInfo], server_id: &str) -> usize {
     infos.iter().filter(|info| info.server_id == server_id).count()
 }
 
+/// 认得出 ZMODEM 会话已经起来，但**只**用来提示，不参与传输。
+///
+/// 认的是线路上的十六进制头：`ZPAD ZPAD ZDLE 'B'` 即 `2A 2A 18 42`，后面跟 14 个十六进制字符
+/// （头类型 2 + P0..P3 8 + CRC 4）再 CR LF。`rz` 和 `sz` 都以这一句开头，后面的二进制帧我们不
+/// 解，也不需要解。
+///
+/// ⚠️ 屏幕上看到的是 `**B0100000023be50`，那**不是**线上的字节：那个 0x18 是控制字符，终端把
+/// 它画成不动墨水的空位，所以复制出来的文本里 `**` 和 `B` 之间什么都没有了。按屏幕文本去匹配
+/// 等于永远命中不了——这里必须认带 0x18 的那一串。
+///
+/// 冷却是必要的：一次 `rz` 之后远端会反复重发 ZRQINIT，提示不该跟着刷屏。
+#[derive(Default)]
+struct ZmodemWatch {
+    /// 上一块的尾巴。握手头正好被拆成两个通道包时也要认得出来，所以不能只看当前这块。
+    tail: Vec<u8>,
+    last_hit: Option<std::time::Instant>,
+}
+
+/// 上一次提示之后多久允许再提示。
+const ZMODEM_HINT_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+/// 跨包拼接要留的尾巴长度：一个完整的十六进制头是 4 + 14 + 2 个字节，留 48 够装下还带余量。
+const ZMODEM_TAIL: usize = 48;
+
+impl ZmodemWatch {
+    fn feed(&mut self, chunk: &[u8], now: std::time::Instant) -> bool {
+        // 先判再截：头正好横跨两块时，截过之后再判就看不见那一半了。
+        // 拷贝一份尾巴的代价与同一个块已经做过的 base64 相比是噪音，不值得为它换正确性。
+        self.tail.extend_from_slice(chunk);
+        let hit = looks_like_zmodem_start(&self.tail);
+        if self.tail.len() > ZMODEM_TAIL {
+            let drop_to = self.tail.len() - ZMODEM_TAIL;
+            self.tail.drain(..drop_to);
+        }
+        if !hit {
+            return false;
+        }
+        if self
+            .last_hit
+            .is_some_and(|last| now.saturating_duration_since(last) < ZMODEM_HINT_COOLDOWN)
+        {
+            return false;
+        }
+        self.last_hit = Some(now);
+        true
+    }
+}
+
+/// `2A 2A 18 42` 开头、后面至少 12 个十六进制字符。
+///
+/// 完整的头是 14 个，取 12 是给「正好被拆包拆在最后两个字符上」留余量；同时 16 个字节里带
+/// 0x18 的普通文本几乎不存在，误报面比按屏幕文本匹配小得多。
+fn looks_like_zmodem_start(bytes: &[u8]) -> bool {
+    const PREFIX: [u8; 4] = [0x2a, 0x2a, 0x18, 0x42];
+    (0..bytes.len()).any(|at| {
+        bytes[at..].starts_with(&PREFIX)
+            && bytes[at + PREFIX.len()..]
+                .iter()
+                .take_while(|byte| byte.is_ascii_hexdigit())
+                .count()
+                >= 12
+    })
+}
+
 /// 读循环：把远端吐出来的字节交给回调，直到这条通道结束。
 async fn read_loop<F>(
     manager: Arc<TerminalManager>,
@@ -265,13 +333,18 @@ async fn read_loop<F>(
     F: Fn(TerminalEvent) + Send + Sync + 'static,
 {
     let mut reason: Option<String> = None;
+    let mut zmodem = ZmodemWatch::default();
     loop {
         match reader.wait().await {
             Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                 on_event(TerminalEvent::Data {
                     id: id.clone(),
-                    bytes: general_purpose::STANDARD.encode(data),
+                    bytes: general_purpose::STANDARD.encode(&data),
                 });
+                // 字节原样交出去之后再判提示：这条通道上的输出永远先喂界面。
+                if zmodem.feed(&data, std::time::Instant::now()) {
+                    on_event(TerminalEvent::ZmodemHint { id: id.clone() });
+                }
             }
             Some(ChannelMsg::ExitStatus { exit_status }) => {
                 reason = Some(format!("远端 shell 已退出（退出码 {exit_status}）"));
@@ -432,6 +505,11 @@ mod tests {
         .expect("序列化");
         assert_eq!(data["bytes"], "AA==");
 
+        let hint = serde_json::to_value(TerminalEvent::ZmodemHint { id: "t1".to_string() })
+            .expect("序列化");
+        assert_eq!(hint["type"], "zmodemHint");
+        assert_eq!(hint["id"], "t1");
+
         let listed = serde_json::to_value(TerminalInfo {
             id: "t1".to_string(),
             server_id: "s1".to_string(),
@@ -467,5 +545,54 @@ mod tests {
         let err = manager.resize("没有这个标签", 80, 24).await.expect_err("要报错");
         assert!(matches!(err, CoreError::NotFound(_)), "{err}");
         assert!(manager.list().is_empty(), "没有标签就是空列表，不是报错");
+    }
+
+    /// 用户在服务器上真跑一次 `rz`，线路上到的就是这一串：`**` 与 `B` 之间那个 0x18 是控制
+    /// 字符，屏幕上不占位，所以复制出来的文本看着是 `**B0…`。按屏幕文本匹配等于永远不命中。
+    #[test]
+    fn the_real_rz_bytes_trip_the_watch() {
+        let mut watch = ZmodemWatch::default();
+        let now = std::time::Instant::now();
+        assert!(watch.feed(b"rz waiting to receive.\r\n**\x18B0100000023be50", now));
+    }
+
+    /// 通道不保证按一行给：握手头被拆成两包也要认得出来（不跨界拼就等于「有时提示有时不提示」）。
+    #[test]
+    fn a_header_split_across_two_packets_is_still_caught() {
+        let mut watch = ZmodemWatch::default();
+        let now = std::time::Instant::now();
+        assert!(!watch.feed(b"rz waiting to receive.\r\n**\x18B0", now), "头还没发完，先不说");
+        assert!(watch.feed(b"100000023be50", now));
+    }
+
+    /// 屏幕文本那种没有 0x18 的 `**B0…` 不算命中：那是用户从界面上复制出来的样子，或者是
+    /// 日志里的巧合文本，不是线路上的头。误报的代价是凭空弹一条「请走上传」。
+    #[test]
+    fn ordinary_text_is_not_a_hit() {
+        let mut watch = ZmodemWatch::default();
+        let now = std::time::Instant::now();
+        assert!(!watch.feed(b"echo \"**B0100000023be50\"", now), "少了 0x18");
+        assert!(!watch.feed(b"**\x18B0deadbeef", now), "十六进制不够 12 个");
+        assert!(!watch.feed("lrzsz 未安装".as_bytes(), now));
+    }
+
+    /// 远端等不到应答会反复重发 ZRQINIT，提示不能跟着刷屏。
+    #[test]
+    fn the_watch_cools_down_after_one_hint() {
+        let mut watch = ZmodemWatch::default();
+        let start = std::time::Instant::now();
+        assert!(watch.feed(b"**\x18B0100000023be50", start));
+        assert!(!watch.feed(b"**\x18B0100000023be50", start), "冷却期内不再重复提示");
+        let later = start + ZMODEM_HINT_COOLDOWN;
+        assert!(watch.feed(b"**\x18B0100000023be50", later), "过了冷却还要能再提示一次");
+    }
+
+    /// 尾巴只留得下一个头的长度：一次 `cat` 几十 KB 不能把它一直攒着。
+    #[test]
+    fn the_tail_does_not_grow_with_the_output() {
+        let mut watch = ZmodemWatch::default();
+        let now = std::time::Instant::now();
+        watch.feed(&vec![b'x'; 100 * 1024], now);
+        assert_eq!(watch.tail.len(), ZMODEM_TAIL);
     }
 }

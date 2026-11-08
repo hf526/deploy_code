@@ -1,86 +1,32 @@
-import { useRef, useState } from "react";
-import {
-  Ban,
-  Cable,
-  FolderOpen,
-  KeyRound,
-  Loader2,
-  Lock,
-  LogOut,
-  Plus,
-  RefreshCw,
-  Server,
-  ShieldCheck,
-  TerminalSquare,
-  Trash2,
-  Wifi,
-  X,
-} from "lucide-react";
+import { useEffect, useMemo, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { Trans, useTranslation } from "react-i18next";
-import { useNavigate } from "react-router-dom";
-import { open } from "@tauri-apps/plugin-dialog";
+import { useLocation, useNavigate } from "react-router-dom";
+import { Plus, Server } from "lucide-react";
 
-import {
-  Badge,
-  Button,
-  Card,
-  ConfirmModal,
-  EmptyState,
-  Field,
-  Input,
-  Modal,
-  Page,
-  Select,
-} from "../components/ui";
+import { Button, ConfirmModal, EmptyState } from "../components/ui";
 import { api } from "../lib/api";
-import i18n from "../lib/i18n";
-import { blockGuardReason, isWhitelisted, type BlockGuardReason } from "../lib/security";
+import { readStoredFontSizeSafe, writeStoredFontSize } from "../lib/terminal";
+import { clampTreeWidth, readStoredTreeWidthSafe, writeStoredTreeWidth } from "../lib/serverTree";
 import { useApp } from "../lib/store";
-import { activeTunnelCount, findHostStatus, tunnelTone } from "../lib/tunnel";
 import { useAutoRefresh } from "../lib/useAutoRefresh";
-import { GuardSection } from "./servers/GuardSection";
+import type { ServerConfig, ServerHostStatus, TransferDirection } from "../lib/types";
+import { ServerFormModal } from "./servers/ServerFormModal";
+import { SecurityModal } from "./servers/SecurityModal";
+import { ServerTree } from "./servers/ServerTree";
+import { TerminalWorkspace } from "./servers/TerminalWorkspace";
+import { TransferModal } from "./servers/TransferModal";
 import { TunnelModal } from "./servers/TunnelModal";
-import type {
-  OnlineSession,
-  SecurityReport,
-  ServerConfig,
-  ServerHostStatus,
-  HostMetrics,
-  SecuritySetting,
-} from "../lib/types";
-import { authSummary, humanSize, newServerTemplate } from "../lib/utils";
+import { useTerminalTabs } from "./servers/useTerminalTabs";
+import { useTransfers } from "./servers/useTransfers";
 
-function firewallLabel(firewall: string): string {
-  if (firewall === "none") return i18n.t("servers.firewallNone");
-  if (firewall === "unknown") return i18n.t("servers.firewallUnknown");
-  if (firewall === "ufw") return "UFW";
-  return firewall;
-}
-
-/** 到这两个比例就把数字换成警示色：界面上不用点开详情也能扫出哪台快撑不住。 */
-const CPU_WARN_PERCENT = 85;
-const MEMORY_WARN_PERCENT = 90;
-
-function memoryPercent(metrics: HostMetrics): number {
-  if (metrics.memoryTotalBytes <= 0) return 0;
-  return Math.round((metrics.memoryUsedBytes / metrics.memoryTotalBytes) * 100);
-}
-
-function settingTone(setting: SecuritySetting): "green" | "red" | "amber" | "gray" {
-  if (setting.key === "permitrootlogin") return setting.value.startsWith("yes") ? "red" : "green";
-  if (setting.key === "passwordauthentication") {
-    return setting.value.startsWith("yes") ? "amber" : "green";
-  }
-  return "gray";
-}
-
-/** 保护理由的完整说明（挂在旁边的短标签上，鼠标悬停看细节）。 */
-function blockReasonTip(reason: BlockGuardReason, ip: string): string {
-  return reason === "self"
-    ? i18n.t("servers.blockReasonSelf", { ip })
-    : i18n.t("servers.blockReasonWhitelisted", { ip });
-}
-
+/**
+ * 服务器工作台：左边一台一个会话节点，右边是它的终端标签。
+ *
+ * 原来「服务器」与「终端」是两页，连一台机器要在列表里找到那一行点按钮、再到另一页的下拉框
+ * 里把同一台重选一次；现在双击节点即开标签，隧道 / 安全 / 配置从节点的菜单进。
+ * 业务口径一点没动：状态、占用与隧道仍全部来自 `list_host_status` 那一次内存读取，界面不新增
+ * 任何 SSH 往返，终端也不占任务名额。
+ */
 export default function ServersPage() {
   const { t } = useTranslation();
   const servers = useApp((state) => state.servers);
@@ -88,27 +34,33 @@ export default function ServersPage() {
   const refreshBackupConfigs = useApp((state) => state.refreshBackupConfigs);
   const setSettings = useApp((state) => state.setSettings);
   const toast = useApp((state) => state.toast);
+  const location = useLocation();
   const navigate = useNavigate();
 
+  const [hostStatuses, setHostStatuses] = useState<ServerHostStatus[]>([]);
+  const [selectedId, setSelectedId] = useState("");
   const [formOpen, setFormOpen] = useState(false);
   const [editing, setEditing] = useState<ServerConfig | null>(null);
   const [removing, setRemoving] = useState<ServerConfig | null>(null);
   const [tunneling, setTunneling] = useState<ServerConfig | null>(null);
-  const [hostStatuses, setHostStatuses] = useState<ServerHostStatus[]>([]);
+  const [securing, setSecuring] = useState<ServerConfig | null>(null);
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
+  const [fontSize, setFontSize] = useState(readStoredFontSizeSafe);
+  const [treeWidth, setTreeWidth] = useState(readStoredTreeWidthSafe);
+  // 弹窗只记「哪一台 + 哪个方向」：服务器对象本身交给下面的 find，免得列表刷新后
+  // 弹窗里那份旧配置盖掉刚保存过的新值。
+  const [transferModal, setTransferModal] = useState<{
+    serverId: string;
+    mode: TransferDirection;
+  } | null>(null);
 
-  const [securing, setSecuring] = useState<ServerConfig | null>(null);
-  const [report, setReport] = useState<SecurityReport | null>(null);
-  const [scanning, setScanning] = useState(false);
-  const [secError, setSecError] = useState<string | null>(null);
-  const [ipBusy, setIpBusy] = useState<string | null>(null);
-  const [kicking, setKicking] = useState<OnlineSession | null>(null);
-  const [sessionBusy, setSessionBusy] = useState<string | null>(null);
+  const terminal = useTerminalTabs();
+  const fileTransfer = useTransfers();
+  const { openFor, closeTab, closeOthers, attach, detach } = terminal;
 
   // 会话状态、每条规则的监听情况与资源占用都由那一条常驻连接自己维护，这一句只读内存里的
   // 快照，不含任何 SSH 往返——所以可以按秒轮询，界面上的数字就是它此刻的样子。
-  // 采集本身在后台每几秒跑一次（切到别的应用时不必读，回到窗口再补上）。
   const { refresh: refreshHosts } = useAutoRefresh(
     async () => {
       setHostStatuses(await api.listHostStatus());
@@ -116,91 +68,49 @@ export default function ServersPage() {
     { intervalMs: 2000, minGapMs: 1500 },
   );
 
-  // 扫描请求序号 + 当前打开的服务器：切换/关闭后，旧服务器操作触发的重扫直接丢弃，
-  // 避免把 A 的报告显示到 B 上，或对错误的服务器执行拉黑/解除。
-  const scanSeq = useRef(0);
-  const securingRef = useRef<ServerConfig | null>(null);
+  useEffect(() => {
+    if (!selectedId && servers.length > 0) setSelectedId(servers[0].id);
+  }, [selectedId, servers]);
 
-  async function scanSecurity(server: ServerConfig) {
-    if (securingRef.current?.id !== server.id) return;
-    const seq = ++scanSeq.current;
-    setScanning(true);
-    try {
-      const result = await api.scanServerSecurity(server);
-      if (seq !== scanSeq.current || securingRef.current?.id !== server.id) return;
-      setReport(result);
-      setSecError(null);
-    } catch (error) {
-      if (seq !== scanSeq.current || securingRef.current?.id !== server.id) return;
-      setSecError(String(error));
-    } finally {
-      if (seq === scanSeq.current && securingRef.current?.id === server.id) setScanning(false);
-    }
-  }
-
-  function openSecurity(server: ServerConfig) {
-    securingRef.current = server;
-    setSecuring(server);
-    setReport(null);
-    setSecError(null);
-    setIpBusy(null);
-    setSessionBusy(null);
-    setKicking(null);
-    void scanSecurity(server);
-  }
-
-  function closeSecurity() {
-    securingRef.current = null;
-    scanSeq.current++;
-    setSecuring(null);
-  }
-
-  async function handleBlock(ip: string) {
-    if (!securing) return;
-    setIpBusy(ip);
-    try {
-      const message = await api.blockServerIp(securing, ip);
-      toast("success", message);
-      await scanSecurity(securing);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setIpBusy(null);
-    }
-  }
-
-  async function handleUnblock(ip: string) {
-    if (!securing) return;
-    setIpBusy(ip);
-    try {
-      const message = await api.unblockServerIp(securing, ip);
-      toast("success", message);
-      await scanSecurity(securing);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setIpBusy(null);
-    }
-  }
-
-  async function handleKick() {
-    if (!kicking || !securing) return;
-    setSessionBusy(kicking.tty);
-    try {
-      const message = await api.kickServerSession(securing, kicking.tty);
-      toast("success", message);
-      setKicking(null);
-      await scanSecurity(securing);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setSessionBusy(null);
-    }
-  }
+  // 别的页面「在某台机器上打开终端」跳过来时带的参数：进来就开一个标签，然后把参数清掉——
+  // 不清的话刷新一次就多开一条同样的会话。
+  const requested = useMemo(
+    () => new URLSearchParams(location.search).get("server") ?? "",
+    [location.search],
+  );
+  useEffect(() => {
+    if (!requested) return;
+    setSelectedId(requested);
+    void openFor(requested);
+    navigate({ pathname: "/servers" }, { replace: true });
+  }, [requested, openFor, navigate]);
 
   function openForm(server: ServerConfig | null) {
     setEditing(server);
     setFormOpen(true);
+  }
+
+  /** 字号只有一个落点：按钮与 Ctrl+滚轮都走这里，写盘也只在这一处。 */
+  function applyFontSize(value: number) {
+    writeStoredFontSize(value);
+    setFontSize(value);
+  }
+
+  /** 树宽拖拽：mousemove 里只改状态，松手那一次才写盘（与字号同口径的本机偏好）。 */
+  function startTreeDrag(event: ReactMouseEvent) {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = treeWidth;
+    const onMove = (move: MouseEvent) => {
+      setTreeWidth(clampTreeWidth(startWidth + move.clientX - startX));
+    };
+    const onUp = (up: MouseEvent) => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      writeStoredTreeWidth(startWidth + up.clientX - startX);
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
   }
 
   async function handleDelete() {
@@ -239,162 +149,94 @@ export default function ServersPage() {
   }
 
   return (
-    <Page
-      title={t("nav.servers")}
-      subtitle={t("servers.subtitle")}
-      actions={
-        <div className="flex items-center gap-2">
-          <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
-            {t("servers.add")}
-          </Button>
+    <div className="flex h-full flex-col">
+      {/* 紧凑页头：Page 那套「标题 + 副标题 + 20px 内边距」会把终端要的纵向空间吃掉一截，
+          这一页是整高工作台，排版照 RepoDetailPage 的根布局走。 */}
+      <header className="ui-titlebar flex shrink-0 items-center gap-3 border-b border-line px-4 py-2.5">
+        <div className="min-w-0 flex-1">
+          <h1 className="truncate text-sm font-semibold tracking-tight text-ink">
+            {t("nav.servers")}
+          </h1>
+          <p className="truncate text-[11px] text-ink-faint">{t("servers.subtitle")}</p>
         </div>
-      }
-    >
+        <Button size="sm" icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
+          {t("servers.add")}
+        </Button>
+      </header>
+
       {servers.length === 0 ? (
-        <EmptyState
-          icon={<Server className="size-4.5" />}
-          title={t("servers.emptyTitle")}
-          description={t("servers.emptyDescription")}
-          action={
-            <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
-              {t("servers.add")}
-            </Button>
-          }
-        />
+        <div className="min-h-0 flex-1 px-6 py-5">
+          <EmptyState
+            icon={<Server className="size-4.5" />}
+            title={t("servers.emptyTitle")}
+            description={t("servers.emptyDescription")}
+            action={
+              <Button icon={<Plus className="size-4" />} onClick={() => openForm(null)}>
+                {t("servers.add")}
+              </Button>
+            }
+          />
+        </div>
       ) : (
-        <Card className="overflow-hidden">
-          <ul className="divide-y divide-line">
-            {servers.map((server) => {
-              const enabledTunnels = activeTunnelCount(server.tunnels);
-              const status = findHostStatus(hostStatuses, server.id);
-              const host = status?.metrics ?? null;
-              return (
-              <li
-                key={server.id}
-                className="group flex items-center gap-4 px-4 py-3 transition-colors hover:bg-hover"
-              >
-                <span className="grid size-9 shrink-0 place-items-center rounded-md border border-line bg-field">
-                  {server.auth.type === "password" ? (
-                    <Lock className="size-4 text-ink-dim" />
-                  ) : (
-                    <KeyRound className="size-4 text-ink-dim" />
-                  )}
-                </span>
-                <div className="min-w-0 flex-1">
-                  <div className="flex items-center gap-2">
-                    <p className="truncate text-[13px] font-semibold tracking-tight text-ink">
-                      {server.name}
-                    </p>
-                    <Badge kind="gray">{authSummary(server)}</Badge>
-                    {enabledTunnels > 0 && (
-                      <Badge kind={tunnelTone(status, enabledTunnels)}>
-                        {t("servers.tunnelBadge", { count: enabledTunnels })}
-                      </Badge>
-                    )}
-                  </div>
-                  <p className="mt-0.5 truncate font-mono text-[11px] text-ink-dim">
-                    {server.username}@{server.host}:{server.port}
-                  </p>
-                  {host ? (
-                    <p className="mt-0.5 flex items-center gap-2 truncate text-[11px] text-ink-faint">
-                      <span className={host.cpuPercent >= CPU_WARN_PERCENT ? "text-warn" : undefined}>
-                        {t("servers.metricsCpu", { percent: host.cpuPercent })}
-                      </span>
-                      {/* 少数虚拟化内核的 /proc/cpuinfo 数不出核数，读 0 就干脆不写这一项。 */}
-                      {host.cpuCores > 0 && (
-                        <span>{t("servers.metricsCores", { cores: host.cpuCores })}</span>
-                      )}
-                      <span
-                        className={
-                          memoryPercent(host) >= MEMORY_WARN_PERCENT ? "text-warn" : undefined
-                        }
-                      >
-                        {t("servers.metricsMemory", {
-                          used: humanSize(host.memoryUsedBytes),
-                          total: humanSize(host.memoryTotalBytes),
-                          percent: memoryPercent(host),
-                        })}
-                      </span>
-                    </p>
-                  ) : status?.metricsError ? (
-                    // 真的采不到才红：原因挂在悬停上，不许退回成「什么都没写」，
-                    // 也不许留着断线前那一个看着像实时的旧值。
-                    <p
-                      className="mt-0.5 truncate text-[11px] text-neg"
-                      title={status.metricsError}
-                    >
-                      {t("servers.metricsFailed")}
-                    </p>
-                  ) : (
-                    // 刚加进来、会话还在建，或这一轮还没采完：谈不上失败，标成待采。
-                    <p className="mt-0.5 truncate text-[11px] text-ink-faint">
-                      {t("servers.metricsPending")}
-                    </p>
-                  )}
-                </div>
-                <div className="hidden w-56 shrink-0 truncate md:block" title={server.defaultTargetDir}>
-                  {server.defaultTargetDir ? (
-                    <p className="truncate font-mono text-[11px] text-ink-faint">
-                      {server.defaultTargetDir}
-                    </p>
-                  ) : (
-                    <p className="text-[11px] text-ink-faint">{t("servers.noDefaultDir")}</p>
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-1">
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    title={t("servers.testConnection")}
-                    loading={testingId === server.id}
-                    disabled={testingId !== null && testingId !== server.id}
-                    icon={<Wifi className="size-3.5" />}
-                    onClick={() => void handleTest(server)}
-                  />
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    title={t("servers.tunnelButton")}
-                    icon={<Cable className="size-3.5" />}
-                    onClick={() => setTunneling(server)}
-                  >
-                    {t("servers.tunnelButton")}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    title={t("servers.securityTitle")}
-                    icon={<ShieldCheck className="size-3.5" />}
-                    onClick={() => openSecurity(server)}
-                  >
-                    {t("servers.securityButton")}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="secondary"
-                    title={t("servers.terminalButtonTip")}
-                    icon={<TerminalSquare className="size-3.5" />}
-                    onClick={() => navigate(`/terminal?server=${server.id}`)}
-                  >
-                    {t("servers.terminalButton")}
-                  </Button>
-                  <Button size="sm" variant="secondary" onClick={() => openForm(server)}>
-                    {t("servers.configure")}
-                  </Button>
-                  <Button
-                    size="sm"
-                    variant="ghost"
-                    title={t("common.delete")}
-                    className="text-neg hover:bg-neg-soft hover:text-neg"
-                    icon={<Trash2 className="size-3.5" />}
-                    onClick={() => setRemoving(server)}
-                  />
-                </div>
-              </li>
-              );
-            })}
-          </ul>
-        </Card>
+        <div className="flex min-h-0 flex-1">
+          <ServerTree
+            servers={servers}
+            statuses={hostStatuses}
+            selectedId={selectedId}
+            tabCounts={terminal.tabCounts}
+            testingId={testingId}
+            width={treeWidth}
+            onSelect={setSelectedId}
+            onOpenTerminal={(server) => void openFor(server.id)}
+            onTest={(server) => void handleTest(server)}
+            onTunnels={setTunneling}
+            onSecurity={setSecuring}
+            onEdit={openForm}
+            onDelete={setRemoving}
+            onAdd={() => openForm(null)}
+          />
+
+          <div
+            className="w-1 shrink-0 cursor-col-resize transition-colors hover:bg-brand-line"
+            onMouseDown={startTreeDrag}
+            title={t("servers.resizeTree")}
+            aria-label={t("servers.resizeTree")}
+          />
+
+          <TerminalWorkspace
+            tabs={terminal.tabs}
+            activeId={terminal.activeId}
+            busy={terminal.busy}
+            activityIds={terminal.activityIds}
+            clearActivity={terminal.clearActivity}
+            servers={servers}
+            statuses={hostStatuses}
+            fontSize={fontSize}
+            selectedServerId={selectedId}
+            onFontSizeChange={applyFontSize}
+            onSelect={terminal.setActiveId}
+            onOpen={(serverId) => void openFor(serverId)}
+            onClose={(id) => {
+              // 标签没了，挂在它身上的那句 ZMODEM 指路也就没人要看了；留着会让下一个标签
+              // 一开就冒出一句没头没尾的提示。closeTab 的 promise 原样交出去。
+              fileTransfer.dismissZmodem(id);
+              return closeTab(id);
+            }}
+            onCloseOthers={(id) => {
+              for (const tab of terminal.tabs) {
+                if (tab.id !== id) fileTransfer.dismissZmodem(tab.id);
+              }
+              void closeOthers(id);
+            }}
+            attach={attach}
+            detach={detach}
+            transfers={fileTransfer.entries}
+            zmodemHint={fileTransfer.zmodemIds.includes(terminal.activeId)}
+            onPickTransfer={(serverId, mode) => setTransferModal({ serverId, mode })}
+            onCancelTransfer={(transferId) => void fileTransfer.cancel(transferId)}
+            onDismissZmodem={() => fileTransfer.dismissZmodem(terminal.activeId)}
+          />
+        </div>
       )}
 
       <ServerFormModal
@@ -423,285 +265,24 @@ export default function ServersPage() {
         />
       )}
 
-      <Modal
-        open={!!securing}
-        onClose={closeSecurity}
-        title={t("servers.securityTitle")}
-        subtitle={
-          securing
-            ? `${securing.name} · ${securing.username}@${securing.host}:${securing.port}`
-            : undefined
-        }
-        width="max-w-3xl"
-        footer={
-          <>
-            <Button variant="secondary" onClick={closeSecurity}>
-              {t("common.close")}
-            </Button>
-            <Button
-              variant="secondary"
-              loading={scanning}
-              icon={<RefreshCw className="size-4" />}
-              onClick={() => securing && void scanSecurity(securing)}
-            >
-              {t("servers.rescan")}
-            </Button>
-          </>
-        }
-      >
-        {scanning && !report ? (
-          <p className="flex items-center justify-center gap-2 py-12 text-xs text-ink-dim">
-            <Loader2 className="size-4 animate-spin" /> {t("servers.scanning")}
-          </p>
-        ) : secError ? (
-          <p className="rounded-md border border-neg/30 bg-neg-soft px-4 py-3 text-xs break-all text-neg">
-            {secError}
-          </p>
-        ) : report && securing ? (
-          <div className="flex flex-col gap-5">
-            <div className="flex flex-wrap items-center gap-2">
-              <Badge
-                kind={
-                  report.firewall === "none" ? "red" : report.firewall === "unknown" ? "amber" : "brand"
-                }
-              >
-                {t("servers.firewall", { value: firewallLabel(report.firewall) })}
-              </Badge>
-              <Badge kind={report.isRoot || report.hasSudo ? "green" : "amber"}>
-                {report.isRoot
-                  ? t("servers.privilegeRoot")
-                  : report.hasSudo
-                    ? t("servers.privilegeSudo")
-                    : t("servers.privilegeLimited")}
-              </Badge>
-            </div>
+      {/* 按 id 挂 key：换一台就是换实例，旧那台的扫描结果不会再落到新服务器上。 */}
+      {securing && (
+        <SecurityModal key={securing.id} server={securing} onClose={() => setSecuring(null)} />
+      )}
 
-            {report.notes.length > 0 && (
-              <div className="rounded-md border border-warn/30 bg-warn-soft px-3.5 py-2.5 text-[11.5px] leading-relaxed text-warn">
-                {report.notes.map((note) => (
-                  <p key={note}>{note}</p>
-                ))}
-              </div>
-            )}
-
-            <div className="flex flex-wrap items-center gap-2 text-[11px]">
-              <span className="rounded-md border border-line bg-field px-2.5 py-1 text-ink-dim">
-                {t("servers.onlineSessions")}{" "}
-                <b className="ml-1 text-ink">{report.sessions.length}</b>
-              </span>
-              <span className="rounded-md border border-line bg-field px-2.5 py-1 text-ink-dim">
-                {t("servers.lastScan")}{" "}
-                <b className="ml-1 text-ink">{report.scannedAt || "-"}</b>
-              </span>
-            </div>
-
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">
-                {t("servers.failedLogins", { count: report.failed.length })}
-              </h4>
-              {report.failed.length === 0 ? (
-                <p className="text-xs text-ink-faint">{t("servers.noFailedLogins")}</p>
-              ) : (
-                <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
-                  {report.failed.map((item) => {
-                    // 判定用服务器上的白名单：界面上没点「更新」的改动还没生效，远端只认那份配置。
-                    // 禁用态的按钮不吃指针事件（ui.tsx 的 disabled:pointer-events-none），
-                    // 所以理由必须摆在旁边，挂 title 是看不到的。
-                    const reason = blockGuardReason(report.whitelist, report.selfIp, item.ip);
-                    return (
-                      <li
-                        key={`${item.user}-${item.ip}`}
-                        className="flex items-center gap-3 px-3 py-1.5 transition-colors hover:bg-hover"
-                      >
-                        <span
-                          className="w-40 shrink-0 truncate font-mono text-xs text-ink"
-                          title={item.user}
-                        >
-                          {item.user}
-                        </span>
-                        <span className="min-w-0 flex-1 truncate font-mono text-xs text-ink-dim">
-                          {item.ip}
-                        </span>
-                        <Badge kind="red">{t("servers.times", { count: item.count })}</Badge>
-                        {report.blocked.includes(item.ip) ? (
-                          <Button
-                            size="sm"
-                            variant="secondary"
-                            loading={ipBusy === item.ip}
-                            disabled={ipBusy !== null && ipBusy !== item.ip}
-                            icon={<X className="size-3.5" />}
-                            onClick={() => void handleUnblock(item.ip)}
-                          >
-                            {t("servers.unblock")}
-                          </Button>
-                        ) : (
-                          <>
-                            {reason && (
-                              <span title={blockReasonTip(reason, item.ip)} className="text-[11px] text-warn">
-                                {reason === "self"
-                                  ? t("servers.blockGuardSelf")
-                                  : t("servers.guardWhitelistBadge")}
-                              </span>
-                            )}
-                            <Button
-                              size="sm"
-                              variant="secondary"
-                              loading={ipBusy === item.ip}
-                              disabled={(ipBusy !== null && ipBusy !== item.ip) || reason !== null}
-                              icon={<Ban className="size-3.5" />}
-                              onClick={() => void handleBlock(item.ip)}
-                            >
-                              {t("servers.block")}
-                            </Button>
-                          </>
-                        )}
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </section>
-
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.recentSuccess")}</h4>
-              {report.success.length === 0 ? (
-                <p className="text-xs text-ink-faint">{t("servers.noSuccess")}</p>
-              ) : (
-                <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
-                  {report.success.map((item, index) => (
-                    <li
-                      key={`${item.user}-${item.ip}-${index}`}
-                      className="flex items-center gap-3 px-3 py-1.5"
-                    >
-                      <span className="w-28 shrink-0 truncate font-mono text-xs text-ink">
-                        {item.user}
-                      </span>
-                      <span className="w-40 shrink-0 truncate font-mono text-xs text-ink-dim">
-                        {item.ip}
-                      </span>
-                      <span
-                        className="min-w-0 flex-1 truncate text-[11px] text-ink-faint"
-                        title={item.detail}
-                      >
-                        {item.detail}
-                      </span>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </section>
-
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">
-                {t("servers.sessionsTitle", { count: report.sessions.length })}
-              </h4>
-              {report.sessions.length === 0 ? (
-                <p className="text-xs text-ink-faint">{t("servers.noSessions")}</p>
-              ) : (
-                <ul className="divide-y divide-line overflow-hidden rounded-md border border-line">
-                  {report.sessions.map((session) => (
-                    <li
-                      key={`${session.user}-${session.tty}`}
-                      className="flex items-center gap-3 px-3 py-1.5 transition-colors hover:bg-hover"
-                    >
-                      <span
-                        className="w-28 shrink-0 truncate font-mono text-xs text-ink"
-                        title={session.user}
-                      >
-                        {session.user}
-                      </span>
-                      <span className="w-20 shrink-0 truncate font-mono text-xs text-ink-dim">
-                        {session.tty}
-                      </span>
-                      <span
-                        className="min-w-0 flex-1 truncate text-[11px] text-ink-faint"
-                        title={`${session.loginAt}${session.from ? ` · ${session.from}` : ""}`}
-                      >
-                        {session.loginAt}
-                        {session.from ? ` · ${session.from}` : ""}
-                      </span>
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        loading={sessionBusy === session.tty}
-                        disabled={sessionBusy !== null && sessionBusy !== session.tty}
-                        icon={<LogOut className="size-3.5" />}
-                        onClick={() => setKicking(session)}
-                      >
-                        {t("servers.kick")}
-                      </Button>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </section>
-
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.blockedIps")}</h4>
-              {report.blocked.length === 0 ? (
-                <p className="text-xs text-ink-faint">{t("servers.noBlockedIps")}</p>
-              ) : (
-                <div className="flex flex-wrap gap-2">
-                  {report.blocked.map((ip) => {
-                    // 白名单里的地址还挂在拦截列表里 = 自己（或定时任务）正被挡在外面，
-                    // 白名单只挡以后的拉黑、不会自动把已封的放出来，所以单独标出来。
-                    const guarded = isWhitelisted(report.whitelist, ip);
-                    return (
-                      <span
-                        key={ip}
-                        title={guarded ? t("servers.blockedWhitelisted") : undefined}
-                        className={`inline-flex items-center gap-1.5 rounded-md border py-0.5 pr-1 pl-2 font-mono text-[11px] ${
-                          guarded ? "border-warn/30 bg-warn-soft text-warn" : "border-line bg-field text-ink"
-                        }`}
-                      >
-                        {ip}
-                        {guarded && (
-                          <span className="font-sans text-[10px]">{t("servers.guardWhitelistBadge")}</span>
-                        )}
-                        <button
-                          type="button"
-                          disabled={ipBusy !== null}
-                          onClick={() => void handleUnblock(ip)}
-                          className="rounded px-1.5 py-0.5 text-[10px] text-ink-faint hover:bg-hover hover:text-ink disabled:opacity-50"
-                        >
-                          {ipBusy === ip ? t("servers.unblocking") : t("servers.unblock")}
-                        </button>
-                      </span>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
-
-            <GuardSection
-              server={securing}
-              report={report}
-              onChanged={() => void scanSecurity(securing)}
-            />
-
-            <section>
-              <h4 className="mb-2 text-xs font-semibold text-ink">{t("servers.sshdTitle")}</h4>
-              {report.sshd.length === 0 ? (
-                <p className="text-xs text-ink-faint">{t("servers.noSshd")}</p>
-              ) : (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  {report.sshd.map((setting) => (
-                    <div
-                      key={setting.key}
-                      className="flex items-center justify-between gap-2 rounded-md border border-line bg-field px-3 py-1.5"
-                    >
-                      <span className="truncate font-mono text-[11px] text-ink-dim">
-                        {setting.key}
-                      </span>
-                      <Badge kind={settingTone(setting)}>{setting.value}</Badge>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          </div>
-        ) : null}
-      </Modal>
+      {/* 按 id + 方向挂 key：换一台或换方向就是换实例，那一次在飞的 remote_home 回包
+          不会落到新打开的这个弹窗上（方向不同，连该校验什么都变了）。 */}
+      {transferModal && (
+        <TransferModal
+          key={`${transferModal.serverId}:${transferModal.mode}`}
+          open
+          server={servers.find((item) => item.id === transferModal.serverId) ?? null}
+          mode={transferModal.mode}
+          onClose={() => setTransferModal(null)}
+          onUpload={fileTransfer.upload}
+          onDownload={fileTransfer.download}
+        />
+      )}
 
       <ConfirmModal
         open={!!removing}
@@ -719,257 +300,6 @@ export default function ServersPage() {
         onCancel={() => setRemoving(null)}
         onConfirm={() => void handleDelete()}
       />
-
-      <ConfirmModal
-        open={!!kicking}
-        danger
-        loading={sessionBusy !== null}
-        title={t("servers.kickTitle")}
-        confirmText={t("servers.kick")}
-        description={
-          <Trans
-            i18nKey={kicking?.from ? "servers.kickDescriptionWithFrom" : "servers.kickDescription"}
-            values={{ user: kicking?.user, tty: kicking?.tty, from: kicking?.from }}
-            components={{ b: <b className="text-ink" /> }}
-          />
-        }
-        onCancel={() => setKicking(null)}
-        onConfirm={() => void handleKick()}
-      />
-    </Page>
-  );
-}
-
-function ServerFormModal({
-  open: isOpen,
-  initial,
-  onClose,
-  onSaved,
-}: {
-  open: boolean;
-  initial: ServerConfig | null;
-  onClose: () => void;
-  onSaved: () => void | Promise<void>;
-}) {
-  const { t } = useTranslation();
-  const toast = useApp((state) => state.toast);
-  const [draft, setDraft] = useState<ServerConfig>(newServerTemplate);
-  const [busy, setBusy] = useState(false);
-  const [testing, setTesting] = useState(false);
-  const [initialized, setInitialized] = useState(false);
-
-  if (isOpen && !initialized) {
-    setDraft(initial ? { ...initial, auth: { ...initial.auth } } : newServerTemplate());
-    setInitialized(true);
-  }
-  if (!isOpen && initialized) {
-    setInitialized(false);
-  }
-
-  async function browseKey() {
-    const selected = await open({ multiple: false, title: t("servers.keyBrowseTitle") });
-    if (typeof selected === "string") {
-      setDraft((current) =>
-        current.auth.type === "privateKey"
-          ? { ...current, auth: { ...current.auth, keyPath: selected } }
-          : current,
-      );
-    }
-  }
-
-  async function save() {
-    if (busy || testing) return;
-    if (!draft.name.trim()) return toast("error", t("servers.errorName"));
-    if (!draft.host.trim()) return toast("error", t("servers.errorHost"));
-    if (!draft.username.trim()) return toast("error", t("servers.errorUsername"));
-    if (draft.auth.type === "password" && !draft.auth.password) {
-      return toast("error", t("servers.errorPassword"));
-    }
-    if (draft.auth.type === "privateKey" && !draft.auth.keyPath.trim()) {
-      return toast("error", t("servers.errorKey"));
-    }
-
-    setBusy(true);
-    try {
-      const saved = await api.saveServer(draft);
-      toast("success", initial ? t("servers.updated") : t("servers.added"));
-      setDraft(saved);
-      await onSaved();
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function test() {
-    if (busy || testing) return;
-    setTesting(true);
-    try {
-      const message = await api.testServer(draft);
-      toast("success", message);
-    } catch (error) {
-      toast("error", String(error));
-    } finally {
-      setTesting(false);
-    }
-  }
-
-  /** 保存 / 测试进行中禁止关闭，避免异步结果落到另一个服务器的表单上。 */
-  function requestClose() {
-    if (busy || testing) return;
-    onClose();
-  }
-
-  return (
-    <Modal
-      open={isOpen}
-      onClose={requestClose}
-      title={initial ? t("servers.editTitle", { name: initial.name }) : t("servers.addTitle")}
-      subtitle={t("servers.formSubtitle")}
-      onEnter={() => {
-        if (!busy && !testing) void save();
-      }}
-      footer={
-        <>
-          <Button
-            variant="secondary"
-            loading={testing}
-            disabled={busy}
-            icon={<Wifi className="size-4" />}
-            onClick={() => void test()}
-          >
-            {t("servers.testConnection")}
-          </Button>
-          <Button variant="secondary" disabled={busy || testing} onClick={requestClose}>
-            {t("common.cancel")}
-          </Button>
-          <Button loading={busy} disabled={testing} onClick={() => void save()}>
-            {t("common.save")}
-          </Button>
-        </>
-      }
-    >
-      <div className="flex flex-col gap-4">
-        <div className="grid grid-cols-2 gap-4">
-          <Field label={t("servers.name")} required>
-            <Input
-              value={draft.name}
-              onChange={(event) => setDraft({ ...draft, name: event.target.value })}
-              placeholder={t("servers.namePlaceholder")}
-            />
-          </Field>
-          <Field label={t("servers.host")} required>
-            <Input
-              value={draft.host}
-              onChange={(event) => setDraft({ ...draft, host: event.target.value })}
-              placeholder={t("servers.hostPlaceholder")}
-            />
-          </Field>
-        </div>
-
-        <div className="grid grid-cols-2 gap-4">
-          <Field label={t("servers.port")}>
-            <Input
-              type="number"
-              value={draft.port}
-              onChange={(event) => setDraft({ ...draft, port: Number(event.target.value) || 22 })}
-            />
-          </Field>
-          <Field label={t("servers.username")} required>
-            <Input
-              value={draft.username}
-              onChange={(event) => setDraft({ ...draft, username: event.target.value })}
-              placeholder="root"
-            />
-          </Field>
-        </div>
-
-        <Field label={t("servers.authType")}>
-          <Select
-            value={draft.auth.type}
-            onChange={(event) => {
-              const type = event.target.value as "password" | "privateKey";
-              if (type === draft.auth.type) return;
-              setDraft({
-                ...draft,
-                auth:
-                  type === "password"
-                    ? { type: "password", password: "" }
-                    : { type: "privateKey", keyPath: "", passphrase: null },
-              });
-            }}
-          >
-            <option value="password">{t("servers.passwordAuth")}</option>
-            <option value="privateKey">{t("servers.keyAuth")}</option>
-          </Select>
-        </Field>
-
-        {draft.auth.type === "password" ? (
-          <Field label={t("servers.password")} required>
-            <Input
-              type="password"
-              value={draft.auth.password}
-              onChange={(event) =>
-                setDraft({ ...draft, auth: { type: "password", password: event.target.value } })
-              }
-              placeholder={t("servers.passwordPlaceholder")}
-            />
-          </Field>
-        ) : (
-          <>
-            <Field label={t("servers.keyPath")} required>
-              <div className="flex gap-2">
-                <Input
-                  value={draft.auth.keyPath}
-                  onChange={(event) =>
-                    setDraft({
-                      ...draft,
-                      auth: {
-                        type: "privateKey",
-                        keyPath: event.target.value,
-                        passphrase: draft.auth.type === "privateKey" ? draft.auth.passphrase : null,
-                      },
-                    })
-                  }
-                  placeholder="C:\Users\you\.ssh\id_rsa"
-                />
-                <Button
-                  variant="secondary"
-                  icon={<FolderOpen className="size-4" />}
-                  onClick={() => void browseKey()}
-                >
-                  {t("servers.browse")}
-                </Button>
-              </div>
-            </Field>
-            <Field label={t("servers.keyPassphrase")} hint={t("servers.keyPassphraseHint")}>
-              <Input
-                type="password"
-                value={draft.auth.type === "privateKey" ? (draft.auth.passphrase ?? "") : ""}
-                onChange={(event) =>
-                  setDraft({
-                    ...draft,
-                    auth: {
-                      type: "privateKey",
-                      keyPath: draft.auth.type === "privateKey" ? draft.auth.keyPath : "",
-                      passphrase: event.target.value || null,
-                    },
-                  })
-                }
-              />
-            </Field>
-          </>
-        )}
-
-        <Field label={t("servers.defaultTargetDir")} hint={t("servers.defaultTargetDirHint")}>
-          <Input
-            value={draft.defaultTargetDir}
-            onChange={(event) => setDraft({ ...draft, defaultTargetDir: event.target.value })}
-            placeholder="/opt/apps/my-app"
-          />
-        </Field>
-      </div>
-    </Modal>
+    </div>
   );
 }

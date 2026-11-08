@@ -1,5 +1,6 @@
-import React, { useEffect, useRef } from "react";
+import React, { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { AlertTriangle, CheckCircle2, Inbox, Info, Loader2, X } from "lucide-react";
+import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 
 import { useApp } from "../lib/store";
@@ -444,6 +445,121 @@ export function ConfirmModal({
         <div className="text-[13px] leading-relaxed text-ink-dim">{description}</div>
       </div>
     </Modal>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// ContextMenu
+// ---------------------------------------------------------------------------
+
+export type ContextMenuRow =
+  | {
+      kind: "item";
+      key: string;
+      label: string;
+      icon?: React.ReactNode;
+      danger?: boolean;
+      disabled?: boolean;
+      onClick: () => void;
+    }
+  | { kind: "divider"; key: string };
+
+/**
+ * 右键菜单：会话树的节点、终端标签、终端区域共用一份。
+ *
+ * 挂到 body 上而不是就地渲染——树那一栏是 `overflow-y-auto` 的，就地画会被裁掉半截；
+ * 坐标先按鼠标位置画，再用布局前的一次测量夹回视口内，菜单不会顶出屏幕右缘。
+ */
+export function ContextMenu({
+  x,
+  y,
+  rows,
+  onClose,
+}: {
+  x: number;
+  y: number;
+  rows: ContextMenuRow[];
+  onClose: () => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  const [pos, setPos] = useState({ x, y });
+
+  // 回调进 ref：调用方每次渲染都换一个新 onClose，不该让这几条全局监听重挂一遍。
+  const closeRef = useRef(onClose);
+  useEffect(() => {
+    closeRef.current = onClose;
+  });
+
+  useLayoutEffect(() => {
+    const box = ref.current?.getBoundingClientRect();
+    if (!box) return;
+    const next = {
+      x: Math.max(8, Math.min(x, window.innerWidth - box.width - 8)),
+      y: Math.max(8, Math.min(y, window.innerHeight - box.height - 8)),
+    };
+    setPos((current) => (current.x === next.x && current.y === next.y ? current : next));
+  }, [x, y]);
+
+  useEffect(() => {
+    const onPointerDown = (event: MouseEvent) => {
+      if (ref.current?.contains(event.target as Node)) return;
+      closeRef.current();
+    };
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      // 捕获阶段先拦下：菜单叠在弹窗上时，Esc 应该只关菜单，不该把弹窗一起关掉。
+      event.preventDefault();
+      event.stopPropagation();
+      closeRef.current();
+    };
+    const dismiss = () => closeRef.current();
+    document.addEventListener("mousedown", onPointerDown, true);
+    document.addEventListener("keydown", onKeyDown, true);
+    window.addEventListener("resize", dismiss);
+    window.addEventListener("scroll", dismiss, true);
+    return () => {
+      document.removeEventListener("mousedown", onPointerDown, true);
+      document.removeEventListener("keydown", onKeyDown, true);
+      window.removeEventListener("resize", dismiss);
+      window.removeEventListener("scroll", dismiss, true);
+    };
+  }, []);
+
+  return createPortal(
+    <div
+      ref={ref}
+      role="menu"
+      className="ui-pop fixed z-[120] min-w-44 p-1 select-none"
+      style={{ left: pos.x, top: pos.y }}
+    >
+      {rows.map((row) =>
+        row.kind === "divider" ? (
+          <div key={row.key} className="my-1 h-px bg-line" />
+        ) : (
+          <button
+            key={row.key}
+            type="button"
+            role="menuitem"
+            disabled={row.disabled}
+            onClick={() => {
+              row.onClick();
+              onClose();
+            }}
+            className={cn(
+              "flex h-7 w-full items-center gap-2 rounded px-2 text-left text-xs transition-colors",
+              row.danger ? "text-neg hover:bg-neg-soft" : "text-ink hover:bg-hover",
+              row.disabled && "pointer-events-none opacity-45",
+            )}
+          >
+            <span className="grid size-3.5 shrink-0 place-items-center text-ink-faint">
+              {row.icon}
+            </span>
+            <span className="min-w-0 truncate">{row.label}</span>
+          </button>
+        ),
+      )}
+    </div>,
+    document.body,
   );
 }
 

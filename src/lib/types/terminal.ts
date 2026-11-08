@@ -24,4 +24,14 @@ export interface TerminalInfo {
 export type TerminalEvent =
   | { type: "opened"; id: string; serverId: string; serverName: string }
   | { type: "data"; id: string; bytes: string }
+  | {
+      /**
+       * 远端起了 ZMODEM 会话（`rz` / `sz`），而这个终端不实现那套协议。
+       *
+       * 只是提示：输出字节一个都没被截走，远端那个 `rz` 该等多久还等多久，所以界面这边
+       * 只能说「请走上传 / 下载」，不能说「已接管」。
+       */
+      type: "zmodemHint";
+      id: string;
+    }
   | { type: "closed"; id: string; reason: string | null };

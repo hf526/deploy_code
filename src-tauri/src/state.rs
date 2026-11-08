@@ -4,7 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use deploy_core::store::TaskLock;
-use deploy_core::{DeployEngine, HostLinkManager, Result, Store, TerminalManager};
+use deploy_core::{
+    DeployEngine, HostLinkManager, Result, Store, TerminalManager, TransferManager,
+};
 use serde::Serialize;
 use tauri::{AppHandle, Manager};
 
@@ -335,6 +337,8 @@ pub struct AppState {
     pub hosts: Arc<HostLinkManager>,
     /// 打开中的交互式终端：每条只是常驻会话上多出来的一条 PTY 通道，不占任务名额。
     pub terminals: Arc<TerminalManager>,
+    /// 进行中的文件传输：每条只是常驻会话上多出来的一路 SFTP，同样不占任务名额。
+    pub transfers: Arc<TransferManager>,
     /// 部署抢占标记：在 prepare 之前原子占位，避免两个并发命令同时通过检查。
     deploy_claim: AtomicBool,
     /// 备份抢占标记：同一时间只允许一个数据库备份。
@@ -373,6 +377,7 @@ impl AppState {
             pending_shutdown: Mutex::new(None),
             hosts: Arc::new(HostLinkManager::new()),
             terminals: TerminalManager::new(),
+            transfers: TransferManager::new(),
             deploy_claim: AtomicBool::new(false),
             backup_claim: AtomicBool::new(false),
             pages_claim: AtomicBool::new(false),

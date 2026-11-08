@@ -8,6 +8,7 @@ import {
   dropTab,
   markTabClosed,
   reconcileTabs,
+  tabCountByServer,
   tabFromInfo,
   type TerminalTab,
 } from "../../lib/terminal";
@@ -25,6 +26,9 @@ export function useTerminalTabs() {
   const [tabs, setTabs] = useState<TerminalTab[]>([]);
   const [activeId, setActiveId] = useState("");
   const [busy, setBusy] = useState(false);
+  // 后台标签来过输出：标签上点一个活动标记，切过去就清。Xshell 的多标签靠这个知道
+  // 「哪台在动」；没有它，长任务跑在后台时界面毫无反馈。
+  const [activity, setActivity] = useState<string[]>([]);
 
   const toast = useApp((state) => state.toast);
   const dispatcherRef = useRef<ReturnType<typeof createDispatcher> | null>(null);
@@ -34,7 +38,17 @@ export function useTerminalTabs() {
   // 关掉标签后要把焦点交给旁边的一个，而那时 setState 还没落地，只能读自己维护的这份快照。
   const tabsRef = useRef<TerminalTab[]>([]);
   tabsRef.current = tabs;
+  const activeIdRef = useRef("");
+  activeIdRef.current = activeId;
   const mountedRef = useRef(true);
+
+  // 切到某个标签（无论哪条路切的）就清掉它的活动标记。
+  const clearActivity = useCallback((id: string) => {
+    setActivity((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : prev));
+  }, []);
+  useEffect(() => {
+    clearActivity(activeId);
+  }, [activeId, clearActivity]);
 
   const attach = useCallback(
     (id: string, sink: Parameters<typeof dispatcher.attach>[1]) => dispatcher.attach(id, sink),
@@ -68,6 +82,7 @@ export function useTerminalTabs() {
       const remaining = dropTab(tabsRef.current, id);
       setTabs(remaining);
       dispatcher.forget(id);
+      clearActivity(id);
       setActiveId((current) => {
         if (current !== id) return current;
         const index = tabsRef.current.findIndex((tab) => tab.id === id);
@@ -76,6 +91,22 @@ export function useTerminalTabs() {
       // 后端关不掉也要把标签从界面上摘掉：留着只会让人以为还连着。
       await api.closeTerminal(id).catch(() => undefined);
     },
+    [dispatcher, clearActivity],
+  );
+
+  /** 关掉除这一个以外的所有标签：标签多了以后「清掉旁边的」比逐个点快得多。 */
+  const closeOthers = useCallback(
+    async (id: string) => {
+      const others = tabsRef.current.filter((tab) => tab.id !== id);
+      if (others.length === 0) return;
+      setTabs(tabsRef.current.filter((tab) => tab.id === id));
+      setActiveId(id);
+      setActivity((prev) => prev.filter((x) => x === id));
+      for (const tab of others) {
+        dispatcher.forget(tab.id);
+        await api.closeTerminal(tab.id).catch(() => undefined);
+      }
+    },
     [dispatcher],
   );
 
@@ -83,6 +114,10 @@ export function useTerminalTabs() {
     switch (event.type) {
       case "data":
         dispatcher.push(event.id, decodeTerminalBytes(event.bytes));
+        // 已在标记里就返回原数组：一次 cat 几千个事件，不能每个都触发重渲染。
+        if (event.id !== activeIdRef.current) {
+          setActivity((prev) => (prev.includes(event.id) ? prev : [...prev, event.id]));
+        }
         break;
       // 通道结束：标签留着（已经打出来的东西还能看、能复制），只是不再接受输入。
       case "closed":
@@ -129,5 +164,18 @@ export function useTerminalTabs() {
     };
   }, []);
 
-  return { tabs, activeId, setActiveId, busy, openFor, closeTab, attach, detach };
+  return {
+    tabs,
+    activeId,
+    setActiveId,
+    busy,
+    activityIds: activity,
+    clearActivity,
+    tabCounts: tabCountByServer(tabs),
+    openFor,
+    closeTab,
+    closeOthers,
+    attach,
+    detach,
+  };
 }

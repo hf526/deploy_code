@@ -87,6 +87,13 @@
   --warn: #d9a445;
   --warn-soft: rgba(217, 164, 69, 0.14);
 
+  /* 终端 ANSI 专用：品红/青要与蓝（brand）分得开，ls --color 与提示符靠它们区分 */
+  --term-magenta: #d2a8ff;
+  --term-cyan: #56d4dd;
+  /* 终端搜索命中底色：addon-search 只收 #RRGGBB，hex 只许落在这一层 */
+  --term-search-match: #6e5a1e;
+  --term-search-active: #d29922;
+
   --scroll-thumb: rgba(255, 255, 255, 0.14);
   --scroll-thumb-hover: rgba(255, 255, 255, 0.26);
 
@@ -164,6 +171,13 @@
   --neg-soft: rgba(207, 63, 69, 0.08);
   --warn: #96690f;
   --warn-soft: rgba(150, 105, 15, 0.1);
+
+  /* 终端 ANSI 专用：浅色下用深一档的品红/青，白底上可读 */
+  --term-magenta: #a626a4;
+  --term-cyan: #0b7285;
+  /* 终端搜索命中底色：浅色下用浅黄，当前命中再深一档 */
+  --term-search-match: #ffefc2;
+  --term-search-active: #f0b429;
 
   --scroll-thumb: rgba(0, 0, 0, 0.18);
   --scroll-thumb-hover: rgba(0, 0, 0, 0.3);

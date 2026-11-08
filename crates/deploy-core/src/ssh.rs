@@ -313,6 +313,79 @@ impl SshClient {
         Ok(())
     }
 
+    /// 在当前这条会话上开一路 SFTP。
+    ///
+    /// 算的是 sshd `MaxSessions` 那一份槽位（与隧道转发、资源探针、终端 PTY 共用），所以调用
+    /// 方用完要把会话关掉，别留着。
+    async fn sftp_session(&self) -> Result<SftpSession> {
+        let channel = self
+            .session
+            .channel_open_session()
+            .await
+            .map_err(|e| CoreError::ssh(format!("打开 SFTP 通道失败: {e}")))?;
+        if let Err(e) = channel.request_subsystem(true, "sftp").await {
+            // 服务器没装 sftp-server（或 Subsystem 被摘了）走的就是这一条：OpenSSH 在
+            // CHANNEL_FAILURE 之后**不**替你把通道收掉，而 russh 对被 drop 的普通通道也不补发
+            // CHANNEL_CLOSE（只有 into_stream() 那条路会）。不在这儿显式 close，每点一次就漏
+            // 一个 session 槽，十次之后隧道与探针一起打不开而会话看着完全健康。
+            let _ = channel.close().await;
+            return Err(CoreError::ssh(format!("启动 SFTP 子系统失败: {e}")));
+        }
+        let sftp = SftpSession::new(channel.into_stream())
+            .await
+            .map_err(|e| CoreError::ssh(format!("初始化 SFTP 失败: {e}")))?;
+        sftp.set_timeout(120);
+        Ok(sftp)
+    }
+
+    /// 远端这一个路径在不在。取消那一步要用它分清「文件其实已经落地」和「真的没传成」。
+    pub async fn remote_exists(&self, path: &str) -> Result<bool> {
+        let sftp = self.sftp_session().await?;
+        let exists = sftp
+            .try_exists(path.to_string())
+            .await
+            .map_err(|e| CoreError::ssh(format!("查看远端文件失败 {path}: {e}")))?;
+        let _ = sftp.close().await;
+        Ok(exists)
+    }
+
+    /// 这一路 SSH 登录默认落在哪个目录——SFTP 服务器建会话时的当前目录就是它。
+    ///
+    /// 终端里的「上传到……」需要一个能改的起点：直接让用户写绝对路径太难猜，`~` 又不能原样
+    /// 交给 SFTP（它按字面路径处理）。取不到就报错，不兜底成 `/`：兜错了会把文件传到用户
+    /// 没打算放的地方，而界面上看着一切正常。
+    pub async fn remote_home(&self) -> Result<String> {
+        let sftp = self.sftp_session().await?;
+        let home = sftp
+            .canonicalize(".")
+            .await
+            .map_err(|e| CoreError::ssh(format!("读取远端主目录失败: {e}")))?;
+        let _ = sftp.close().await;
+        if home.starts_with('/') {
+            Ok(home)
+        } else {
+            Err(CoreError::ssh(format!(
+                "远端主目录不是一个绝对路径（返回的是 {home}），请手动填写绝对路径"
+            )))
+        }
+    }
+
+    /// 远端改名（同一目录内即「先写临时名、成功后落到正式名」那一步）。
+    pub async fn rename_remote(&self, old: &str, new: &str) -> Result<()> {
+        let sftp = self.sftp_session().await?;
+        let result = sftp.rename(old.to_string(), new.to_string()).await;
+        let _ = sftp.close().await;
+        result.map_err(|e| CoreError::ssh(format!("远端改名失败 {old} -> {new}: {e}")))
+    }
+
+    /// 删掉一个远端文件（清理中途失败的半截上传包）。
+    pub async fn remove_remote(&self, path: &str) -> Result<()> {
+        let sftp = self.sftp_session().await?;
+        let result = sftp.remove_file(path.to_string()).await;
+        let _ = sftp.close().await;
+        result.map_err(|e| CoreError::ssh(format!("删除远端文件失败 {path}: {e}")))
+    }
+
     /// 通过 SFTP 上传文件，并回调上传进度。
     pub async fn upload_file(
         &self,
@@ -320,20 +393,7 @@ impl SshClient {
         remote: &str,
         on_progress: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<()> {
-        let channel = self
-            .session
-            .channel_open_session()
-            .await
-            .map_err(|e| CoreError::ssh(format!("打开 SFTP 通道失败: {e}")))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| CoreError::ssh(format!("启动 SFTP 子系统失败: {e}")))?;
-
-        let sftp = SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| CoreError::ssh(format!("初始化 SFTP 失败: {e}")))?;
-        sftp.set_timeout(120);
+        let sftp = self.sftp_session().await?;
 
         let total = std::fs::metadata(local)
             .map_err(|e| CoreError::io_path(local, e))?
@@ -382,20 +442,7 @@ impl SshClient {
         local: &Path,
         on_progress: &mut (dyn FnMut(u64, u64) + Send),
     ) -> Result<()> {
-        let channel = self
-            .session
-            .channel_open_session()
-            .await
-            .map_err(|e| CoreError::ssh(format!("打开 SFTP 通道失败: {e}")))?;
-        channel
-            .request_subsystem(true, "sftp")
-            .await
-            .map_err(|e| CoreError::ssh(format!("启动 SFTP 子系统失败: {e}")))?;
-
-        let sftp = SftpSession::new(channel.into_stream())
-            .await
-            .map_err(|e| CoreError::ssh(format!("初始化 SFTP 失败: {e}")))?;
-        sftp.set_timeout(120);
+        let sftp = self.sftp_session().await?;
 
         let total = sftp
             .metadata(remote.to_string())

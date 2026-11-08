@@ -107,7 +107,9 @@ fn spread_secs(seed: &str, span: u64) -> u64 {
 }
 
 /// 截断来自远端的文本，保证按字符边界切（远端输出是 UTF-8，按字节切会劈开汉字）。
-fn clip(text: &str) -> Option<String> {
+///
+/// 传输那一路的失败原因同样来自远端（SFTP 的错误串长度由服务器决定），共用这一份口径。
+pub(crate) fn clip(text: &str) -> Option<String> {
     let trimmed = text.trim();
     if trimmed.is_empty() {
         return None;

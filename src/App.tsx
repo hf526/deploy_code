@@ -30,7 +30,6 @@ const RepoDetailPage = lazy(() => import("./pages/RepoDetailPage"));
 const ReposPage = lazy(() => import("./pages/ReposPage"));
 const ServersPage = lazy(() => import("./pages/ServersPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
-const TerminalPage = lazy(() => import("./pages/TerminalPage"));
 
 function ReposEntry() {
   const tabs = useApp((state) => state.tabs);
@@ -66,7 +65,8 @@ function TabsAndRoutes() {
             <Route path="/repos/:repoId" element={<RepoDetailPage />} />
             <Route path="/deploy" element={<DeployPage />} />
             <Route path="/servers" element={<ServersPage />} />
-            <Route path="/terminal" element={<TerminalPage />} />
+            {/* 终端并进了服务器工作台（左会话树 + 右标签），旧地址只重定向，不再单独一页。 */}
+            <Route path="/terminal" element={<Navigate to="/servers" replace />} />
             <Route path="/nginx" element={<NginxPage />} />
             <Route path="/containers" element={<ContainersPage />} />
             <Route path="/cron-jobs" element={<CronJobsPage />} />

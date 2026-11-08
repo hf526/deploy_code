@@ -10,6 +10,7 @@ import { pagesCommands } from "./pages";
 import { cronjobCommands } from "./cronjob";
 import { containerCommands } from "./container";
 import { terminalCommands } from "./terminal";
+import { transferCommands } from "./transfer";
 
 /** 后端 Tauri 命令的类型化封装。 */
 export const api = {
@@ -25,4 +26,5 @@ export const api = {
   ...cronjobCommands,
   ...containerCommands,
   ...terminalCommands,
+  ...transferCommands,
 };
