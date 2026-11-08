@@ -139,6 +139,17 @@ export function TerminalWorkspace({
     setFocusedId(activeId);
   }, [activeId]);
 
+  // 焦点不能停在一个已经看不见的 pane 上：关分屏、或关掉正被聚焦的那个标签之后，`focusedId`
+  // 还指着那个 `hidden` 的终端——浏览器把焦点丢回 body（字母键静默丢失，用户以为「终端不响应」），
+  // 而搜索条仍只对看不见的那一个生效（可见端没有高亮、却报着它的命中数）。回落到当前标签并
+  // 把键盘交还给它。
+  useEffect(() => {
+    if (focusedId === activeId || (!!splitId && focusedId === splitId)) return;
+    setFocusedId(activeId);
+    if (!activeId) return;
+    searchHandles.current.get(activeId)?.focus();
+  }, [focusedId, activeId, splitId]);
+
   // 分屏右侧那个 pane 正被看着，不算「后台来过输出」：显示侧已抑制，这里在收拢分屏时
   // 把它可见期间攒下的标记清掉，否则一分屏关闭就冒出一个假活动点。
   useEffect(() => {

@@ -69,7 +69,10 @@ export default function ServersPage() {
   );
 
   useEffect(() => {
-    if (!selectedId && servers.length > 0) setSelectedId(servers[0].id);
+    if (servers.length === 0) return;
+    // 选中的那台被删掉之后要落回一个真实存在的：否则 `plusTarget` 拿着那个死 id 去开终端，
+    // 后端只会回一句「找不到这台服务器」。
+    if (!servers.some((server) => server.id === selectedId)) setSelectedId(servers[0].id);
   }, [selectedId, servers]);
 
   // 别的页面「在某台机器上打开终端」跳过来时带的参数：进来就开一个标签，然后把参数清掉——

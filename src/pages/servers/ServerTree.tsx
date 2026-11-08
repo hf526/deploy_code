@@ -296,9 +296,12 @@ function tunnelBadgeClass(tone: "green" | "amber" | "red" | "gray"): string {
  * 断开只说断开加原因。没有状态（后端这轮没给这一台）不谎报。
  */
 function linkTip(status: ServerHostStatus | undefined): string {
-  if (!status) return i18n.t("servers.linkUnknown");
-  if (status.connected) return i18n.t("servers.linkOnline", { time: status.connectedAt ?? "-" });
-  if (status.retries > 0) {
+  // 与状态点共用 `hostLink` 那一份判定：两套判法会让「刚登记、还没连过」的那几秒出现
+  // 点是灰的（还不知道）、悬停却说「已断开」。
+  const link = hostLink(status).link;
+  if (!status || link === "unknown") return i18n.t("servers.linkUnknown");
+  if (link === "online") return i18n.t("servers.linkOnline", { time: status.connectedAt ?? "-" });
+  if (link === "retrying") {
     return status.lastError
       ? i18n.t("servers.linkRetryingReason", { retries: status.retries, reason: status.lastError })
       : i18n.t("servers.linkRetrying", { retries: status.retries });
