@@ -6,6 +6,7 @@ import {
   ChevronUp,
   Columns2,
   Download,
+  Keyboard,
   ListChecks,
   Minus,
   Plus,
@@ -16,7 +17,14 @@ import {
   X,
 } from "lucide-react";
 
-import { Button, ContextMenu, EmptyState, Input, type ContextMenuRow } from "../../components/ui";
+import {
+  Button,
+  ContextMenu,
+  EmptyState,
+  Input,
+  Modal,
+  type ContextMenuRow,
+} from "../../components/ui";
 import i18n from "../../lib/i18n";
 import {
   CPU_WARN_PERCENT,
@@ -76,6 +84,8 @@ export function TerminalWorkspace({
   onPickTransfer,
   onCancelTransfer,
   onDismissZmodem,
+  onReconnect,
+  reconnectingId,
 }: {
   tabs: TerminalTab[];
   activeId: string;
@@ -99,6 +109,10 @@ export function TerminalWorkspace({
   onPickTransfer: (serverId: string, mode: TransferDirection) => void;
   onCancelTransfer: (id: string) => void;
   onDismissZmodem: () => void;
+  /** 状态栏的重连入口：会话断开时就地重连，不用再开隧道弹窗。 */
+  onReconnect: (serverId: string) => void;
+  /** 正在重连的那一台（转圈用），与树上的行内按钮共用一个状态。 */
+  reconnectingId: string | null;
 }) {
   const { t } = useTranslation();
   const [menu, setMenu] = useState<{ x: number; y: number; tab: TerminalTab } | null>(null);
@@ -111,6 +125,7 @@ export function TerminalWorkspace({
   // 搜索作用于焦点所在的 pane（分屏时两边都可见，只有焦点那边该被搜）。
   const [focusedId, setFocusedId] = useState("");
   const [dims, setDims] = useState<{ cols: number; rows: number } | null>(null);
+  const [helpOpen, setHelpOpen] = useState(false);
   const searchInputRef = useRef<HTMLInputElement>(null);
   const searchHandles = useRef(new Map<string, TerminalSearchHandle>());
   const focusedIdRef = useRef("");
@@ -127,6 +142,18 @@ export function TerminalWorkspace({
   const activeStatus = active
     ? statuses.find((item) => item.serverId === active.serverId)
     : undefined;
+  // 空状态要显示「当前选中了哪台」并把上传 / 下载入口摆出来：以前这两个动作只在有标签时
+  // 才出现在工具栏里，想传个文件得先开一个终端。
+  const selectedServer = servers.find((item) => item.id === selectedServerId);
+  const activeLink = hostLink(activeStatus).link;
+  const activeLinkLabel =
+    activeLink === "online"
+      ? t("servers.linkOnline", { time: activeStatus?.connectedAt ?? "-" })
+      : activeLink === "retrying"
+        ? t("servers.linkRetrying", { retries: activeStatus?.retries ?? 0 })
+        : activeLink === "down"
+          ? t("servers.linkDown")
+          : t("servers.linkUnknown");
 
   // 「+」给谁开标签：有当前标签就跟着它，否则跟着树上选中的那台。
   const plusTarget = active?.serverId || selectedServerId;
@@ -318,18 +345,53 @@ export function TerminalWorkspace({
           <EmptyState
             icon={<TerminalSquare className="size-4.5" />}
             title={t("terminal.emptyTitle")}
-            description={t("terminal.emptyDesc")}
+            description={
+              selectedServer
+                ? t("terminal.emptySelected", {
+                    name: selectedServer.name,
+                    target: `${selectedServer.username}@${selectedServer.host}:${selectedServer.port}`,
+                  })
+                : t("terminal.emptyDesc")
+            }
             action={
-              <Button
-                icon={<Plus className="size-4" />}
-                disabled={!plusTarget || busy}
-                onClick={() => onOpen(plusTarget)}
-              >
-                {t("terminal.openFor")}
-              </Button>
+              <div className="flex flex-col items-center gap-2">
+                <div className="flex flex-wrap items-center justify-center gap-2">
+                  <Button
+                    icon={<Plus className="size-4" />}
+                    disabled={!plusTarget || busy}
+                    onClick={() => onOpen(plusTarget)}
+                  >
+                    {t("terminal.openFor")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    disabled={!selectedServer}
+                    icon={<Upload className="size-4" />}
+                    onClick={() => selectedServer && onPickTransfer(selectedServer.id, "upload")}
+                  >
+                    {t("transfer.uploadButton")}
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    disabled={!selectedServer}
+                    icon={<Download className="size-4" />}
+                    onClick={() => selectedServer && onPickTransfer(selectedServer.id, "download")}
+                  >
+                    {t("transfer.downloadButton")}
+                  </Button>
+                </div>
+                <button
+                  type="button"
+                  className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
+                  onClick={() => setHelpOpen(true)}
+                >
+                  {t("terminal.shortcuts")}
+                </button>
+              </div>
             }
           />
         </div>
+        <ShortcutsModal open={helpOpen} onClose={() => setHelpOpen(false)} />
       </div>
     );
   }
@@ -453,6 +515,9 @@ export function TerminalWorkspace({
               <span className="text-[10px] leading-none">A</span>
             </FontButton>
           </div>
+          <BarButton label={t("terminal.shortcuts")} onClick={() => setHelpOpen(true)}>
+            <Keyboard className="size-3.5" />
+          </BarButton>
         </div>
       </div>
 
@@ -578,8 +643,9 @@ export function TerminalWorkspace({
 
       <div className="flex shrink-0 items-center gap-2.5 border-t border-line bg-panel px-3 py-1 text-[11px] text-ink-dim">
         <span
-          className={cn("size-1.5 shrink-0 rounded-full", hostLinkClass[hostLink(activeStatus).link])}
-          aria-hidden
+          className={cn("size-1.5 shrink-0 rounded-full", hostLinkClass[activeLink])}
+          title={activeLinkLabel}
+          aria-label={activeLinkLabel}
         />
         <span className="min-w-0 truncate font-mono">
           {activeServer
@@ -587,6 +653,29 @@ export function TerminalWorkspace({
             : (active?.serverName ?? "")}
         </span>
         {active?.closed && <span className="shrink-0 text-neg">{t("terminal.closedBadge")}</span>}
+        {/* 断了就地说清楚并给一个重连按钮：以前这里只有一个红点，原因得回左边树上悬停。 */}
+        {activeServer && activeLink !== "online" && (
+          <>
+            <span
+              className={cn(
+                "max-w-48 shrink-0 truncate",
+                activeLink === "retrying" ? "text-warn" : "text-neg",
+              )}
+              title={activeLinkLabel}
+            >
+              {activeLinkLabel}
+            </span>
+            <BarButton
+              label={t("terminal.reconnect")}
+              disabled={reconnectingId === activeServer.id}
+              onClick={() => onReconnect(activeServer.id)}
+            >
+              <RotateCw
+                className={cn("size-3.5", reconnectingId === activeServer.id && "animate-spin")}
+              />
+            </BarButton>
+          </>
+        )}
         <span className="min-w-0 flex-1" />
         <Vitals status={activeStatus} />
         {dims && (
@@ -604,7 +693,49 @@ export function TerminalWorkspace({
           onClose={() => setMenu(null)}
         />
       )}
+
+      <ShortcutsModal open={helpOpen} onClose={() => setHelpOpen(false)} />
     </div>
+  );
+}
+
+/**
+ * 快捷键帮助：这些组合键以前只存在于文档和 title 提示里，用户遇到的第一反应是「怎么复制」。
+ * 这里列的都是 `resolveShortcut` 真正接住的那几条，改动键表时两边一起改。
+ */
+function ShortcutsModal({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const { t } = useTranslation();
+  const rows: { keys: string; labelKey: string }[] = [
+    { keys: "Ctrl+Shift+C", labelKey: "terminal.shortcutCopy" },
+    { keys: "Ctrl+Shift+V", labelKey: "terminal.shortcutPaste" },
+    { keys: "Ctrl+Shift+A", labelKey: "terminal.shortcutSelectAll" },
+    { keys: "Ctrl+Shift+F", labelKey: "terminal.shortcutFind" },
+    { keys: "Ctrl+PageUp / Ctrl+PageDown", labelKey: "terminal.shortcutTabs" },
+    { keys: "Ctrl+Shift+W", labelKey: "terminal.shortcutCloseTab" },
+    { keys: t("terminal.shortcutFontKeys"), labelKey: "terminal.shortcutFont" },
+  ];
+  return (
+    <Modal
+      open={open}
+      onClose={onClose}
+      title={t("terminal.shortcuts")}
+      subtitle={t("terminal.shortcutsSubtitle")}
+      width="max-w-md"
+    >
+      <ul className="flex flex-col gap-2">
+        {rows.map((row) => (
+          <li
+            key={row.labelKey}
+            className="flex items-center justify-between gap-3 rounded-md border border-line bg-field px-3 py-1.5"
+          >
+            <span className="text-[12px] text-ink-dim">{t(row.labelKey)}</span>
+            <kbd className="shrink-0 rounded border border-line bg-panel px-1.5 py-0.5 font-mono text-[11px] text-ink">
+              {row.keys}
+            </kbd>
+          </li>
+        ))}
+      </ul>
+    </Modal>
   );
 }
 

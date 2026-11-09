@@ -21,7 +21,10 @@
     "cronJobs": "定时请求",
     "backups": "数据库备份",
     "history": "记录",
-    "settings": "设置"
+    "settings": "设置",
+    "collapse": "收起侧栏",
+    "expand": "展开侧栏",
+    "themeCycle": "切换主题"
   },
   "titlebar": {
     "minimize": "最小化",
@@ -424,7 +427,7 @@
     "rowMenu": "更多操作",
     "treeEmpty": "还没有登记服务器，点上面的加号添加一台。",
     "treeNoMatch": "没有匹配「{{query}}」的服务器。",
-    "treeHint": "双击打开终端，右键有更多操作。",
+    "treeHint": "双击打开终端，悬停或右键有更多操作。",
     "sampledAt": "采集于",
     "linkUnknown": "还没有这一台的状态读数。",
     "linkOnline": "会话在线 · {{time}}",
@@ -432,11 +435,20 @@
     "linkRetryingReason": "正在重连（第 {{retries}} 次）：{{reason}}",
     "linkDown": "会话未连接",
     "linkDownReason": "会话未连接：{{reason}}",
-    "resizeTree": "拖拽调整会话树宽度"
+    "resizeTree": "拖拽调整会话树宽度",
+    "openTerminal": "打开终端",
+    "copySshAddress": "复制 SSH 地址",
+    "sshAddressCopied": "已复制 SSH 地址：{{address}}",
+    "sshAddressCopyFailed": "复制失败，请手动选择地址",
+    "linkRetryingShort": "重连中 · {{retries}}",
+    "linkDownShort": "已断开",
+    "compactTree": "切换紧凑列表",
+    "detailedTree": "切换详细列表",
+    "reconnectRequested": "已请求重连：{{name}}"
   },
   "terminal": {
     "emptyTitle": "还没有打开的终端",
-    "emptyDesc": "双击左边的服务器即可开一个标签。Ctrl+PageUp/Down 切标签，Ctrl+Shift+C/V 复制粘贴，Ctrl+滚轮调字号。",
+    "emptyDesc": "在左侧选一台服务器再打开终端，或双击直接开。Ctrl+PageUp/Down 切标签，Ctrl+Shift+C/V 复制粘贴，Ctrl+滚轮调字号。",
     "closedBadge": "已结束",
     "closedReason": "会话已结束：{{reason}}",
     "closedPlain": "会话已结束（远端 shell 正常退出）",
@@ -464,7 +476,18 @@
     "findCount": "{{index}} / {{count}}",
     "splitOn": "分屏",
     "splitOff": "关闭分屏",
-    "splitRight": "在右侧分屏显示"
+    "splitRight": "在右侧分屏显示",
+    "shortcuts": "快捷键",
+    "shortcutsSubtitle": "终端与标签的常用快捷键",
+    "shortcutCopy": "复制选中内容",
+    "shortcutPaste": "粘贴",
+    "shortcutSelectAll": "全选",
+    "shortcutFind": "搜索输出",
+    "shortcutTabs": "切换标签",
+    "shortcutCloseTab": "关闭当前标签",
+    "shortcutFontKeys": "Ctrl+滚轮",
+    "shortcutFont": "调整字号",
+    "emptySelected": "当前选中：{{name}}（{{target}}）。双击左侧任一服务器也能直接打开。"
   },
   "transfer": {
     "uploadTitle": "上传到 {{name}}",

@@ -1,31 +1,38 @@
-import { useMemo, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useState, type KeyboardEvent as ReactKeyboardEvent, type MouseEvent } from "react";
 import { useTranslation } from "react-i18next";
 import {
+  AlignJustify,
   Cable,
+  Copy,
+  Download,
   EllipsisVertical,
   KeyRound,
   Lock,
   Plus,
+  RotateCw,
   Settings,
   ShieldCheck,
   TerminalSquare,
   Trash2,
+  Upload,
   Wifi,
 } from "lucide-react";
 
 import { Button, ContextMenu, Input, type ContextMenuRow } from "../../components/ui";
 import i18n from "../../lib/i18n";
 import { hostLink, hostLinkClass, metricsView } from "../../lib/metrics";
+import { stepIndex } from "../../lib/serverTree";
 import { activeTunnelCount, findHostStatus, tunnelTone } from "../../lib/tunnel";
 import { authSummary, cn } from "../../lib/utils";
-import type { ServerConfig, ServerHostStatus } from "../../lib/types";
+import type { ServerConfig, ServerHostStatus, TransferDirection } from "../../lib/types";
 import { MetricsBars } from "./MetricsBars";
 
 /**
  * 会话树：一台一个节点，双击即开终端。
  *
- * 原来那一行六个按钮把「打开终端」和「删除」摆得一样重，中间还空着一大片；现在高频动作
- * 是双击与回车，低频的（配置 / 删除）收进菜单，行内只留一个 `⋯` 入口。
+ * 高频动作（打开终端 / 重连）在悬停时露出行内按钮，低频的（配置 / 删除 / 测试 / 隧道 / 安全 /
+ * 上传下载）收进右键菜单；`⋯` 是给不知道可以右键的人留的入口。搜索框支持 ↑↓ 选行、回车直接
+ * 打开第一台，树本身也可以用方向键上下移动。
  */
 export function ServerTree({
   servers,
@@ -33,7 +40,9 @@ export function ServerTree({
   selectedId,
   tabCounts,
   testingId,
+  compact,
   width,
+  reconnectingId,
   onSelect,
   onOpenTerminal,
   onTest,
@@ -41,6 +50,10 @@ export function ServerTree({
   onSecurity,
   onEdit,
   onDelete,
+  onTransfer,
+  onCopyAddress,
+  onReconnect,
+  onToggleCompact,
   onAdd,
 }: {
   servers: ServerConfig[];
@@ -48,7 +61,9 @@ export function ServerTree({
   selectedId: string;
   tabCounts: Record<string, number>;
   testingId: string | null;
+  compact: boolean;
   width: number;
+  reconnectingId: string | null;
   onSelect: (serverId: string) => void;
   onOpenTerminal: (server: ServerConfig) => void;
   onTest: (server: ServerConfig) => void;
@@ -56,11 +71,21 @@ export function ServerTree({
   onSecurity: (server: ServerConfig) => void;
   onEdit: (server: ServerConfig) => void;
   onDelete: (server: ServerConfig) => void;
+  onTransfer: (server: ServerConfig, mode: TransferDirection) => void;
+  onCopyAddress: (server: ServerConfig) => void;
+  onReconnect: (server: ServerConfig) => void;
+  onToggleCompact: () => void;
   onAdd: () => void;
 }) {
   const { t } = useTranslation();
   const [query, setQuery] = useState("");
+  // 搜索结果里的「光标」：↑↓ 移动，回车打开它（还没移过就打开第一台）。
+  const [cursor, setCursor] = useState(-1);
   const [menu, setMenu] = useState<{ x: number; y: number; server: ServerConfig } | null>(null);
+
+  useEffect(() => {
+    setCursor(-1);
+  }, [query]);
 
   const visible = useMemo(() => {
     const needle = query.trim().toLowerCase();
@@ -80,6 +105,17 @@ export function ServerTree({
     setMenu({ x: event.clientX, y: event.clientY, server });
   }
 
+  /** 行与行之间的方向键：焦点跟着走，选中态跟焦点一致。 */
+  function moveRowFocus(event: ReactKeyboardEvent<HTMLElement>, delta: number) {
+    const list = event.currentTarget.closest("ul");
+    if (!list) return;
+    const rows = Array.from(list.querySelectorAll<HTMLElement>("[data-server-row]"));
+    const next = rows[rows.indexOf(event.currentTarget) + delta];
+    if (!next) return;
+    onSelect(next.dataset.serverRow ?? "");
+    next.focus();
+  }
+
   function menuRows(server: ServerConfig): ContextMenuRow[] {
     return [
       {
@@ -89,6 +125,21 @@ export function ServerTree({
         icon: <TerminalSquare className="size-3.5" />,
         onClick: () => onOpenTerminal(server),
       },
+      {
+        kind: "item",
+        key: "upload",
+        label: t("transfer.uploadButton"),
+        icon: <Upload className="size-3.5" />,
+        onClick: () => onTransfer(server, "upload"),
+      },
+      {
+        kind: "item",
+        key: "download",
+        label: t("transfer.downloadButton"),
+        icon: <Download className="size-3.5" />,
+        onClick: () => onTransfer(server, "download"),
+      },
+      { kind: "divider", key: "d1" },
       {
         kind: "item",
         key: "test",
@@ -111,7 +162,14 @@ export function ServerTree({
         icon: <ShieldCheck className="size-3.5" />,
         onClick: () => onSecurity(server),
       },
-      { kind: "divider", key: "d" },
+      { kind: "divider", key: "d2" },
+      {
+        kind: "item",
+        key: "copy",
+        label: t("servers.copySshAddress"),
+        icon: <Copy className="size-3.5" />,
+        onClick: () => onCopyAddress(server),
+      },
       {
         kind: "item",
         key: "edit",
@@ -140,6 +198,16 @@ export function ServerTree({
         <Button
           size="sm"
           variant="ghost"
+          className={compact ? "bg-chip text-ink" : undefined}
+          title={compact ? t("servers.detailedTree") : t("servers.compactTree")}
+          aria-label={compact ? t("servers.detailedTree") : t("servers.compactTree")}
+          aria-pressed={compact}
+          icon={<AlignJustify className="size-3.5" />}
+          onClick={onToggleCompact}
+        />
+        <Button
+          size="sm"
+          variant="ghost"
           title={t("servers.add")}
           aria-label={t("servers.add")}
           icon={<Plus className="size-3.5" />}
@@ -152,37 +220,64 @@ export function ServerTree({
           className="h-7 text-xs"
           value={query}
           onChange={(event) => setQuery(event.target.value)}
+          onKeyDown={(event) => {
+            if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+              event.preventDefault();
+              setCursor((prev) => stepIndex(prev, event.key === "ArrowDown" ? 1 : -1, visible.length));
+              return;
+            }
+            if (event.key === "Enter") {
+              event.preventDefault();
+              // 箭头移动后过滤条件可能又变短了：落点夹回最后一行，别让回车空按。
+              const index = Math.min(cursor, visible.length - 1);
+              const target = visible[index >= 0 ? index : 0];
+              if (target) onOpenTerminal(target);
+            }
+          }}
           placeholder={t("servers.searchPlaceholder")}
           aria-label={t("servers.searchPlaceholder")}
         />
       </div>
 
       <ul className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-        {visible.map((server) => {
+        {visible.map((server, index) => {
           const status = findHostStatus(statuses, server.id);
           const { link } = hostLink(status);
           const enabledTunnels = activeTunnelCount(server.tunnels);
           const tabs = tabCounts[server.id] ?? 0;
           const selected = server.id === selectedId;
+          const reconnecting = reconnectingId === server.id;
           return (
             <li key={server.id} className="mb-0.5">
               <div
                 role="button"
                 tabIndex={0}
+                data-server-row={server.id}
                 aria-current={selected}
                 title={linkTip(status)}
                 onClick={() => onSelect(server.id)}
+                onFocus={() => onSelect(server.id)}
                 onDoubleClick={() => onOpenTerminal(server)}
                 onContextMenu={(event) => openMenu(event, server)}
                 onKeyDown={(event) => {
-                  if (event.key === "Enter") onOpenTerminal(server);
+                  if (event.key === "Enter") {
+                    event.preventDefault();
+                    onOpenTerminal(server);
+                    return;
+                  }
+                  if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+                    event.preventDefault();
+                    moveRowFocus(event, event.key === "ArrowDown" ? 1 : -1);
+                  }
                 }}
                 className={cn(
-                  "cursor-pointer rounded-md border px-2.5 py-2 transition-colors outline-none",
+                  "group cursor-pointer rounded-md border transition-colors outline-none",
                   "focus-visible:ring-2 focus-visible:ring-brand-line",
+                  compact ? "px-2.5 py-1.5" : "px-2.5 py-2",
                   selected
                     ? "border-brand-line bg-brand-soft"
                     : "border-transparent hover:bg-hover",
+                  index === cursor && "ring-1 ring-brand-line",
                 )}
               >
                 <div className="flex items-center gap-1.5">
@@ -211,6 +306,34 @@ export function ServerTree({
                       {tabs}
                     </span>
                   )}
+                  {/* 悬停才露出的两个高频动作：打开终端 / 重连。平时不占视觉，也不挤占标题。 */}
+                  <button
+                    type="button"
+                    className="grid size-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity group-hover:opacity-100 hover:bg-hover hover:text-ink focus-visible:opacity-100"
+                    aria-label={t("servers.openTerminal")}
+                    title={t("servers.openTerminal")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpenTerminal(server);
+                    }}
+                  >
+                    <TerminalSquare className="size-3.5" />
+                  </button>
+                  {(link === "retrying" || link === "down") && (
+                    <button
+                      type="button"
+                      className="grid size-5 shrink-0 place-items-center rounded text-ink-faint opacity-0 transition-opacity group-hover:opacity-100 hover:bg-hover hover:text-ink focus-visible:opacity-100"
+                      aria-label={t("servers.tunnelReconnect")}
+                      title={t("servers.tunnelReconnect")}
+                      disabled={reconnecting}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        onReconnect(server);
+                      }}
+                    >
+                      <RotateCw className={cn("size-3.5", reconnecting && "animate-spin")} />
+                    </button>
+                  )}
                   <button
                     type="button"
                     className="grid size-5 shrink-0 place-items-center rounded text-ink-faint transition-colors hover:bg-hover hover:text-ink"
@@ -223,8 +346,7 @@ export function ServerTree({
                 </div>
 
                 <p className="mt-0.5 flex items-center gap-1.5 truncate font-mono text-[11px] text-ink-dim">
-                  {/* 认证方式用一个小图标表示（原来那一格 36px 的图标方块在树里放不下），
-                      悬停给的是完整说法：「密钥: id_ed25519」/「密码认证」。 */}
+                  {/* 认证方式用一个小图标表示，悬停给的是完整说法：「密钥: id_ed25519」/「密码认证」。 */}
                   <span
                     className="shrink-0 text-ink-faint"
                     title={authSummary(server)}
@@ -236,14 +358,27 @@ export function ServerTree({
                       <KeyRound className="size-3" />
                     )}
                   </span>
-                  <span className="truncate">
+                  <span className="min-w-0 truncate">
                     {server.username}@{server.host}:{server.port}
                   </span>
+                  {(link === "retrying" || link === "down") && (
+                    <span
+                      className={cn(
+                        "ml-auto shrink-0 font-sans text-[10px]",
+                        link === "retrying" ? "text-warn" : "text-neg",
+                      )}
+                      title={linkTip(status)}
+                    >
+                      {link === "retrying"
+                        ? t("servers.linkRetryingShort", { retries: status?.retries ?? 0 })
+                        : t("servers.linkDownShort")}
+                    </span>
+                  )}
                 </p>
 
-                <MetricsBars view={metricsView(status)} />
+                {!compact && <MetricsBars view={metricsView(status)} />}
 
-                {server.defaultTargetDir && (
+                {!compact && server.defaultTargetDir && (
                   <p
                     className="mt-0.5 truncate font-mono text-[10px] text-ink-faint"
                     title={`${t("servers.defaultTargetDir")} ${server.defaultTargetDir}`}

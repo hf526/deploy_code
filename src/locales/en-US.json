@@ -21,7 +21,10 @@
     "cronJobs": "Scheduled requests",
     "backups": "Database Backups",
     "history": "History",
-    "settings": "Settings"
+    "settings": "Settings",
+    "collapse": "Collapse sidebar",
+    "expand": "Expand sidebar",
+    "themeCycle": "Cycle theme"
   },
   "titlebar": {
     "minimize": "Minimize",
@@ -424,7 +427,7 @@
     "rowMenu": "More actions",
     "treeEmpty": "No server registered yet. Use the plus button above to add one.",
     "treeNoMatch": "No server matches \"{{query}}\".",
-    "treeHint": "Double-click to open a terminal; right-click for more actions.",
+    "treeHint": "Double-click to open a terminal; hover or right-click for more.",
     "sampledAt": "Sampled at",
     "linkUnknown": "No status reading for this host yet.",
     "linkOnline": "Session online - {{time}}",
@@ -432,11 +435,20 @@
     "linkRetryingReason": "Reconnecting (attempt {{retries}}): {{reason}}",
     "linkDown": "Session not connected",
     "linkDownReason": "Session not connected: {{reason}}",
-    "resizeTree": "Drag to resize the session tree"
+    "resizeTree": "Drag to resize the session tree",
+    "openTerminal": "Open terminal",
+    "copySshAddress": "Copy SSH address",
+    "sshAddressCopied": "SSH address copied: {{address}}",
+    "sshAddressCopyFailed": "Copy failed — select the address manually",
+    "linkRetryingShort": "Reconnecting · {{retries}}",
+    "linkDownShort": "Disconnected",
+    "compactTree": "Switch to compact list",
+    "detailedTree": "Switch to detailed list",
+    "reconnectRequested": "Reconnecting: {{name}}"
   },
   "terminal": {
     "emptyTitle": "No terminal open",
-    "emptyDesc": "Double-click a server on the left to open a tab. Ctrl+PageUp/Down switches tabs, Ctrl+Shift+C/V copies and pastes, Ctrl+wheel changes the font size.",
+    "emptyDesc": "Select a server on the left and open a terminal, or double-click to open one. Ctrl+PageUp/Down switch tabs, Ctrl+Shift+C/V copy/paste, Ctrl+wheel zooms.",
     "closedBadge": "Ended",
     "closedReason": "Session ended: {{reason}}",
     "closedPlain": "Session ended (remote shell exited normally)",
@@ -464,7 +476,18 @@
     "findCount": "{{index}} / {{count}}",
     "splitOn": "Split view",
     "splitOff": "Close split",
-    "splitRight": "Show in right split"
+    "splitRight": "Show in right split",
+    "shortcuts": "Keyboard shortcuts",
+    "shortcutsSubtitle": "Common shortcuts for the terminal and tabs",
+    "shortcutCopy": "Copy selection",
+    "shortcutPaste": "Paste",
+    "shortcutSelectAll": "Select all",
+    "shortcutFind": "Search output",
+    "shortcutTabs": "Switch tabs",
+    "shortcutCloseTab": "Close current tab",
+    "shortcutFontKeys": "Ctrl+wheel",
+    "shortcutFont": "Adjust font size",
+    "emptySelected": "Selected: {{name}} ({{target}}). Double-click any server on the left to open it directly."
   },
   "transfer": {
     "uploadTitle": "Upload to {{name}}",

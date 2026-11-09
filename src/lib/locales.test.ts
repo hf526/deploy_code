@@ -87,8 +87,8 @@ describe("界面文案", () => {
       expect(text.includes("\t"), `${name} 不应出现制表符`).toBe(false);
 
       // 行尾必须统一：CRLF 与 LF 混排正是「文本模式写回」留下的痕迹，也是往返检查
-      // 看着通过、写回却改掉整份文件的那种事故。这里不硬钉 CRLF —— Linux 检出会把
-      // 行尾折成 LF，钉死会让别人的机器假失败；要钉死得先加 .gitattributes。
+      // 看着通过、写回却改掉整份文件的那种事故。这里只校验不混用，不硬钉 CRLF
+      // （.gitattributes 已给两份文案声明 eol=crlf，检出会保持 CRLF）。
       const crlf = (text.match(/\r\n/g) ?? []).length;
       const bareLf = (text.match(/(?<!\r)\n/g) ?? []).length;
       expect(

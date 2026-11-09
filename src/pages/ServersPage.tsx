@@ -5,8 +5,14 @@ import { Plus, Server } from "lucide-react";
 
 import { Button, ConfirmModal, EmptyState } from "../components/ui";
 import { api } from "../lib/api";
-import { readStoredFontSizeSafe, writeStoredFontSize } from "../lib/terminal";
-import { clampTreeWidth, readStoredTreeWidthSafe, writeStoredTreeWidth } from "../lib/serverTree";
+import { copyToClipboard, readStoredFontSizeSafe, writeStoredFontSize } from "../lib/terminal";
+import {
+  clampTreeWidth,
+  readStoredCompactSafe,
+  readStoredTreeWidthSafe,
+  writeStoredCompact,
+  writeStoredTreeWidth,
+} from "../lib/serverTree";
 import { useApp } from "../lib/store";
 import { useAutoRefresh } from "../lib/useAutoRefresh";
 import type { ServerConfig, ServerHostStatus, TransferDirection } from "../lib/types";
@@ -48,6 +54,9 @@ export default function ServersPage() {
   const [testingId, setTestingId] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(readStoredFontSizeSafe);
   const [treeWidth, setTreeWidth] = useState(readStoredTreeWidthSafe);
+  // 列表密度与树宽同口径：本机视图偏好，不参与配置导出 / 导入。
+  const [compact, setCompact] = useState(readStoredCompactSafe);
+  const [reconnectingId, setReconnectingId] = useState<string | null>(null);
   // 弹窗只记「哪一台 + 哪个方向」：服务器对象本身交给下面的 find，免得列表刷新后
   // 弹窗里那份旧配置盖掉刚保存过的新值。
   const [transferModal, setTransferModal] = useState<{
@@ -97,6 +106,47 @@ export default function ServersPage() {
   function applyFontSize(value: number) {
     writeStoredFontSize(value);
     setFontSize(value);
+  }
+
+  /** 列表密度：与字号 / 树宽同口径，写盘只在这一个落点。 */
+  function applyCompact(value: boolean) {
+    writeStoredCompact(value);
+    setCompact(value);
+  }
+
+  /**
+   * 点树节点：这台已经开着标签就直接切过去；没有就只选中，开新的仍交给双击 / 悬停按钮。
+   * 「点一下就开」会把标签开满（后端每台只让开 3 个），这里只做「切过去」的顺手动作。
+   */
+  function selectServer(serverId: string) {
+    setSelectedId(serverId);
+    const tab = [...terminal.tabs].reverse().find((item) => item.serverId === serverId);
+    if (tab) terminal.setActiveId(tab.id);
+  }
+
+  async function handleCopyAddress(server: ServerConfig) {
+    const address = `${server.username}@${server.host}:${server.port}`;
+    const ok = await copyToClipboard(address);
+    toast(
+      ok ? "success" : "error",
+      ok ? t("servers.sshAddressCopied", { address }) : t("servers.sshAddressCopyFailed"),
+    );
+  }
+
+  /** 行内 / 状态栏的重连入口：与隧道弹窗同一条命令，等一下让 2 秒轮询把新状态读回来。 */
+  async function handleReconnect(server: ServerConfig) {
+    if (reconnectingId) return;
+    setReconnectingId(server.id);
+    try {
+      await api.reconnectHost(server.id);
+      toast("info", t("servers.reconnectRequested", { name: server.name }));
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      void refreshHosts(true);
+    } catch (error) {
+      toast("error", String(error));
+    } finally {
+      setReconnectingId(null);
+    }
   }
 
   /** 树宽拖拽：mousemove 里只改状态，松手那一次才写盘（与字号同口径的本机偏好）。 */
@@ -188,14 +238,20 @@ export default function ServersPage() {
             selectedId={selectedId}
             tabCounts={terminal.tabCounts}
             testingId={testingId}
+            compact={compact}
             width={treeWidth}
-            onSelect={setSelectedId}
+            reconnectingId={reconnectingId}
+            onSelect={selectServer}
             onOpenTerminal={(server) => void openFor(server.id)}
             onTest={(server) => void handleTest(server)}
             onTunnels={setTunneling}
             onSecurity={setSecuring}
             onEdit={openForm}
             onDelete={setRemoving}
+            onTransfer={(server, mode) => setTransferModal({ serverId: server.id, mode })}
+            onCopyAddress={(server) => void handleCopyAddress(server)}
+            onReconnect={(server) => void handleReconnect(server)}
+            onToggleCompact={() => applyCompact(!compact)}
             onAdd={() => openForm(null)}
           />
 
@@ -238,6 +294,11 @@ export default function ServersPage() {
             onPickTransfer={(serverId, mode) => setTransferModal({ serverId, mode })}
             onCancelTransfer={(transferId) => void fileTransfer.cancel(transferId)}
             onDismissZmodem={() => fileTransfer.dismissZmodem(terminal.activeId)}
+            onReconnect={(serverId) => {
+              const server = servers.find((item) => item.id === serverId);
+              if (server) void handleReconnect(server);
+            }}
+            reconnectingId={reconnectingId}
           />
         </div>
       )}
