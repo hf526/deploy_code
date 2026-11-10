@@ -68,6 +68,7 @@ pub fn run() {
             commands::app::preview_config_import,
             commands::app::import_config,
             commands::app::reveal_path,
+            commands::app::open_external_url,
             commands::app::get_autostart,
             commands::app::set_autostart,
             commands::shutdown::get_shutdown_status,

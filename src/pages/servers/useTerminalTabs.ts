@@ -57,10 +57,10 @@ export function useTerminalTabs() {
   const detach = useCallback((id: string) => dispatcher.detach(id), [dispatcher]);
 
   const openFor = useCallback(
-    async (serverId: string) => {
+    async (serverId: string, tmux: boolean) => {
       setBusy(true);
       try {
-        const info = await api.openTerminal(serverId, INITIAL_DIMS.cols, INITIAL_DIMS.rows);
+        const info = await api.openTerminal(serverId, INITIAL_DIMS.cols, INITIAL_DIMS.rows, tmux);
         if (!mountedRef.current) {
           // 页面已经切走：这条通道没人接，留着就是界面上看不见、却占着一个名额的死标签。
           void api.closeTerminal(info.id).catch(() => undefined);

@@ -5,7 +5,13 @@ import { Plus, Server } from "lucide-react";
 
 import { Button, ConfirmModal, EmptyState } from "../components/ui";
 import { api } from "../lib/api";
-import { copyToClipboard, readStoredFontSizeSafe, writeStoredFontSize } from "../lib/terminal";
+import {
+  copyToClipboard,
+  readStoredFontSizeSafe,
+  readStoredTmuxSafe,
+  writeStoredFontSize,
+  writeStoredTmux,
+} from "../lib/terminal";
 import {
   clampTreeWidth,
   readStoredCompactSafe,
@@ -53,6 +59,7 @@ export default function ServersPage() {
   const [busy, setBusy] = useState(false);
   const [testingId, setTestingId] = useState<string | null>(null);
   const [fontSize, setFontSize] = useState(readStoredFontSizeSafe);
+  const [tmux, setTmux] = useState(readStoredTmuxSafe);
   const [treeWidth, setTreeWidth] = useState(readStoredTreeWidthSafe);
   // 列表密度与树宽同口径：本机视图偏好，不参与配置导出 / 导入。
   const [compact, setCompact] = useState(readStoredCompactSafe);
@@ -93,9 +100,9 @@ export default function ServersPage() {
   useEffect(() => {
     if (!requested) return;
     setSelectedId(requested);
-    void openFor(requested);
+    void openFor(requested, tmux);
     navigate({ pathname: "/servers" }, { replace: true });
-  }, [requested, openFor, navigate]);
+  }, [requested, openFor, navigate, tmux]);
 
   function openForm(server: ServerConfig | null) {
     setEditing(server);
@@ -112,6 +119,12 @@ export default function ServersPage() {
   function applyCompact(value: boolean) {
     writeStoredCompact(value);
     setCompact(value);
+  }
+
+  /** tmux 开关只影响之后开的标签（含重连，它是先关再开）；写盘与字号同口径只有一个落点。 */
+  function applyTmux(value: boolean) {
+    writeStoredTmux(value);
+    setTmux(value);
   }
 
   /**
@@ -242,7 +255,7 @@ export default function ServersPage() {
             width={treeWidth}
             reconnectingId={reconnectingId}
             onSelect={selectServer}
-            onOpenTerminal={(server) => void openFor(server.id)}
+            onOpenTerminal={(server) => void openFor(server.id, tmux)}
             onTest={(server) => void handleTest(server)}
             onTunnels={setTunneling}
             onSecurity={setSecuring}
@@ -271,10 +284,12 @@ export default function ServersPage() {
             servers={servers}
             statuses={hostStatuses}
             fontSize={fontSize}
+            tmux={tmux}
             selectedServerId={selectedId}
             onFontSizeChange={applyFontSize}
+            onTmuxChange={applyTmux}
             onSelect={terminal.setActiveId}
-            onOpen={(serverId) => void openFor(serverId)}
+            onOpen={(serverId) => void openFor(serverId, tmux)}
             onClose={(id) => {
               // 标签没了，挂在它身上的那句 ZMODEM 指路也就没人要看了；留着会让下一个标签
               // 一开就冒出一句没头没尾的提示。closeTab 的 promise 原样交出去。

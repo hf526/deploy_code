@@ -7,6 +7,7 @@ import {
   Columns2,
   Download,
   Keyboard,
+  Layers,
   ListChecks,
   Minus,
   Plus,
@@ -19,6 +20,7 @@ import {
 
 import {
   Button,
+  Checkbox,
   ContextMenu,
   EmptyState,
   Input,
@@ -71,8 +73,10 @@ export function TerminalWorkspace({
   servers,
   statuses,
   fontSize,
+  tmux,
   selectedServerId,
   onFontSizeChange,
+  onTmuxChange,
   onSelect,
   onOpen,
   onClose,
@@ -95,8 +99,11 @@ export function TerminalWorkspace({
   servers: ServerConfig[];
   statuses: ServerHostStatus[];
   fontSize: number;
+  /** 之后开的标签是否包一层 tmux（断线 / 退出后重开同一位次即接回原来那个会话）。 */
+  tmux: boolean;
   selectedServerId: string;
   onFontSizeChange: (value: number) => void;
+  onTmuxChange: (value: boolean) => void;
   onSelect: (id: string) => void;
   onOpen: (serverId: string) => void;
   onClose: (id: string) => Promise<void>;
@@ -380,6 +387,11 @@ export function TerminalWorkspace({
                     {t("transfer.downloadButton")}
                   </Button>
                 </div>
+                {/* 空状态也要有这个开关：第一次开终端之前正是决定要不要 tmux 的时候，
+                    而工具栏在有标签之后才渲染。 */}
+                <Checkbox checked={tmux} onChange={onTmuxChange} className="text-ink-dim">
+                  {t("terminal.tmuxLabel")}
+                </Checkbox>
                 <button
                   type="button"
                   className="text-[11px] text-ink-faint underline underline-offset-2 hover:text-ink"
@@ -488,6 +500,13 @@ export function TerminalWorkspace({
             }}
           >
             <Download className="size-3.5" />
+          </BarButton>
+          <BarButton
+            label={t("terminal.tmuxToggle")}
+            active={tmux}
+            onClick={() => onTmuxChange(!tmux)}
+          >
+            <Layers className="size-3.5" />
           </BarButton>
           <BarButton
             label={splitId ? t("terminal.splitOff") : t("terminal.splitOn")}

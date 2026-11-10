@@ -17,6 +17,8 @@ export const appCommands = {
     invoke<ImportPreview>("preview_config_import", { jsonStr }),
   importConfig: (jsonStr: string) => invoke<ImportPreview>("import_config", { jsonStr }),
   revealPath: (path: string) => invoke<void>("reveal_path", { path }),
+  /** 终端里点到的链接交给系统浏览器：webview 自己开不了新窗口（wry 默认吞掉那个请求）。 */
+  openExternalUrl: (url: string) => invoke<void>("open_external_url", { url }),
   getAutostart: () => invoke<boolean>("get_autostart"),
   setAutostart: (enabled: boolean) => invoke<void>("set_autostart", { enabled }),
   getShutdownStatus: () => invoke<ShutdownStatus>("get_shutdown_status"),

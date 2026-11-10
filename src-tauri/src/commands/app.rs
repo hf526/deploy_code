@@ -276,10 +276,67 @@ pub fn reveal_path(path: String) -> Result<()> {
     Ok(())
 }
 
+/// 只放 http/https 出去：这一句的入参是远端服务器吐出来的文本（终端里的链接），等于不可信
+/// 输入。放开 scheme 就等于让远端能在本机起任意协议处理器，所以宁可拒绝并报错。
+fn external_url_allowed(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.starts_with("https://") || lower.starts_with("http://")
+}
+
+/// 在系统默认浏览器里打开终端里点到的链接。
+///
+/// 为什么不让前端 `window.open`：本应用没设 `on_new_window`，wry 在 WebView2 上对没有
+/// 处理器的新窗口请求直接 `SetHandled(true)` 吞掉——addon 看着挂上了，点了却毫无反应。
+/// 与 `reveal_path` 同形：整条 URL 作为一个 argv 交出去，不经 shell 解析。
+#[tauri::command(async)]
+pub fn open_external_url(url: String) -> Result<()> {
+    if !external_url_allowed(&url) {
+        return Err(CoreError::config(
+            "只支持在浏览器里打开 http / https 链接",
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("explorer").arg(&url).spawn();
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+
+    let child = result.map_err(|e| CoreError::Process(format!("打开链接失败: {e}")))?;
+    std::thread::spawn(move || {
+        let mut child = child;
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use deploy_core::models::DbBackupSource;
+
+    /// 链接来自远端吐出来的文本，scheme 必须白名单：放开 `file:` / 自定义协议就等于让
+    /// 服务器在本机起任意处理器。大小写混写要认（URI 的 scheme 本来就大小写不敏感）。
+    #[test]
+    fn only_http_and_https_links_reach_the_system_browser() {
+        assert!(external_url_allowed("https://example.com/a?b=1#c"));
+        assert!(external_url_allowed("http://192.168.1.1:8080/"));
+        assert!(external_url_allowed("HTTPS://example.com"));
+        for refused in [
+            "file:///C:/Windows/win.ini",
+            "javascript:alert(1)",
+            "ftp://example.com/x",
+            "ms-settings:windowsupdate",
+            "explorer.exe",
+            " https://example.com",
+            "",
+        ] {
+            assert!(!external_url_allowed(refused), "不该放出去：{refused}");
+        }
+    }
 
     fn backup_config(id: &str) -> BackupConfig {
         let mut config = BackupConfig::new(

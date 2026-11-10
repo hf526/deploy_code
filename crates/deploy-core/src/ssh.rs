@@ -269,10 +269,17 @@ impl SshClient {
     /// `want_reply` 一律传 false：russh 的 `ChannelMsg` 里没有「请求应答」这一类消息，
     /// 要一个收不到的确认只会白挂着。服务器拒绝分配 PTY 时这条通道会当场关闭，由读到的
     /// 那一侧结束来暴露，不在这里猜。
+    ///
+    /// `command` 为 `Some` 时走 exec 而不是 shell：PTY 已经分配好了，远端由 sshd 用登录
+    /// shell 跑这一句（`tmux new -A -s …` 就是这么进去的）。不选「先起 shell 再把命令当
+    /// 键盘输入敲进去」那条路——那样命令行会回显在屏幕上，而且它进的是用户的交互 shell，
+    /// 前面任何一句 rc 里的输出都会混进第一屏。命令跑完通道即结束，失败（比如没装 tmux）
+    /// 由退出码与 stderr 明说，不偷偷退回普通 shell。
     pub async fn open_shell(
         &self,
         cols: u16,
         rows: u16,
+        command: Option<&str>,
     ) -> Result<(ChannelReadHalf, ChannelWriteHalf<client::Msg>)> {
         let channel = self
             .session
@@ -291,10 +298,16 @@ impl SshClient {
             )
             .await
             .map_err(|e| CoreError::ssh(format!("申请伪终端失败: {e}")))?;
-        channel
-            .request_shell(false)
-            .await
-            .map_err(|e| CoreError::ssh(format!("启动远端 shell 失败: {e}")))?;
+        match command {
+            Some(command) => channel
+                .exec(false, command)
+                .await
+                .map_err(|e| CoreError::ssh(format!("启动远端命令失败: {e}")))?,
+            None => channel
+                .request_shell(false)
+                .await
+                .map_err(|e| CoreError::ssh(format!("启动远端 shell 失败: {e}")))?,
+        }
         // 拆成读写两半：读的那半归采集任务循环，写的那半留着收键盘输入与窗口尺寸变化。
         Ok(channel.split())
     }

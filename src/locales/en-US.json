@@ -477,6 +477,8 @@
     "splitOn": "Split view",
     "splitOff": "Close split",
     "splitRight": "Show in right split",
+    "tmuxToggle": "Wrap new tabs in tmux: reopening after a disconnect or app exit resumes the same session",
+    "tmuxLabel": "Use a tmux session for new tabs (resumes after a disconnect; requires tmux on the server)",
     "shortcuts": "Keyboard shortcuts",
     "shortcutsSubtitle": "Common shortcuts for the terminal and tabs",
     "shortcutCopy": "Copy selection",

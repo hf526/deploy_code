@@ -30,6 +30,34 @@ pub const MAX_TERMINALS_PER_SERVER: usize = 3;
 pub const MAX_TERMINALS_TOTAL: usize = 8;
 /// 一次键盘输入的最大字节数：粘贴一大段文本要能过去，但不许把排队变成无界。
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
+/// tmux 会话名的前缀，后面接这一台当前标签的位次（`deploycode-1`）。
+const TMUX_SESSION_PREFIX: &str = "deploycode";
+
+/// 开标签时要跑的那一句：`-A` 让「已存在就接上、不存在才新建」合成一步。
+///
+/// 会话名带位次而不是全机共用一个 `deploycode`：共用的话第二个标签会 attach 到同一个会话，
+/// 两个标签变成同一块屏幕的镜像，在一个里敲字另一个跟着动——多标签就白做了。
+///
+/// 位次怎么挑见 [`free_tmux_index`]。断线重连能接回原来那一个：重连是「先关再开」（见界面
+/// 的 `reconnect`），旧通道一关它那个位次就空了出来，而 tmux 会话在客户端 detach 之后仍留
+/// 在服务器上，跑着的构建也就还在。
+fn tmux_command(index: usize) -> String {
+    let session = format!("{TMUX_SESSION_PREFIX}-{index}");
+    format!("tmux new -A -s {}", crate::process::shell_quote(&session))
+}
+
+/// 给新标签挑一个没被占用的会话位次：从 1 起找第一个空位。
+///
+/// 不用「这一台当前标签数 + 1」：关掉中间那个再开一个新的，数出来的位次会与还活着的那条
+/// 重合，而 `-A` 遇到已存在的会话是 attach——两个活标签共用一块屏幕。找空位则保证活着的
+/// 标签各占一个会话，同时把刚空出来的那个留给重连。
+fn free_tmux_index(taken: &[Option<usize>]) -> usize {
+    let mut index = 1;
+    while taken.contains(&Some(index)) {
+        index += 1;
+    }
+    index
+}
 
 /// 一个终端标签的对外信息（界面重载后用它对账哪些标签还活着）。
 #[derive(Debug, Clone, Serialize)]
@@ -73,6 +101,8 @@ struct ActiveTerminal {
     info: TerminalInfo,
     writer: Arc<ShellWriter>,
     reader: tokio::task::AbortHandle,
+    /// 这一条占着的 tmux 会话位次；没勾 tmux 就是 `None`（不占位次）。
+    tmux_index: Option<usize>,
 }
 
 /// 终端登记表。与部署/备份那四类长任务不同，终端**不占任务名额**：多标签并发是常态，
@@ -92,6 +122,11 @@ impl TerminalManager {
 
     /// 在 `client` 这条已在线的会话上开一个终端，并把输出交给 `on_event`。
     ///
+    /// `tmux` 为真时远端跑的是 `tmux new -A -s deploycode-N` 而不是登录 shell：断线、关标签、
+    /// 退出软件都只是 detach，服务器上的会话与里面跑着的东西都还在，下次开同一位次即接回。
+    /// 没装 tmux 的机器上这一句会以 127 退出，通道当场结束、原因写在标签上——不静默退回
+    /// 普通 shell，否则用户以为续得上，其实每次都是新会话。
+    ///
     /// 要 `&Arc<Self>`：读的那一半跑完时必须把这一条从登记表里摘掉，否则死标签会一直占着
     /// 名额，而界面看到的是「这台已经开满 3 个」。
     pub async fn open<F>(
@@ -101,17 +136,32 @@ impl TerminalManager {
         server_name: &str,
         cols: u16,
         rows: u16,
+        tmux: bool,
         on_event: F,
     ) -> Result<TerminalInfo>
     where
         F: Fn(TerminalEvent) + Send + Sync + 'static,
     {
         let _guard = self.opening.lock().await;
-        if let Some(message) = self.cap_message(server_id, server_name) {
+        // 锁不能跨 await：这里先把要用的两份快照取出来，std 的 guard 在块尾就放掉。
+        let (infos, taken) = {
+            let running = lock(&self.running);
+            let infos: Vec<TerminalInfo> = running.values().map(|e| e.info.clone()).collect();
+            let taken: Vec<Option<usize>> = running
+                .values()
+                .filter(|e| e.info.server_id == server_id)
+                .map(|e| e.tmux_index)
+                .collect();
+            (infos, taken)
+        };
+        let per_server = count_for_server(&infos, server_id);
+        if let Some(message) = cap_message_for(per_server, infos.len(), server_name) {
             return Err(CoreError::ssh(message));
         }
 
-        let (reader, writer) = client.open_shell(cols, rows).await?;
+        let tmux_index = tmux.then(|| free_tmux_index(&taken));
+        let command = tmux_index.map(tmux_command);
+        let (reader, writer) = client.open_shell(cols, rows, command.as_deref()).await?;
         let id = uuid::Uuid::new_v4().to_string();
         let info = TerminalInfo {
             id: id.clone(),
@@ -142,6 +192,7 @@ impl TerminalManager {
                 info: info.clone(),
                 writer,
                 reader: handle.abort_handle(),
+                tmux_index,
             },
         );
         // 登记与读任务自己摘除之间隔着一次线程调度：任务如果在我们登记之前就已完成（通道
@@ -186,7 +237,8 @@ impl TerminalManager {
     /// 关掉一个标签（用户点标签上的 ×，或界面重载后清理孤儿标签）。
     ///
     /// 没有「挨个关掉所有标签」那一步：退出清理只要会话一收（`hosts.stop_all()`），远端
-    /// 那些 shell 就随传输一起没了，本机通道也当场读不到东西。
+    /// 那些 shell 就随传输一起没了，本机通道也当场读不到东西。勾了 tmux 的那一支除外——
+    /// 关通道只是让远端那个 tmux 客户端 detach，会话留在服务器上（这正是勾它的目的）。
     pub async fn close(&self, id: &str) -> Result<()> {
         let entry = self.take(id)?;
         shutdown_terminal(entry).await;
@@ -206,18 +258,6 @@ impl TerminalManager {
                 .then_with(|| a.id.cmp(&b.id))
         });
         list
-    }
-
-    /// 上限判定：先看这一台，再看全局。
-    ///
-    /// 分组只认 `server_id`：名字是给用户看的，两台同名机器很常见，按名字算会让第一台把
-    /// 第二台的名额吃掉，而错误信息还指着错的机器。
-    fn cap_message(&self, server_id: &str, server_name: &str) -> Option<String> {
-        let infos: Vec<TerminalInfo> = lock(&self.running)
-            .values()
-            .map(|entry| entry.info.clone())
-            .collect();
-        cap_message_for(count_for_server(&infos, server_id), infos.len(), server_name)
     }
 
     fn writer(&self, id: &str) -> Result<Arc<ShellWriter>> {
@@ -256,6 +296,10 @@ fn cap_message_for(per_server: usize, total: usize, server_name: &str) -> Option
 }
 
 /// 这一台已经占着的标签数。
+///
+/// 只认 `server_id`：名字是给用户看的，两台同名机器很常见，按名字算会让第一台把第二台的
+/// 名额吃掉，而错误信息还指着错的机器。tmux 的会话位次也取自这里，同一台的两条通道必须
+/// 落到两个不同的会话上。
 fn count_for_server(infos: &[TerminalInfo], server_id: &str) -> usize {
     infos.iter().filter(|info| info.server_id == server_id).count()
 }
@@ -446,6 +490,52 @@ mod tests {
             .expect("要被拒绝");
         assert!(message.contains("深圳"), "{message}");
         assert!(!message.contains("总数"), "该报的是这一台：{message}");
+    }
+
+    /// tmux 那一支必须带 `-A`：少了它，重连就是「新建一个会话」而不是接回原来那一个，
+    /// 跑着的构建也就续不上。会话名照样过 shell_quote（红线：远端命令不许裸拼）。
+    #[test]
+    fn tmux_command_attaches_and_quotes_the_session_name() {
+        let command = tmux_command(2);
+        assert!(command.starts_with("tmux new -A -s "), "{command}");
+        assert_eq!(
+            command,
+            format!("tmux new -A -s {}", crate::process::shell_quote("deploycode-2"))
+        );
+        assert_ne!(
+            tmux_command(1),
+            tmux_command(2),
+            "两个标签共用一个会话就变成同一块屏幕的镜像了"
+        );
+    }
+
+    /// 挑空位而不是「数量 + 1」：关掉中间那个再开新的，数量算出来的位次会撞上还活着的
+    /// 那一条，而 `-A` 撞上就是 attach，两个活标签变成同一块屏幕的镜像。
+    #[test]
+    fn a_new_tab_never_shares_a_session_with_a_live_one() {
+        assert_eq!(free_tmux_index(&[]), 1);
+        assert_eq!(free_tmux_index(&[Some(1)]), 2);
+        // 1 号被关了、2 号还活着：新标签补 1 号那个空位，不去撞 2 号。
+        assert_eq!(free_tmux_index(&[Some(2)]), 1);
+        assert_ne!(free_tmux_index(&[Some(2)]), 2, "数量 + 1 在这里就会撞车");
+        // 没勾 tmux 的那条不占位次。
+        assert_eq!(free_tmux_index(&[None, Some(1)]), 2);
+    }
+
+    /// 断线重连要接回**同一个**会话：重连是先关再开，旧条目一摘它那个位次就空出来，
+    /// 挑回来的正是原来那一个（而不是新建一个，那样跑着的构建就续不上了）。
+    #[test]
+    fn reconnect_lands_on_the_same_tmux_session() {
+        let live = [Some(1), Some(2), Some(3)];
+        assert_eq!(free_tmux_index(&live[..1]), 2, "开第二个时只有 1 号占着");
+        // 2 号断线：读任务把它从登记表摘掉，1 与 3 还活着。
+        let after: Vec<Option<usize>> = live.into_iter().filter(|index| *index != Some(2)).collect();
+        assert_eq!(free_tmux_index(&after), 2, "空出来的正是它原来那一个");
+        assert_eq!(
+            tmux_command(free_tmux_index(&after)),
+            tmux_command(2),
+            "重连要接回原来那一个会话"
+        );
     }
 
     /// 输出必须是原样的字节：控制序列与 UTF-8 边界都靠 base64 保住。

@@ -477,6 +477,8 @@
     "splitOn": "分屏",
     "splitOff": "关闭分屏",
     "splitRight": "在右侧分屏显示",
+    "tmuxToggle": "新标签包一层 tmux：断线或退出软件后重开，接回原来那个会话",
+    "tmuxLabel": "新标签用 tmux 会话（断线后重连可接回，需要服务器装有 tmux）",
     "shortcuts": "快捷键",
     "shortcutsSubtitle": "终端与标签的常用快捷键",
     "shortcutCopy": "复制选中内容",

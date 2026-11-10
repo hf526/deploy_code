@@ -2,6 +2,8 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebLinksAddon } from "@xterm/addon-web-links";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { ClipboardPaste, Copy, Eraser, SquareDashedMousePointer } from "lucide-react";
@@ -166,8 +168,9 @@ export function TerminalView({
       cursorBlink: true,
       // 搜索高亮走 registerDecoration，xterm 6 仍把它归在 proposed API 后面，不开就抛异常。
       allowProposedApi: true,
-      // 3000 行够回滚一次构建日志；再多就是拿内存换一个看不到的地方。
-      scrollback: 3000,
+      // 一次构建日志动辄上万行，3000 行滚回去半截就没了；20000 行是主流客户端的量级，
+      // 内存换的是「出错时能翻回第一个报错」。
+      scrollback: 20000,
       // 等宽字体直接取这个元素算出来的 font-family：容器上挂着 .font-mono，取到的就是界面
       // 现在真正在用的那一套，不必再抄一份字体栈进来。
       fontFamily: getComputedStyle(host).fontFamily,
@@ -178,6 +181,17 @@ export function TerminalView({
     term.loadAddon(fit);
     const search = new SearchAddon();
     term.loadAddon(search);
+    // 装上还不够：默认宽度表仍是 Unicode 6，中文与 emoji 按旧表算成半角，vim / tmux 里
+    // 光标与文本会错列。
+    term.loadAddon(new Unicode11Addon());
+    term.unicode.activeVersion = "11";
+    // 链接交给系统浏览器，不用 addon 默认的 window.open：本应用没设 on_new_window，
+    // wry 对没有处理器的新窗口请求直接吞掉，点了毫无反应。
+    term.loadAddon(
+      new WebLinksAddon((_event, uri) => {
+        void api.openExternalUrl(uri).catch((err) => toast("error", String(err)));
+      }),
+    );
     term.open(host);
     termRef.current = term;
     fitRef.current = fit;

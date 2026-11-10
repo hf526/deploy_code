@@ -3,6 +3,8 @@
 //! 业务逻辑都在 `deploy_core::terminal`，这一层只做参数校验、事件转发与登记。
 //! 终端**不占任务名额**：它只是已有会话上多出来的一条通道，跟部署/备份/容器任务不互斥，
 //! 所以也不参与退出清理——会话一收（`hosts.stop_all()`）远端那些 shell 就随传输一起没了。
+//! 勾了 tmux 的那一支是例外：远端跑的是 tmux 客户端，会话一收它只是 detach，服务器上的
+//! 会话与里面跑着的构建都还在，下次开同一位次即接回。
 
 use deploy_core::{CoreError, Result, Store, TerminalInfo};
 use tauri::{AppHandle, Emitter, State};
@@ -34,6 +36,7 @@ pub async fn open_terminal(
     server_id: String,
     cols: u16,
     rows: u16,
+    tmux: bool,
 ) -> Result<TerminalInfo> {
     check_dims(cols, rows)?;
     let config = state.store.load_config()?;
@@ -48,7 +51,7 @@ pub async fn open_terminal(
     let terminals = state.terminals.clone();
     let emit_app = app.clone();
     terminals
-        .open(client, &server.id, &server.name, cols, rows, move |event| {
+        .open(client, &server.id, &server.name, cols, rows, tmux, move |event| {
             let _ = emit_app.emit(EVENT_TOPIC, &event);
         })
         .await

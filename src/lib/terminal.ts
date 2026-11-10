@@ -282,6 +282,40 @@ export function readStoredFontSizeSafe(): number {
 }
 
 // ---------------------------------------------------------------------------
+// tmux 会话
+// ---------------------------------------------------------------------------
+
+/**
+ * 新标签是否包一层 tmux（远端跑 `tmux new -A -s deploycode-N`）。
+ *
+ * 与字号同例属于本机使用习惯，不进 settings：它不该被配置导入盖掉，也不参与导出抹凭据
+ * 那两条不变量。默认关——不是每台机器都装了 tmux，而勾上之后没装的那台会以 127 退出、
+ * 标签当场结束，这个决定该由用户按机器情况自己按下去。
+ */
+export const TMUX_STORAGE_KEY = "deploycode:terminal.tmux";
+
+/** 只认字面量 "true"：盘上可能是别的版本写的东西，认不出就当没勾。 */
+export function readStoredTmux(raw: string | null): boolean {
+  return raw === "true";
+}
+
+export function writeStoredTmux(value: boolean): void {
+  try {
+    localStorage.setItem(TMUX_STORAGE_KEY, value ? "true" : "false");
+  } catch {
+    // 隐私模式 / WebView 禁写：这一次照样生效，只是下次进来回到默认。
+  }
+}
+
+export function readStoredTmuxSafe(): boolean {
+  try {
+    return readStoredTmux(localStorage.getItem(TMUX_STORAGE_KEY));
+  } catch {
+    return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 快捷键
 // ---------------------------------------------------------------------------
 

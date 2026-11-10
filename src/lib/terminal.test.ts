@@ -14,6 +14,7 @@ import {
   normalizeSplit,
   pickSplitTarget,
   readStoredFontSize,
+  readStoredTmux,
   reconcileTabs,
   resolveShortcut,
   searchDecorations,
@@ -325,6 +326,19 @@ describe("字号", () => {
   it("盘上越界的值夹回端点，认得出的数字不会被当成没读到", () => {
     expect(readStoredFontSize("18")).toBe(18);
     expect(readStoredFontSize("40")).toBe(FONT_SIZE_MAX);
+  });
+});
+
+describe("tmux 开关", () => {
+  it("默认关：没读到、空串、认不出的值都当没勾", () => {
+    // 默认必须是关：不是每台机器都装了 tmux，勾上之后没装的那台会当场以 127 退出。
+    for (const raw of [null, "", "false", "1", "TRUE", "yes", "on"]) {
+      expect(readStoredTmux(raw)).toBe(false);
+    }
+  });
+
+  it("只认自己写下去的那个字面量", () => {
+    expect(readStoredTmux("true")).toBe(true);
   });
 });
 
