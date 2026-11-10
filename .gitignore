@@ -16,3 +16,8 @@ pages.json
 
 # scripts/shot.mjs 的输出：界面截图与 headless Chrome profile
 tmp_shots*/
+# 验收截图、工具本地状态与误放到根目录的安装包
+shots/
+.arts/
+.zcode/
+/DeployCode_*.exe
