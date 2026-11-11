@@ -26,6 +26,56 @@ export interface DeployRecord {
   startedAt: string;
   finishedAt: string | null;
   durationMs: number;
+  /** 失败后生成的 AI 诊断结果；旧记录没有该字段。 */
+  aiDiagnosis: AiDiagnosis | null;
+}
+
+/** AI 诊断的置信度。 */
+export type AiConfidence = "high" | "medium" | "low";
+
+/** 后端预置的只读诊断命令（枚举即白名单，模型只能挑选 id）。 */
+export type DiagnosticCommandId =
+  | "diskUsage"
+  | "memory"
+  | "failedServices"
+  | "targetDir"
+  | "docker";
+
+/** 诊断结果里允许一键执行的动作。 */
+export type AiFixAction =
+  | { type: "redeploy" }
+  | { type: "openTerminal" }
+  | { type: "runDiagnostic"; command: DiagnosticCommandId };
+
+/** 一次 AI 失败诊断的结果。 */
+export interface AiDiagnosis {
+  summary: string;
+  likelyCause: string;
+  confidence: AiConfidence;
+  steps: string[];
+  /** 后端已按白名单过滤；凭据类怀疑一律为空。 */
+  actions: AiFixAction[];
+  /** 参与分析的脱敏日志字节数。 */
+  logBytes: number;
+  credentialSuspect: boolean;
+  credentialNote: string | null;
+  model: string;
+  analyzedAt: string;
+}
+
+/** 发送前预览：真正要发给模型的脱敏上下文。 */
+export interface DiagnosisPreview {
+  context: string;
+  logBytes: number;
+  totalBytes: number;
+}
+
+/** 一条只读诊断命令的执行结果。 */
+export interface DiagnosticOutput {
+  command: DiagnosticCommandId;
+  code: number;
+  output: string;
+  truncated: boolean;
 }
 
 export interface DeployRequest {

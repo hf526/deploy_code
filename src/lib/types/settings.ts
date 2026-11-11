@@ -16,6 +16,12 @@ export interface Settings {
   githubToken: string;
   /** cron-job.org 的 API Key（控制台生成）；未填写时定时请求页会引导去设置。 */
   cronjobApiKey: string;
+  /** AI 失败诊断：OpenAI 兼容接口的 Base URL（留空表示未启用）。 */
+  aiBaseUrl: string;
+  /** AI 失败诊断的 API Key（明文存于 config.json，导出时抹除）。 */
+  aiApiKey: string;
+  /** AI 失败诊断使用的模型名。 */
+  aiModel: string;
   pagesHistoryLimit: number;
   /** 容器备份/迁移记录的保留条数。 */
   containerHistoryLimit: number;

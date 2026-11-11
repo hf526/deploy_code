@@ -13,7 +13,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { DiffView } from "../../components/CodeView";
+import { DiffView } from "./CodeView";
 import { Button, EmptyState } from "../../components/ui";
 import { highlightCode } from "../../lib/highlight";
 import { cn } from "../../lib/utils";

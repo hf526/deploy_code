@@ -36,6 +36,7 @@ pub(crate) fn config_with_secrets() -> AppConfig {
     let mut settings = Settings::default();
     settings.github_token = "gh_secret".to_string();
     settings.cronjob_api_key = "cj_secret".to_string();
+    settings.ai_api_key = "ai_secret".to_string();
     AppConfig {
         servers: vec![server],
         repos: vec![repo],

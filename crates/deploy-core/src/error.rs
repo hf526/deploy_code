@@ -35,6 +35,9 @@ pub enum CoreError {
     #[error("定时请求服务调用失败：{0}")]
     CronJob(String),
 
+    #[error("AI 诊断失败：{0}")]
+    Diagnosis(String),
+
     #[error("IO 错误：{0}")]
     Io(#[from] std::io::Error),
 
@@ -90,6 +93,10 @@ impl CoreError {
 
     pub fn cronjob(msg: impl Into<String>) -> Self {
         Self::CronJob(msg.into())
+    }
+
+    pub fn diagnosis(msg: impl Into<String>) -> Self {
+        Self::Diagnosis(msg.into())
     }
 
     pub fn io_path(path: impl Into<PathBuf>, err: std::io::Error) -> Self {

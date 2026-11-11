@@ -971,7 +971,7 @@ pub fn is_sensitive_path(path: &str) -> bool {
 /// git 失败的 stderr 与命令参数都可能带着内嵌口令的远端 URL（`fatal: unable to access
 /// 'https://user:token@…'`），这条消息会进任务日志与记录；同一行里 URL 还可能
 /// 出现多次，不能只遮第一处。URL 的边界取空白与常见引用符，遮不到的尾巴维持原文。
-fn mask_remote_urls_in_text(text: &str) -> String {
+pub(crate) fn mask_remote_urls_in_text(text: &str) -> String {
     const BOUNDARIES: &[char] = &[
         ' ', '\t', '\n', '\r', '\'', '"', '(', ')', '[', ']', '<', '>', ',', ';',
     ];

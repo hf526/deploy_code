@@ -2,9 +2,9 @@ import { useEffect, useState } from "react";
 import { Plus } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { Button, Field, Input, Modal, Select } from "./ui";
-import type { BackupTarget, ServerConfig } from "../lib/types";
-import { maskUrlPassword } from "../lib/utils";
+import { Button, Field, Input, Modal, Select } from "../../components/ui";
+import type { BackupTarget, ServerConfig } from "../../lib/types";
+import { maskUrlPassword } from "../../lib/utils";
 
 const DEFAULT_PG_PORT = 5432;
 

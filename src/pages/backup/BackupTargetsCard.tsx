@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Plus, Save, Server, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 
-import { BackupTargetFromServerModal } from "../../components/BackupTargetFromServerModal";
+import { BackupTargetFromServerModal } from "./BackupTargetFromServerModal";
 import { Button, Card, Field, Input, SectionTitle, Select } from "../../components/ui";
 import { api } from "../../lib/api";
 import { useApp } from "../../lib/store";

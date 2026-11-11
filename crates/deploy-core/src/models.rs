@@ -581,6 +581,61 @@ pub struct DeployRecord {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub duration_ms: u64,
+    /// 失败后一次性生成的 AI 诊断结果（旧记录没有这个字段）。
+    #[serde(default)]
+    pub ai_diagnosis: Option<AiDiagnosis>,
+}
+
+/// AI 诊断的置信度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AiConfidence {
+    High,
+    Medium,
+    Low,
+}
+
+/// 可一键执行的只读诊断命令。枚举本身就是白名单：模型只能从中挑选，
+/// 不能自带命令或参数。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DiagnosticCommandId {
+    DiskUsage,
+    Memory,
+    FailedServices,
+    TargetDir,
+    Docker,
+}
+
+/// 诊断结果里允许用户一键执行的动作。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", tag = "type")]
+pub enum AiFixAction {
+    /// 按这条记录重新部署一次。
+    Redeploy,
+    /// 跳到这台服务器的交互式终端，由用户自己排查。
+    OpenTerminal,
+    /// 执行一条预定义的只读诊断命令。
+    RunDiagnostic { command: DiagnosticCommandId },
+}
+
+/// 一次 AI 失败诊断的结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiDiagnosis {
+    pub summary: String,
+    pub likely_cause: String,
+    pub confidence: AiConfidence,
+    pub steps: Vec<String>,
+    /// 后端已按白名单过滤；凭据类怀疑一律为空。
+    pub actions: Vec<AiFixAction>,
+    /// 参与分析的脱敏日志字节数。
+    pub log_bytes: usize,
+    /// 是否怀疑失败由密码 / 密钥 / Token 等凭据问题导致。
+    pub credential_suspect: bool,
+    pub credential_note: Option<String>,
+    pub model: String,
+    pub analyzed_at: String,
 }
 
 /// 发起一次部署所需的参数。
@@ -1034,6 +1089,15 @@ pub struct Settings {
     /// cron-job.org 的 API Key（控制台 Settings → API Keys 生成），用于管理云端定时请求。
     #[serde(default)]
     pub cronjob_api_key: String,
+    /// AI 失败诊断：OpenAI 兼容接口的 Base URL（留空表示未启用）。
+    #[serde(default)]
+    pub ai_base_url: String,
+    /// AI 失败诊断的 API Key（明文存于 config.json，导出时抹除）。
+    #[serde(default)]
+    pub ai_api_key: String,
+    /// AI 失败诊断使用的模型名（如 deepseek-chat、gpt-4o-mini）。
+    #[serde(default)]
+    pub ai_model: String,
     /// Pages 部署记录保留条数。
     #[serde(default = "default_pages_history_limit")]
     pub pages_history_limit: usize,
@@ -1168,6 +1232,9 @@ impl Default for Settings {
             master_password_hash: None,
             github_token: String::new(),
             cronjob_api_key: String::new(),
+            ai_base_url: String::new(),
+            ai_api_key: String::new(),
+            ai_model: String::new(),
             pages_history_limit: default_pages_history_limit(),
             container_history_limit: default_container_history_limit(),
             container_timeout_secs: default_container_timeout_secs(),
@@ -1343,6 +1410,8 @@ impl ExportData {
         settings.cloudflare_account_id = String::new();
         settings.github_token = String::new();
         settings.cronjob_api_key = String::new();
+        // AI 诊断的 Key 与其它云端凭据同级：导出的配置不能带着能把日志送出去的凭据。
+        settings.ai_api_key = String::new();
         // 旧版全局备份连接串也是凭据：它就是 postgres://user:密码@host/db，留着等于
         // 导出一条能直接连库的串。它同样参与备份目标的兜底解析（backup.rs 的 resolve_target），
         // 所以漏掉它不只是泄漏，还会把外机那份旧库地址顶到本机可用值上面。
@@ -1607,6 +1676,7 @@ mod tests {
         config.settings.cloudflare_api_token = marker.to_string();
         config.settings.github_token = marker.to_string();
         config.settings.cronjob_api_key = marker.to_string();
+        config.settings.ai_api_key = marker.to_string();
         config.settings.supabase_url = format!("postgres://u:{marker}@h/db");
         config.settings.master_password_hash = Some(marker.to_string());
 

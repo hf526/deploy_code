@@ -226,6 +226,12 @@ fn merge_export(config: &mut AppConfig, data: &ExportData) -> ImportPreview {
         &config.settings.cronjob_api_key,
         &mut kept,
     );
+    // AI 诊断 Key 导出时必被抹空，导入必须保住本机这份，否则一次导入就把诊断功能打废。
+    keep_when_blank(
+        &mut settings.ai_api_key,
+        &config.settings.ai_api_key,
+        &mut kept,
+    );
     // 旧版全局备份连接串导出时是空串，本机有值就继续用本机的，否则那条老兜底会被导出的空值清掉。
     keep_when_blank(
         &mut settings.supabase_url,
@@ -275,9 +281,10 @@ mod tests {
         assert_eq!(after.repos[0].env_files[0].local_path, "D:/web/.env");
         assert_eq!(after.settings.github_token, "gh_secret");
         assert_eq!(after.settings.cronjob_api_key, "cj_secret");
+        assert_eq!(after.settings.ai_api_key, "ai_secret");
         assert_eq!(preview.servers.overwritten, 1);
-        // 密码 1 + env 本地/远端路径 2 + Token 2
-        assert_eq!(preview.kept_local_secrets, 5);
+        // 密码 1 + env 本地/远端路径 2 + Token 3
+        assert_eq!(preview.kept_local_secrets, 6);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -193,6 +193,9 @@ pub fn run() {
             commands::history::delete_record,
             commands::history::delete_records,
             commands::history::clear_history,
+            commands::diagnosis::preview_deploy_diagnosis,
+            commands::diagnosis::analyze_deploy_failure,
+            commands::diagnosis::run_deploy_diagnostic,
         ])
         .build(tauri::generate_context!())
         .expect("DeployCode 启动失败");

@@ -11,14 +11,16 @@ const CLOUDFLARE_KEYS: readonly (keyof Settings)[] = [
 ];
 const GITHUB_KEYS: readonly (keyof Settings)[] = ["githubToken"];
 const CRONJOB_KEYS: readonly (keyof Settings)[] = ["cronjobApiKey"];
+const AI_KEYS: readonly (keyof Settings)[] = ["aiBaseUrl", "aiApiKey", "aiModel"];
 
-/** 云端凭据：三家各存各的，保存其中一家不许把另一家没提交的草稿写下去。 */
+/** 云端凭据：各家各存各的，保存其中一家不许把另一家没提交的草稿写下去。 */
 export function CredentialsSection() {
   return (
     <>
       <CloudflareCard />
       <GithubCard />
       <CronJobCard />
+      <AiCard />
     </>
   );
 }
@@ -131,6 +133,57 @@ function CronJobCard() {
             onClick={() => void save()}
           >
             {t("settings.cronjob.save")}
+          </Button>
+        </div>
+      </Card>
+    </section>
+  );
+}
+
+function AiCard() {
+  const { t } = useTranslation();
+  const { draft, setDraft, save } = useSettingsForm(AI_KEYS);
+  return (
+    <section>
+      <SectionTitle
+        title={t("settings.ai.title")}
+        description={t("settings.ai.description")}
+      />
+      <Card className="p-5">
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+          <Field label={t("settings.ai.baseUrl")} hint={t("settings.ai.baseUrlHint")}>
+            <Input
+              value={draft.aiBaseUrl}
+              onChange={(event) => setDraft({ ...draft, aiBaseUrl: event.target.value })}
+              placeholder="https://api.deepseek.com/v1"
+            />
+          </Field>
+          <Field label={t("settings.ai.model")} hint={t("settings.ai.modelHint")}>
+            <Input
+              value={draft.aiModel}
+              onChange={(event) => setDraft({ ...draft, aiModel: event.target.value })}
+              placeholder="deepseek-chat"
+            />
+          </Field>
+        </div>
+        <div className="mt-4">
+          <Field label={t("settings.ai.apiKey")} hint={t("settings.ai.apiKeyHint")}>
+            <Input
+              type="password"
+              value={draft.aiApiKey}
+              onChange={(event) => setDraft({ ...draft, aiApiKey: event.target.value })}
+              placeholder="sk-..."
+            />
+          </Field>
+        </div>
+        <div className="mt-4 flex justify-end border-t border-line pt-4">
+          <Button
+            variant="secondary"
+            size="sm"
+            icon={<Save className="size-3.5" />}
+            onClick={() => void save()}
+          >
+            {t("settings.ai.save")}
           </Button>
         </div>
       </Card>

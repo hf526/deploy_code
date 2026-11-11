@@ -166,6 +166,44 @@
     "bulkDeleteTitle": "批量删除部署记录",
     "bulkDeleteDescription": "将删除 {{count}} 条部署记录及其完整日志，且无法恢复。确定继续吗？"
   },
+  "diagnosis": {
+    "button": "AI 诊断",
+    "title": "AI 失败诊断",
+    "intro": "将把这条失败记录的上下文发送给所配置的 AI 模型，分析原因并给出修复建议。",
+    "privacy": "不会发送服务器地址、用户名、密码、密钥或 env 文件内容；日志中的凭据会先被遮蔽。所有动作都需要你确认后才会执行。",
+    "prepare": "查看将发送的内容",
+    "confirmHint": "下面是将要发送给模型的部署上下文（已脱敏），系统提示词只包含固定的诊断规则。确认无误后再开始分析。",
+    "previewSize": "共 {{total}}，其中日志 {{log}}",
+    "previewLabel": "将发送的内容",
+    "send": "发送并分析",
+    "reanalyze": "重新分析",
+    "summary": "结论",
+    "cause": "原因分析",
+    "steps": "修复步骤",
+    "actions": "可执行操作",
+    "noActions": "本次诊断没有提供自动操作，请按上面的步骤手动处理。",
+    "credentialTitle": "疑似凭据问题",
+    "credentialFallback": "失败可能与密码、密钥或 Token 有关。为避免把凭据交给模型或误改密钥文件，本次不提供自动修复动作，请手动核对该服务器的认证配置。",
+    "meta": "{{model}} · {{time}}",
+    "analyzedLog": "分析了 {{size}} 日志",
+    "actionRedeploy": "重新部署",
+    "actionOpenTerminal": "打开服务器终端",
+    "diagnosticOutput": "诊断输出",
+    "diagnosticEmpty": "（没有输出）",
+    "truncated": "输出已截断",
+    "confidence": {
+      "high": "高置信",
+      "medium": "中置信",
+      "low": "低置信"
+    },
+    "diagnostic": {
+      "diskUsage": "查看磁盘占用",
+      "memory": "查看内存",
+      "failedServices": "查看失败服务",
+      "targetDir": "查看部署目录",
+      "docker": "查看容器状态"
+    }
+  },
   "repos": {
     "subtitle": "本地 Git 仓库的工作台：分支、差异与部署",
     "clone": "克隆仓库",
@@ -673,6 +711,17 @@
       "apiKey": "API Key",
       "apiKeyHint": "在 cron-job.org 控制台 Settings → API Keys 生成",
       "save": "保存 API Key"
+    },
+    "ai": {
+      "title": "AI 失败诊断",
+      "description": "OpenAI 兼容接口，用于分析部署失败原因；Key 只保存在本机，导出配置时会被抹除",
+      "baseUrl": "Base URL",
+      "baseUrlHint": "例如 https://api.deepseek.com/v1 或 https://api.openai.com/v1",
+      "model": "模型",
+      "modelHint": "例如 deepseek-chat、gpt-4o-mini",
+      "apiKey": "API Key",
+      "apiKeyHint": "只保存在本机 config.json，不会被导出",
+      "save": "保存 AI 配置"
     },
     "appearance": {
       "title": "外观",

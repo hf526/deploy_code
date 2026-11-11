@@ -120,6 +120,7 @@ describe("store 长任务接线", () => {
       startedAt: "",
       finishedAt: null,
       durationMs: 0,
+      aiDiagnosis: null,
     };
     useApp.getState().handleDeployEvent({ type: "finished", record });
     expect(useApp.getState().live?.status).toBe("success");

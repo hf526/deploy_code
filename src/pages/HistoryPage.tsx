@@ -1,9 +1,10 @@
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
-import { Eraser, History, Layers, RefreshCw, RotateCcw, ScrollText, Trash2 } from "lucide-react";
+import { Eraser, History, Layers, RefreshCw, RotateCcw, ScrollText, Sparkles, Trash2 } from "lucide-react";
 import { Trans, useTranslation } from "react-i18next";
 import { useNavigate, useSearchParams } from "react-router-dom";
 
 import { RecordLog } from "../components/RecordRows";
+import { AiDiagnosisModal } from "./deploy/AiDiagnosisModal";
 import {
   Badge,
   Button,
@@ -40,6 +41,7 @@ export default function HistoryPage() {
 
   const [repoFilter, setRepoFilter] = useState("");
   const [viewing, setViewing] = useState<DeployRecord | null>(null);
+  const [diagnosing, setDiagnosing] = useState<DeployRecord | null>(null);
   const [removing, setRemoving] = useState<DeployRecord | null>(null);
   const [rollingBack, setRollingBack] = useState<DeployRecord | null>(null);
   const [clearing, setClearing] = useState(false);
@@ -95,11 +97,18 @@ export default function HistoryPage() {
   useEffect(() => {
     const recordId = searchParams.get("record");
     if (!recordId) return;
+    // 部署页失败卡片带 diagnose=1 跳过来：直接打开 AI 诊断，少点一次。
+    const diagnose = searchParams.get("diagnose") === "1";
     let cancelled = false;
     void api
       .getRecord(recordId)
       .then((record) => {
-        if (!cancelled) setViewing(record);
+        if (cancelled) return;
+        if (diagnose && record.status === "failed") {
+          setDiagnosing(record);
+        } else {
+          setViewing(record);
+        }
       })
       .catch((error) => {
         if (!cancelled) toast("error", String(error));
@@ -373,6 +382,16 @@ export default function HistoryPage() {
                       >
                         {t("history.viewLog")}
                       </Button>
+                      {record.status === "failed" && (
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          icon={<Sparkles className="size-3.5" />}
+                          onClick={() => setDiagnosing(record)}
+                        >
+                          {t("diagnosis.button")}
+                        </Button>
+                      )}
                       <Button
                         size="sm"
                         variant="ghost"
@@ -443,6 +462,15 @@ export default function HistoryPage() {
             <Button variant="secondary" onClick={() => setViewing(null)}>
               {t("common.close")}
             </Button>
+            {viewing?.status === "failed" && (
+              <Button
+                variant="secondary"
+                icon={<Sparkles className="size-4" />}
+                onClick={() => setDiagnosing(viewing)}
+              >
+                {t("diagnosis.button")}
+              </Button>
+            )}
             {viewing && (
               <Button
                 icon={<RefreshCw className="size-4" />}
@@ -613,6 +641,27 @@ export default function HistoryPage() {
         description={t("history.clearDescription")}
         onCancel={() => setClearing(false)}
         onConfirm={() => void handleClear()}
+      />
+
+      <AiDiagnosisModal
+        record={diagnosing}
+        onClose={() => {
+          setDiagnosing(null);
+          // 分析结果会写回记录，刷新一次让列表拿到最新的 aiDiagnosis。
+          void refreshHistory();
+        }}
+        onRedeploy={(record) => {
+          setDiagnosing(null);
+          void handleRedeploy(record);
+        }}
+        onAnalyzed={(diagnosis) => {
+          // 日志弹窗里存的是打开那一刻的快照；不更新它，下次从同一个弹窗再点会重复分析。
+          setViewing((current) =>
+            current && diagnosing && current.id === diagnosing.id
+              ? { ...current, aiDiagnosis: diagnosis }
+              : current,
+          );
+        }}
       />
     </Page>
   );

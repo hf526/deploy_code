@@ -1,4 +1,4 @@
-import { cn } from "../lib/utils";
+import { cn } from "../../lib/utils";
 
 function diffLineClass(line: string): string {
   if (line.startsWith("+++") || line.startsWith("---")) return "text-ink font-medium";

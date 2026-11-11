@@ -1,9 +1,13 @@
 import { invoke } from "@tauri-apps/api/core";
 
 import type {
+  AiDiagnosis,
   DeployConfig,
   DeployRecord,
   DeployRequest,
+  DiagnosisPreview,
+  DiagnosticCommandId,
+  DiagnosticOutput,
   RemoteRelease,
 } from "../types";
 
@@ -33,4 +37,12 @@ export const deployCommands = {
   deleteRecords: (recordIds: string[]) =>
     invoke<number>("delete_records", { recordIds }),
   clearHistory: () => invoke<void>("clear_history"),
+
+  // AI 失败诊断
+  previewDeployDiagnosis: (recordId: string) =>
+    invoke<DiagnosisPreview>("preview_deploy_diagnosis", { recordId }),
+  analyzeDeployFailure: (recordId: string) =>
+    invoke<AiDiagnosis>("analyze_deploy_failure", { recordId }),
+  runDeployDiagnostic: (recordId: string, command: DiagnosticCommandId) =>
+    invoke<DiagnosticOutput>("run_deploy_diagnostic", { recordId, command }),
 };

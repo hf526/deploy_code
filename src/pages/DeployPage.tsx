@@ -7,6 +7,7 @@ import {
   Pencil,
   Plus,
   Rocket,
+  Sparkles,
   Square,
   Terminal,
   Timer,
@@ -749,6 +750,20 @@ export default function DeployPage() {
                     {t("deploy.viewRecord")}
                   </Button>
                 )}
+                {activeKind === "server" &&
+                  live?.record &&
+                  live.record.status === "failed" && (
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      icon={<Sparkles className="size-3.5" />}
+                      onClick={() =>
+                        navigate(`/history?record=${live.record?.id ?? ""}&diagnose=1`)
+                      }
+                    >
+                      {t("diagnosis.button")}
+                    </Button>
+                  )}
                 {activeKind === "pages" && livePages?.record?.url && (
                   <Button
                     size="sm"

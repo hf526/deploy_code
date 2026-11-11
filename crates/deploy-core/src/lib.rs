@@ -17,6 +17,7 @@
 //! - [`container`]：容器备份与迁移（docker-compose 项目经本机中转到另一台服务器）
 //! - [`pages`]：Cloudflare Pages 部署（wrangler）
 //! - [`cronjob`]：cron-job.org 云端定时请求（REST 客户端 + cron 表达式互转）
+//! - [`diagnosis`]：部署失败诊断（脱敏上下文 + OpenAI 兼容接口 + 动作白名单）
 //! - [`shutdown`]：本机定时关机（下发 Windows 关机请求）
 //! - [`process`]：本地命令执行与 shell 工具
 //! - [`tasklog`]：三类任务共用的日志器
@@ -27,6 +28,7 @@
 pub mod backup;
 pub mod container;
 pub mod cronjob;
+pub mod diagnosis;
 pub mod engine;
 pub mod error;
 pub mod git;

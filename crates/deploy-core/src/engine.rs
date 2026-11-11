@@ -161,6 +161,7 @@ impl DeployEngine {
             started_at: now_string(),
             finished_at: None,
             duration_ms: 0,
+            ai_diagnosis: None,
         };
 
         self.store

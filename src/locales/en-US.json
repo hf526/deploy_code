@@ -166,6 +166,44 @@
     "bulkDeleteTitle": "Delete Selected Deployments",
     "bulkDeleteDescription": "This deletes {{count}} deployment records with their full logs. This cannot be undone. Continue?"
   },
+  "diagnosis": {
+    "button": "AI Diagnosis",
+    "title": "AI Failure Diagnosis",
+    "intro": "The context of this failed deployment will be sent to the configured AI model to analyze the cause and suggest fixes.",
+    "privacy": "Server addresses, usernames, passwords, keys and env file contents are never sent; credentials in the log are masked first. Every action runs only after you confirm it.",
+    "prepare": "Preview What Will Be Sent",
+    "confirmHint": "Below is the redacted deployment context that will be sent to the model; the system prompt only contains fixed diagnosis rules. Review it before starting the analysis.",
+    "previewSize": "{{total}} total, {{log}} of logs",
+    "previewLabel": "Payload to send",
+    "send": "Send and Analyze",
+    "reanalyze": "Analyze Again",
+    "summary": "Conclusion",
+    "cause": "Cause",
+    "steps": "Fix Steps",
+    "actions": "Available Actions",
+    "noActions": "This diagnosis offers no automated actions. Follow the steps above manually.",
+    "credentialTitle": "Possible credential issue",
+    "credentialFallback": "The failure may be related to a password, key or token. To avoid sending credentials to the model or touching key files, no automated fix is offered. Please check this server's authentication settings manually.",
+    "meta": "{{model}} · {{time}}",
+    "analyzedLog": "Analyzed {{size}} of logs",
+    "actionRedeploy": "Redeploy",
+    "actionOpenTerminal": "Open Server Terminal",
+    "diagnosticOutput": "Diagnostic Output",
+    "diagnosticEmpty": "(no output)",
+    "truncated": "Output truncated",
+    "confidence": {
+      "high": "High confidence",
+      "medium": "Medium confidence",
+      "low": "Low confidence"
+    },
+    "diagnostic": {
+      "diskUsage": "Check Disk Usage",
+      "memory": "Check Memory",
+      "failedServices": "Check Failed Services",
+      "targetDir": "List Deploy Directory",
+      "docker": "Check Containers"
+    }
+  },
   "repos": {
     "subtitle": "A workbench for local Git repositories: branches, diffs and deployments",
     "clone": "Clone Repository",
@@ -673,6 +711,17 @@
       "apiKey": "API key",
       "apiKeyHint": "Create it in the cron-job.org console under Settings → API Keys",
       "save": "Save API key"
+    },
+    "ai": {
+      "title": "AI Failure Diagnosis",
+      "description": "OpenAI-compatible endpoint used to analyze deployment failures; the key stays on this machine and is blanked on config export",
+      "baseUrl": "Base URL",
+      "baseUrlHint": "For example https://api.deepseek.com/v1 or https://api.openai.com/v1",
+      "model": "Model",
+      "modelHint": "For example deepseek-chat or gpt-4o-mini",
+      "apiKey": "API Key",
+      "apiKeyHint": "Stored only in the local config.json and never exported",
+      "save": "Save AI Settings"
     },
     "appearance": {
       "title": "Appearance",

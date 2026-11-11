@@ -3,6 +3,7 @@ pub mod backup;
 pub mod container;
 pub mod cronjob;
 pub mod deploy;
+pub mod diagnosis;
 pub mod history;
 pub mod host;
 pub mod nginx;
